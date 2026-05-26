@@ -291,15 +291,17 @@ function ray_class_group_representatives(K, O, m, Sigma)
 end
 
 function test_principal_only_twists()
-    D = 24
+    F = AdmissibleTuple(7)
+    @show F
+
+    # construct K and O from F
+    D = Int(F.D)
+    q = Int(F.q)
     K, a = quadratic_field(D)
     OK = maximal_order(K)
-
-    q = 2
     O = order(K, [K(1), K(q * OK(a))])
 
-    F = AdmissibleTuple(11, binary_quadratic_form(3, -12, 4))
-    @show F
+    println("D = ", D, ", q = ", q)
 
     d = Int(F.d)
     m = ideal(O, d)
@@ -307,12 +309,10 @@ function test_principal_only_twists()
 
     all_reps, all_triples = ray_class_group_representatives(K, O, m, Sigma)
 
-    # find triples where J is the trivial Picard ideal
     trivial_ideal = ideal(O, 1)
     principal_triples = [(J, I, gamma) for (J, I, gamma) in all_triples if J == trivial_ideal]
     println("Number of purely principal triples: ", length(principal_triples))
 
-    # test the first 10
     n = min(10, length(principal_triples))
     println("Testing first ", n, " purely principal twists:")
 
@@ -325,3 +325,18 @@ function test_principal_only_twists()
 end
 
 test_principal_only_twists()
+
+function test_shin_values(F::AdmissibleTuple)
+    d = Int(F.d)
+    println("Testing shin_of_tuple for all p vectors with F = ", F)
+    for p1 = 0:d-1
+        for p2 = 0:d-1
+            p = [p1, p2]
+            val = shin_of_tuple(F, p)
+            println("  p=($p1,$p2): shin = ", val)
+        end
+    end
+end
+
+F = AdmissibleTuple(7)
+test_shin_values(F)

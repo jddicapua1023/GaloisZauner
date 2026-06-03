@@ -291,7 +291,6 @@ function enumerate_principal_ray_classes(K, O, m, Sigma, N)
 end
 =#
 
-#5/3 using lists L and L' for infinite places with increased precision
 function enumerate_principal_ray_classes(K, ord, m, Sigma, N)
     N == 0 && return []
 
@@ -383,7 +382,7 @@ function enumerate_principal_ray_classes(K, ord, m, Sigma, N)
 
     function coprime_to_m_ideal(I)
         try
-            return isone(I + m)
+            return isone(OK * I + ideal(OK, 1) * norm(m))
         catch
             return false
         end
@@ -458,7 +457,7 @@ function enumerate_principal_ray_classes(K, ord, m, Sigma, N)
             end
 
             if is_new
-                push!(collected, (I, gamma, n))
+                push!(collected, (OK * I, gamma, n))   # lifted to OK
                 println("  Found class ", length(collected),
                         ": generator=", gamma, " norm=", n)
                 length(collected) >= N && break

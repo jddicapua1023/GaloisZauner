@@ -3,7 +3,6 @@ include("ray_unit_quotient.jl")
 include("term2.jl")
 include("enumeration_with_infinite_places.jl")
 
-
 function make_coprime_representatives(O, m, mP, group_elems)
     OK = maximal_order(number_field(O))
     m_OK = OK * m
@@ -12,9 +11,9 @@ function make_coprime_representatives(O, m, mP, group_elems)
     reps = []
 
     for g in group_elems
-        I = mP(g)  # already lives in OK
+        I_O = mP(g)
+        I = OK * I_O          # lift to OK
 
-        # Check valuations at each prime above m
         correction_needed = Dict{AbsSimpleNumFieldOrderIdeal, Int}()
         for (p, _) in fac
             v = valuation(I, p)
@@ -24,11 +23,10 @@ function make_coprime_representatives(O, m, mP, group_elems)
         end
 
         if isempty(correction_needed)
-            push!(reps, I)
+            push!(reps, I)    # I is already in OK, not I_O
             continue
         end
 
-        # Build alpha in K* with required valuations to cancel bad primes
         K = number_field(O)
         alpha = one(K)
         for (p, exp) in correction_needed
@@ -36,15 +34,13 @@ function make_coprime_representatives(O, m, mP, group_elems)
             alpha = alpha * pi_p^exp
         end
 
-        # Form alpha * I as a fractional ideal, simplify, then take numerator
-        J = numerator(simplify(alpha * I))
+        J_OK = numerator(simplify(alpha * I))
 
-        # Sanity check
-        if !isone(J + m_OK)
+        if !isone(J_OK + m_OK)
             error("Failed to make ideal coprime to m for group element ", g)
         end
 
-        push!(reps, J)
+        push!(reps, J_OK)     # no pullback to O
     end
 
     return reps

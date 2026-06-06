@@ -1,6 +1,8 @@
 using Hecke
 using Zauner
+import Zauner: _ghost_invariants, _dualize, _approx_complex_intersection, roots, Vandermonde, pow_to_elem_sym_poly
 using GenericFFT: fft
+using LinearAlgebra
 include("ray_unit_quotient.jl")
 include("term2.jl")
 include("enumeration_with_infinite_places.jl")
@@ -121,47 +123,6 @@ function twisted_chi(F::AdmissibleTuple, J, gamma, K, O)
     c_g = e(-BigFloat(rademacher(F.A)) / 24) / (chi * sqrt(BigFloat(d + 1)))
     println("  c_g = ", c_g)
 
-    if Ng == 1
-        println("  Testing unit invariance of shin_of_tuple:")
-        OK = maximal_order(K)
-        U, mU = unit_group(OK)
-
-        eps = nothing
-        for i in 1:ngens(U)
-            u = elem_in_nf(mU(U[i]))
-            if !(u == one(K) || u == -one(K))
-                eps = u
-                break
-            end
-        end
-
-        units_norm1 = []
-        if eps !== nothing
-            current = one(K)
-            for k in 1:1000
-                current = current * eps
-                n = norm(current)
-                if mod(Int(abs(n)), d) == 1
-                    push!(units_norm1, current)
-                end
-                length(units_norm1) >= 20 && break
-            end
-        end
-
-        println("  Found ", length(units_norm1), " units with norm ≡ 1 mod d")
-
-        p_test = [1, 1]
-        println("  shin_of_tuple at p=$p_test = ", shin_of_tuple(gF, p_test))
-
-        for (k, u) in enumerate(units_norm1)
-            u_gamma = u * K(gamma)
-            M_u = multiplication_matrix_mod_d(u_gamma, rho_g, d, D)
-            newp = mod.(M_u * p_test, d)
-            val = shin_of_tuple(gF, newp)
-            println("  k=$k norm(u)=$(norm(u)) M_u=$M_u newp=$newp shin=$val")
-        end
-    end
-
     new_ovs = zeros(Complex{BigFloat}, d, d)
     new_ovs[1, 1] = sqrt(BigFloat(d + 1))
     for p1 = 0:d-1
@@ -173,11 +134,10 @@ function twisted_chi(F::AdmissibleTuple, J, gamma, K, O)
 
             newp = mod.(M_g * p, d)
 
-            newQA = BigFloat(-QQ(newp...) / (d * (d - 2)))
-            news = (isodd(d) ? 1 : (1 + newp[1]) * (1 + newp[2]))
+            QA = BigFloat(-QQ(newp...) / (d * (d - 2)))
+            s = (isodd(d) ? 1 : (1 + newp[1]) * (1 + newp[2]))
 
-            # corrected: (-1)^(Ng*s) instead of (-1)^s
-            new_ovs[gp[1]+1, gp[2]+1] = ζ^(newQA) * (-1)^(news) * c_g * shin_of_tuple(gF, newp)
+            new_ovs[gp[1]+1, gp[2]+1] = ζ^(QA) * (-1)^(s) * c_g * shin_of_tuple(gF, newp)
         end
     end
 
@@ -187,30 +147,57 @@ function twisted_chi(F::AdmissibleTuple, J, gamma, K, O)
     dev = ghost_overlap_test_complex(new_ovs, d)
     println("  ghost condition deviation on new_ovs = ", dev)
 
-    println("  Checking sign of v(p)*v(-p):")
-    pos_count = 0
-    neg_count = 0
+    # print v(p)*v(-p) for first 10 nonzero p
+    println("  v(p)*v(-p) for first 10 nonzero p:")
+    count = 0
     for p1 = 0:d-1
         for p2 = 0:d-1
             (p1 == 0 && p2 == 0) && continue
-            ov_p = new_ovs[p1+1, p2+1]
-            ov_mp = new_ovs[mod(-p1,d)+1, mod(-p2,d)+1]
-            product = ov_p * ov_mp
-            normed = real(product) * (d+1)
-            if abs(imag(product)) > 1e-10
-                println("  WARNING: v($p1,$p2)*v($(mod(-p1,d)),$(mod(-p2,d))) has large imaginary part: ", imag(product) * (d+1))
-            end
-            if normed > 0
-                pos_count += 1
-            else
-                neg_count += 1
-            end
+            count += 1
+            count > 10 && break
+            mp1 = mod(-p1, d)
+            mp2 = mod(-p2, d)
+            product = new_ovs[p1+1, p2+1] * new_ovs[mp1+1, mp2+1]
+            println("    p=($p1,$p2): v(p)*v(-p) = ", Float64(real(product)),
+                    " + ", Float64(imag(product)), "im",
+                    "  |v(p)*v(-p)| = ", Float64(abs(product)),
+                    "  1/(d+1) = ", 1.0/(d+1))
+        end
+        count > 10 && break
+    end
+
+    # construct M using raw (unscaled) overlaps
+    println("  Constructing fiducial projector M (unscaled)...")
+    Id = Matrix{Complex{BigFloat}}(I, d, d)
+    M = Id / BigFloat(d)
+    for p1 = 0:d-1
+        for p2 = 0:d-1
+            (p1 == 0 && p2 == 0) && continue
+            v_scaled = new_ovs[p1+1, p2+1] 
+            M += v_scaled / BigFloat(d) * wh(p1, p2, d)
         end
     end
-    println("    v(p)*v(-p) = +1/(d+1) count: ", pos_count)
-    println("    v(p)*v(-p) = -1/(d+1) count: ", neg_count)
 
-    return new_ovs
+    M_float = Complex{Float64}.(M)
+    println("  ||M^2 - M||_F = ", norm(M_float^2 - M_float))
+    println("  tr(M) = ", tr(M_float))
+
+    vals, vecs = eigen(M_float)
+    println("  All eigenvalues sorted by distance from 1:")
+    sorted_idx = sortperm(abs.(vals .- 1))
+    for i in 1:min(5, d)
+        println("    eigenvalue ", i, ": ", vals[sorted_idx[i]])
+    end
+
+    idx = sorted_idx[1]
+    psi = Complex{BigFloat}.(vecs[:, idx])
+    psi = psi / norm(psi)
+
+    println("  ghost_frame_test = ", ghost_frame_test(psi))
+    println("  ghost_overlap_test = ", ghost_overlap_test(psi))
+    println("  sic_frame_test = ", sic_frame_test(psi))
+
+    return new_ovs, gF, psi
 end
 
 function find_signs(new_ovs, d)
@@ -232,7 +219,6 @@ function find_signs(new_ovs, d)
             v_mp = new_ovs[mp1+1, mp2+1]
             product = v_p * v_mp * (d + 1)
 
-            # diagnostic: check imaginary part of product
             if abs(imag(product)) > 1e-10
                 println("  WARNING: v($p1,$p2)*v($mp1,$mp2)*(d+1) has large imaginary part: ", imag(product))
             end
@@ -247,7 +233,6 @@ function find_signs(new_ovs, d)
         end
     end
 
-    # verify
     max_dev = 0.0
     for p1 = 0:d-1
         for p2 = 0:d-1
@@ -375,7 +360,6 @@ function test_principal_only_twists(d::Int)
     m = ideal(O, d)
     GC.gc()
 
-    # only the second infinite place
     all_places = real_places(K)
     Sigma = [all_places[2]]
     println("Using Sigma = second real place only: ", Sigma)
@@ -386,28 +370,18 @@ function test_principal_only_twists(d::Int)
 
     trivial_ideal = ideal(OK, 1)
 
-    principal_triples = [(J, I, gamma) for (J, I, gamma) in all_triples if J == trivial_ideal]
-    println("Number of purely principal triples: ", length(principal_triples))
+    # use all triples, not just principal squared ones
+    println("Total triples: ", length(all_triples))
 
-    # square each class
-    squared_triples = [(J, I * I, K(gamma) * K(gamma)) for (J, I, gamma) in principal_triples]
-    println("Number of squared triples: ", length(squared_triples))
+    n = min(10, length(all_triples))
+    println("Testing first ", n, " twists:")
 
-    n = min(10, length(squared_triples))
-    println("Testing first ", n, " squared principal twists:")
-
-    for (k, (J, I, gamma)) in enumerate(squared_triples[1:n])
-        println("\nSquared principal twist ", k, " of ", n, ":")
+    for (k, (J, I, gamma)) in enumerate(all_triples[1:n])
+        println("\nTwist ", k, " of ", n, ":")
+        println("  J = ", J)
         println("  gamma = ", gamma)
         println("  norm(gamma) = ", norm(K(gamma)))
-        new_ovs = twisted_chi(F, J, gamma, K, O)
-
-        println("  Finding sign corrections...")
-        a = find_signs(new_ovs, d)
-        println("  Sign matrix a(p):")
-        for p1 = 0:d-1
-            println("    p1=", p1, ": ", [a[p1+1, p2+1] for p2 = 0:d-1])
-        end
+        new_ovs, gF, psi = twisted_chi(F, J, gamma, K, O)
     end
 end
 

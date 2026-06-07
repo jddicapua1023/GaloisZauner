@@ -49,6 +49,12 @@ function multiplication_matrix_mod_d(gamma, rho, d, D)
 end
 
 function act_on_quadratic_form(J, F, K, O)
+    OK = maximal_order(K)
+    
+    # if J is principal, the action is trivial
+    if is_principal(J)
+        return F.Q
+    end
     D = Int(F.D)
     a = gen(K)
     OK = maximal_order(K)
@@ -347,11 +353,35 @@ function test_principal_only_twists(d::Int)
 
     D = Int(F.D)
     q = Int(F.q)
+
+    function squarefree_part(n::Int)
+        fac = factor(n)
+        sq_part = 1
+        for (p, e) in fac
+            if isodd(e)
+                sq_part *= p
+            end
+        end
+        return sq_part
+    end
+
+    Dr = squarefree_part(D)
     K, a = quadratic_field(D)
     OK = maximal_order(K)
     GC.gc()
     GC.gc()
-    O = order(K, [K(1), K(q * OK(a))])
+
+    # convert Dr to element of K: sqrt(Dr) = a / sqrt(D/Dr)
+    sqrt_Dr = a // isqrt(D ÷ Dr)
+
+    if mod(Dr, 4) == 1
+        omega = (K(1) + sqrt_Dr) // 2
+    else
+        omega = sqrt_Dr
+    end
+
+    O = Order(K, [one(K), q * omega])
+    println("conductor of O is: ", conductor(O))
     GC.gc()
 
     println("D = ", D, ", q = ", q)
@@ -370,7 +400,6 @@ function test_principal_only_twists(d::Int)
 
     trivial_ideal = ideal(OK, 1)
 
-    # use all triples, not just principal squared ones
     println("Total triples: ", length(all_triples))
 
     n = min(10, length(all_triples))
@@ -385,4 +414,4 @@ function test_principal_only_twists(d::Int)
     end
 end
 
-test_principal_only_twists(13)
+test_principal_only_twists(17)

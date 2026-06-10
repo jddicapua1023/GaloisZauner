@@ -275,26 +275,39 @@ function num_principal_ray_classes(OK, O, m, Sigma)
     println("    num_principal: delta constructed")
     GC.gc()
 
-    _, structure = residue_unit_quotient(OK, O, mp, m, delta, Sigma_prime, Sigma)
-    println("    num_principal: residue_unit_quotient done, structure = ", structure)
-    N1 = prod(structure)
+    # compute index [O× : U_{m,Σ}(O)]
+    U_O, mU_O = unit_group(O)
+    R_m_O, proj_m_O = quo(O, m)
+
+    # find the order of -1 in O×/U_{m,Σ}(O): is -1 in U_{m,Σ}(O)?
+    minus_one = O(-1)
+    torsion_index = isone(proj_m_O(minus_one)) && all(sign(K(elem_in_nf(minus_one)), p) > 0 for p in Sigma) ? 1 : 2
+
+    # find smallest k>=1 such that ε^k ∈ U_{m,Σ}(O)
+    eps = elem_in_nf(mU_O(U_O[2]))  # fundamental unit
+    period = 0
+    for k in 1:100_000
+        epsk = O(eps^k)
+        if isone(proj_m_O(epsk)) && all(sign(K(eps^k), p) > 0 for p in Sigma)
+            period = k
+            break
+        end
+    end
+    period == 0 && error("Period not found")
+
+    N2 = torsion_index * period
+    println("    num_principal: N2 = ", N2)
     GC.gc()
 
-    Q_ray, _, _ = ray_unit_quotient(OK, O, mp, m, Sigma_prime, Sigma)
-    println("    num_principal: ray_unit_quotient done")
-    N2 = order(Q_ray)
+    # N2 = order of U_{m,Sigma}(OK) = |(OK/m)|× * 2^|Sigma|
+    m_OK = ideal(OK, minimum(m))
+    R_m, _ = quo(OK, m_OK)
+    U_Rm, _ = unit_group(R_m)
+    N1 = Int(order(U_Rm)) * 2^length(Sigma)
+    println("    num_principal: N1 = ", N1)
     GC.gc()
 
-    P_OK, _ = picard_group(OK)
-    println("    num_principal: picard OK done")
-    N3 = order(P_OK)
-    GC.gc()
-
-    P_O, _ = picard_group(O)
-    println("    num_principal: picard O done")
-    N4 = order(P_O)
-
-    N = Int(N1 * N3 / (N2 * N4)) - 1
+    N = Int(N1/ (N2)) - 1
     println("    num_principal: N = ", N)
     return N
 end
@@ -414,4 +427,4 @@ function test_principal_only_twists(d::Int)
     end
 end
 
-test_principal_only_twists(17)
+test_principal_only_twists(19)

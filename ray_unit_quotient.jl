@@ -52,6 +52,7 @@ function ray_unit_quotient(O_prime, O, m_prime, m, Sigma_prime, Sigma)
         catch
             return false
         end
+
     end
 
     # ----------------------------------------------------------------
@@ -231,6 +232,11 @@ function ray_unit_quotient(O_prime, O, m_prime, m, Sigma_prime, Sigma)
     println("Order of quotient: ", N)
     println("Number of coset representatives: ", length(coset_reps))
     =#
+
+    println("  ray_unit_quotient: period = ", period)
+    println("  ray_unit_quotient: N (order of quotient) = ", N)
+    println("  ray_unit_quotient: is -1 in lower? ", in_lower(mU_prime(U_prime[1])))
+    println("  ray_unit_quotient: elementary_divisors = ", elementary_divisors(Q))
 
     return Q, coset_reps, phi
 end

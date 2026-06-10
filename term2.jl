@@ -30,32 +30,33 @@ function residue_unit_quotient(O_prime, O, m_prime, m, delta, Sigma_prime, Sigma
     R, proj = quo(O, delta_O)
     U_R, mU_R = unit_group(R)
 
-    # Step 3: membership tests
+    # Step 3: compute O/m and O'/m' for membership tests
+    R_m, proj_m = quo(O, m)
+    R_m_prime, proj_m_prime = quo(O_prime, m_prime)
+
+    # membership tests using quotient ring projections
     function in_U_m_prime(u_elem)
         lifted = O_prime(lift(mU_Rprime(u_elem)))
-        return iszero(mod(lifted - one(O_prime), m_prime))
+        return isone(proj_m_prime(lifted))
     end
 
     function in_U_m(u_elem)
         lifted = O(lift(mU_R(u_elem)))
-        return iszero(mod(lifted - one(O), m))
+        return isone(proj_m(lifted))
     end
 
-    # Step 4: find U_{m'}(O'/delta) using generators only
-    # Instead of iterating all elements, find which generators of U_Rprime
-    # satisfy the congruence, then build the subgroup from those generators
-    # and filter by checking generated elements up to their orders.
+    # Step 4: find U_{m'}(O'/delta) — kernel of U_Rprime -> (O'/m')×
     upper_gens = FinGenAbGroupElem[]
     divs_prime = elementary_divisors(U_Rprime)
 
     for i in 1:ngens(U_Rprime)
         g = U_Rprime[i]
         ord_g = Int(divs_prime[i])
-        # collect powers of g that are in U_{m'}
-        for k in 1:ord_g
+        for k in 1:ord_g-1
             gk = k * g
             if in_U_m_prime(gk)
                 push!(upper_gens, gk)
+                break
             end
         end
     end
@@ -67,17 +68,18 @@ function residue_unit_quotient(O_prime, O, m_prime, m, delta, Sigma_prime, Sigma
         G_upper, inc_upper = sub(U_Rprime, upper_gens)
     end
 
-    # Step 5: find U_m(O/delta_O) using generators only
+    # Step 5: find U_m(O/delta_O) — kernel of U_R -> (O/m)×
     lower_gens = FinGenAbGroupElem[]
     divs = elementary_divisors(U_R)
 
     for i in 1:ngens(U_R)
         g = U_R[i]
         ord_g = Int(divs[i])
-        for k in 1:ord_g
+        for k in 1:ord_g-1
             gk = k * g
             if in_U_m(gk)
                 push!(lower_gens, gk)
+                break
             end
         end
     end
@@ -136,5 +138,14 @@ function residue_unit_quotient(O_prime, O, m_prime, m, delta, Sigma_prime, Sigma
     end
 
     structure = elementary_divisors(Q)
+
+    println("  residue_unit_quotient: order(U_Rprime) = ", order(U_Rprime))
+    println("  residue_unit_quotient: order(U_R) = ", order(U_R))
+    println("  residue_unit_quotient: order(G_upper) = ", order(G_upper))
+    println("  residue_unit_quotient: order(G_lower) = ", order(G_lower))
+    println("  residue_unit_quotient: order(Q_finite) = ", order(Q_finite))
+    println("  residue_unit_quotient: n_extra = ", n_extra)
+    println("  residue_unit_quotient: order(Q) = ", order(Q))
+
     return Q, structure
 end

@@ -400,7 +400,13 @@ function test_principal_only_twists(d::Int)
     println("D = ", D, ", q = ", q)
 
     d = Int(F.d)
-    m = ideal(O, d)
+    if mod(d, 2) == 1
+        dbar = d 
+    else
+        dbar = 2d  
+    end
+    
+    m = ideal(O, dbar)
     GC.gc()
 
     all_places = real_places(K)
@@ -427,4 +433,4 @@ function test_principal_only_twists(d::Int)
     end
 end
 
-test_principal_only_twists(19)
+test_principal_only_twists(4)

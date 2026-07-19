@@ -75,19 +75,10 @@ function rationals_by_height(max_h)
 end
 
 function to_du_mod_d(u_val, d)
-    du =  u_val
+    du = u_val
     k = floor(du / d)
-    du_mod = du - d * k  # rational in [0, d)
+    du_mod = du - d * k
     return du_mod
-end
-
-function to_int_mod_d(u_val, d)
-    num = Int(numerator(u_val))
-    den = Int(denominator(u_val))
-    if den == 1
-        return mod(num, d)
-    end
-    return mod(num * invmod(den, d), d)
 end
 
 function find_class_representatives(O, F, K)
@@ -180,9 +171,56 @@ function find_rho_j_and_coords(product, rho_j)
 end
 
 function find_s1_s2(J, rho_B, rho, u_B, P_O, mP_O, O, K, OK, d_val, rho_j)
+    J_OK  = extend(J, OK)
+    b_OK  = extend(mP_O(-u_B), OK)
+    dO_OK = ideal(OK, d_val)
+    bdO_OK = b_OK * dO_OK
+    Jb_OK = J_OK * b_OK
+
+    is_princ_Jb, Jb_gen_fac = is_principal_with_data(Jb_OK)
+    !is_princ_Jb && error("Jb_OK is not principal")
+    Jb_gen = elem_in_nf(Jb_gen_fac)
+    println("  Jb_gen = ", Jb_gen)
+    println("  norm(Jb_gen) = ", norm(K(Jb_gen)))
+
+    target_OK = bdO_OK * inv(fractional_ideal(OK, [K(1), rho_B]))
+    is_princ, alpha_fac = is_principal_with_data(target_OK)
+    !is_princ && error("b*dO / (Z+rho_B*Z) is not principal")
+    alpha_base = elem_in_nf(alpha_fac)
+
     places = real_places(K)
     U_OK, mU_OK = unit_group(OK)
     eps_OK = elem_in_nf(mU_OK(U_OK[2]))
+
+    best_alpha = nothing
+    best_size = Inf
+    ALPHA_SEARCH_RANGE = -60:60
+    for k in ALPHA_SEARCH_RANGE
+        for sgn in [1, -1]
+            a_try = K(sgn) * alpha_base * eps_OK^k
+            all(sign(a_try, p) > 0 for p in places) || continue
+            sz = Float64(abs(coeff(a_try, 0))) + Float64(abs(coeff(a_try, 1)))
+            if sz < best_size
+                best_size = sz
+                best_alpha = a_try
+            end
+        end
+    end
+    best_alpha === nothing && error("Could not find totally positive alpha in range ", ALPHA_SEARCH_RANGE)
+    alpha = best_alpha
+
+    # Explicit verification: alpha must be totally positive (positive under
+    # every real embedding of K), since downstream code (e.g. is_valid's
+    # sign convention, and alpha's role as "= d" in the ideal quotient) relies
+    # on this. This should always hold given the filter above, but we check
+    # it explicitly rather than assuming the search logic is bug-free.
+    alpha_signs = [sign(alpha, p) for p in places]
+    all(s -> s > 0, alpha_signs) ||
+        error("Selected alpha is NOT totally positive! signs = ", alpha_signs,
+              ", alpha = ", alpha)
+    println("  alpha = ", alpha, " (= d)  [verified totally positive: signs = ", alpha_signs, "]")
+
+    println("  norm(Jb_OK) = ", norm(Jb_OK))
 
     c_rhoB = coeff(rho_B, 1)
     println("  rho_B = ", rho_B)
@@ -192,32 +230,14 @@ function find_s1_s2(J, rho_B, rho, u_B, P_O, mP_O, O, K, OK, d_val, rho_j)
     rhoB_conj = Float64(emb_conj(rho_B))
     println("  conj(rho_B) = ", rhoB_conj)
 
-    # b = (Z + rho_B*Z)^{-1}
-    # b*dO = alpha*(Z+rho_B*Z) => alpha = d (scalar)
-    alpha = K(d_val)
-    println("  alpha = ", alpha, " (= d)")
-
-    # Jb = J * b = J * (Z+rho_B*Z)^{-1}
-    # Jb as OK ideal
-    J_OK = extend(J, OK)
-    t_rhoB_OK = fractional_ideal(OK, [K(1), rho_B])
-    Jb_OK = J_OK * inv(t_rhoB_OK)
-
-    println("  norm(Jb_OK) = ", norm(Jb_OK))
-
-    is_princ_Jb, Jb_gen_fac = is_principal_with_data(Jb_OK)
-    !is_princ_Jb && error("Jb_OK = J*(Z+rho_B*Z)^{-1} is not principal")
-    Jb_gen = elem_in_nf(Jb_gen_fac)
-    println("  Jb_gen = ", Jb_gen)
-    println("  norm(Jb_gen) = ", norm(K(Jb_gen)))
+    function to_float(q)
+        return Float64(BigInt(numerator(q))) / Float64(BigInt(denominator(q)))
+    end
 
     function is_valid(s1, s2)
-        s1_f = Float64(BigInt(numerator(s1))) / Float64(BigInt(denominator(s1)))
-        s2_f = Float64(BigInt(numerator(s2))) / Float64(BigInt(denominator(s2)))
+        s1_f = to_float(s1)
+        s2_f = to_float(s2)
         val = s2_f * rhoB_conj - s1_f
-        #=
-        println("    s2*conj(rhoB) - s1 = ", val)
-        =#
         return val > 0
     end
 
@@ -236,31 +256,34 @@ function find_s1_s2(J, rho_B, rho, u_B, P_O, mP_O, O, K, OK, d_val, rho_j)
         return s1, s2
     end
 
-    # try j=0
     result = try_elem_with_alpha(Jb_gen, alpha)
     if result !== nothing
         s1, s2 = result
-        #=
-        println("  j=0: s1=", s1, " s2=", s2)
-        =#
         if is_valid(s1, s2)
-            println("  found s1=", s1, " s2=", s2, " j=0")
+            println("  found s1=", s1, " s2=", s2, " j=0, sgn=1")
+            return s1, s2
+        end
+    end
+    result = try_elem_with_alpha(-Jb_gen, alpha)
+    if result !== nothing
+        s1, s2 = result
+        if is_valid(s1, s2)
+            println("  found s1=", s1, " s2=", s2, " j=0, sgn=-1")
             return s1, s2
         end
     end
 
     for j in 1:200
         for jj in [j, -j]
-            elem = Jb_gen * eps_OK^jj
-            result = try_elem_with_alpha(elem, alpha)
-            result === nothing && continue
-            s1, s2 = result
-            #=
-            println("  j=", jj, ": s1=", s1, " s2=", s2)
-            =#
-            if is_valid(s1, s2)
-                println("  found s1=", s1, " s2=", s2, " j=", jj)
-                return s1, s2
+            for sgn in [1, -1]
+                elem = K(sgn) * Jb_gen * eps_OK^jj
+                result = try_elem_with_alpha(elem, alpha)
+                result === nothing && continue
+                s1, s2 = result
+                if is_valid(s1, s2)
+                    println("  found s1=", s1, " s2=", s2, " j=", jj, " sgn=", sgn)
+                    return s1, s2
+                end
             end
         end
     end
@@ -362,6 +385,51 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
     new_ovs = zeros(Complex{BigFloat}, d, d)
     new_ovs[1, 1] = sqrt(BigFloat(d + 1))
 
+    function du_to_int_mod_d(du_int_val, d)
+        num = Int(numerator(du_int_val))
+        den = Int(denominator(du_int_val))
+        g = gcd(abs(num), den)
+        num ÷= g
+        den ÷= g
+        temp = den
+        while true
+            g2 = gcd(temp, d)
+            g2 == 1 && break
+            while temp % g2 == 0
+                temp ÷= g2
+            end
+        end
+        den_coprime_to_d = temp
+        den_d_part = den ÷ den_coprime_to_d
+        if mod(num, den_d_part) != 0
+            return nothing
+        end
+        num ÷= den_d_part
+        if den_coprime_to_d == 1
+            return mod(num, d)
+        else
+            return mod(num * invmod(den_coprime_to_d, d), d)
+        end
+    end
+
+    function compute_integralnewdu(p1, p2, s1, s2, rhoB_cand, rho, rho_j, M_g_j, d)
+        elem1 = K(p2) * rho - K(p1)
+        elem2 = K(s2) * rhoB_cand - K(s1)
+        product = elem1 * elem2
+        u2, u1 = find_rho_j_and_coords(product, rho_j)
+        du = [to_du_mod_d(u1, d), to_du_mod_d(u2, d)]
+        raw_newdu = M_g_j * du
+        newdu = [to_du_mod_d(raw_newdu[1], d), to_du_mod_d(raw_newdu[2], d)]
+        integralnewdu = Int[]
+        for u in newdu
+            du_int = d * u
+            val = du_to_int_mod_d(du_int, d)
+            val === nothing && return nothing
+            push!(integralnewdu, val)
+        end
+        return integralnewdu
+    end
+
     if is_principal_J
         gF = AdmissibleTuple(d, F.r, F.Q)
         println("  gQ = ", F.Q)
@@ -385,17 +453,31 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
             end
         end
 
+        println("  v(p)*v(-p) for all nonzero p:")
+        for p1 = 0:d-1
+            for p2 = 0:d-1
+                (p1 == 0 && p2 == 0) && continue
+                mp1 = mod(-p1, d)
+                mp2 = mod(-p2, d)
+                product = new_ovs[p1+1, p2+1] * new_ovs[mp1+1, mp2+1]
+                println("    p=($p1,$p2): v(p)*v(-p) = ", Float64(real(product)),
+                        " + ", Float64(imag(product)), "im",
+                        "  |v(p)*v(-p)| = ", Float64(abs(product)),
+                        "  1/(d+1) = ", 1.0/(d+1))
+            end
+        end
+
     else
         u_B = mP_O \ J
         rho_B_init = rho_reps[u_B]
         println("  class of J = ", u_B, " rho_B (raw) = ", rho_B_init)
 
         j_class = F_class + u_B
-        rho_j = rho_reps[j_class]
+        rho_j_orig = rho_reps[j_class]
 
-        # compute gQ_j from rho_j and HJ-reduce it
-        c0_j = coeff(rho_j, 0)
-        c1_j = coeff(rho_j, 1)
+        # compute gQ_j from rho_j_orig and HJ-reduce it
+        c0_j = coeff(rho_j_orig, 0)
+        c1_j = coeff(rho_j_orig, 1)
         p0_j = c0_j^2 - c1_j^2 * D
         p1_j = -2 * c0_j
         p2_j = 1
@@ -413,8 +495,32 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         gQ_j = minimal_hj_stabilizer(V_j, d)
         gF_j = AdmissibleTuple(d, F.r, gQ_j)
 
-        println("  product class = ", j_class, " rho_j = ", rho_j)
-        println("  gQ_j (HJ-reduced from rho_j) = ", gQ_j)
+        # rho_j_orig is a root of gQ_j_raw, NOT of the HJ-reduced gQ_j:
+        # reduced_hj_orbit / minimal_hj_stabilizer move to an SL2(Z)-equivalent
+        # form, and equivalent forms generally do not share a root. Recompute
+        # rho_j directly as a root of gQ_j itself (the larger of its two real
+        # roots) so that (gQ_j, rho_j) is a matched form/root pair.
+        places_K = real_places(K)
+        emb_conj_K = embedding(places_K[1])
+        emb_main_K = embedding(places_K[2])
+
+        D_gQj = Int(discriminant(gQ_j))
+        quotient_gQj, remainder_gQj = divrem(D_gQj, Dr)
+        remainder_gQj == 0 || error("discriminant(gQ_j) = ", D_gQj,
+                                     " is not an integer multiple of Dr = ", Dr)
+        f_gQj = isqrt(quotient_gQj)
+        f_gQj^2 == quotient_gQj || error("D_gQj / Dr = ", quotient_gQj,
+                                          " is not a perfect square (got isqrt = ", f_gQj, ")")
+        sqrt_gQj = f_gQj * sqrt_Dr
+        root_plus  = (-gQ_j.b + sqrt_gQj) / (2 * gQ_j.a)
+        root_minus = (-gQ_j.b - sqrt_gQj) / (2 * gQ_j.a)
+
+        rho_j = Float64(emb_main_K(root_plus)) >= Float64(emb_main_K(root_minus)) ?
+                root_plus : root_minus
+
+        println("  product class = ", j_class, " rho_j_orig (picard rep) = ", rho_j_orig)
+        println("  rho_j (larger root of gQ_j) = ", rho_j)
+        println("  gQ_j (HJ-reduced) = ", gQ_j)
         println("  gQ_j(rho_j, 1) = ", gQ_j(rho_j, K(1)), " (should be 0)")
 
         M_g_j = multiplication_matrix_mod_d(K(gamma), rho_j, d, D)
@@ -426,19 +532,52 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                  (chi * sqrt(BigFloat(d + 1)))
         println("  c_g_j = ", c_g_j)
 
+        # The order O has conductor F.q, and any ideal representing a
+        # non-trivial Picard class of a conductor-q order will structurally
+        # carry a factor of q in its basis coordinates. When q | d (as here,
+        # q=3, d=21), requiring c1's numerator/denominator to be coprime to
+        # the *full* d is unsatisfiable by construction, not a sign of a bad
+        # candidate. Strip q's prime factors out of d before checking; the
+        # compute_integralnewdu/injectivity test below remains the real
+        # correctness gate and is unaffected by this relaxation.
+        q_val = Int(F.q)
+        d_check = d
+        for (p, _) in factor(q_val)
+            while d_check % Int(p) == 0
+                d_check ÷= Int(p)
+            end
+        end
+        println("  d = ", d, ", q = ", q_val, ", d_check (coprimality target) = ", d_check)
+
         function find_good_rhoB(rho_B_init, K, d)
             candidates = []
             for n in -20:20
                 cand = rho_B_init + K(n)
                 c1 = coeff(cand, 1)
-                if gcd(Int(abs(numerator(c1))), d) == 1
+                if gcd(Int(abs(numerator(c1))), d_check) == 1 &&
+                   gcd(Int(denominator(c1)), d_check) == 1
+                    main_val = Float64(emb_main_K(cand))
+                    conj_val = Float64(emb_conj_K(cand))
+                    if main_val < conj_val
+                        c0 = coeff(cand, 0)
+                        cand = c0 - c1 * gen(K)
+                        println("    swapped to conjugate: ", cand)
+                    end
                     push!(candidates, cand)
                 end
             end
             try
                 cand = -K(1) / rho_B_init
                 c1 = coeff(cand, 1)
-                if gcd(Int(abs(numerator(c1))), d) == 1
+                if gcd(Int(abs(numerator(c1))), d_check) == 1 &&
+                   gcd(Int(denominator(c1)), d_check) == 1
+                    main_val = Float64(emb_main_K(cand))
+                    conj_val = Float64(emb_conj_K(cand))
+                    if main_val < conj_val
+                        c0 = coeff(cand, 0)
+                        cand = c0 - c1 * gen(K)
+                        println("    swapped to conjugate: ", cand)
+                    end
                     push!(candidates, cand)
                 end
             catch end
@@ -446,14 +585,24 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 try
                     cand = -K(1) / (rho_B_init + K(n))
                     c1 = coeff(cand, 1)
-                    if gcd(Int(abs(numerator(c1))), d) == 1
+                    if gcd(Int(abs(numerator(c1))), d_check) == 1 &&
+                       gcd(Int(denominator(c1)), d_check) == 1
+                        main_val = Float64(emb_main_K(cand))
+                        conj_val = Float64(emb_conj_K(cand))
+                        if main_val < conj_val
+                            c0 = coeff(cand, 0)
+                            cand = c0 - c1 * gen(K)
+                            println("    swapped to conjugate: ", cand)
+                        end
                         push!(candidates, cand)
                     end
                 catch end
             end
-            println("  Found ", length(candidates), " rho_B candidates with c1 coprime to d")
+            println("  Found ", length(candidates), " rho_B candidates with c1 num and den coprime to d_check=", d_check)
             for cand in candidates
-                println("    rho_B = ", cand, " c1 = ", coeff(cand, 1))
+                println("    rho_B = ", cand, " c1 = ", coeff(cand, 1),
+                        " main = ", Float64(emb_main_K(cand)),
+                        " conj = ", Float64(emb_conj_K(cand)))
             end
             return candidates
         end
@@ -461,7 +610,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         good_rhoB_candidates = find_good_rhoB(rho_B_init, K, d)
 
         if isempty(good_rhoB_candidates)
-            error("Could not find rho_B with c1 coprime to d=", d)
+            error("Could not find rho_B with c1 coprime to d_check=", d_check, " (d=", d, ")")
         end
 
         s1, s2, rho_B = nothing, nothing, nothing
@@ -469,10 +618,42 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
             println("  Trying rho_B candidate = ", rhoB_cand)
             try
                 s1_try, s2_try = find_s1_s2(J, rhoB_cand, rho, u_B, P_O, mP_O, O, K, OK, d, rho_j)
-                s1, s2 = s1_try, s2_try
-                rho_B = rhoB_cand
-                println("  Success with rho_B = ", rhoB_cand)
-                break
+
+                # test injectivity and valid denominators over all p
+                seen = Set{Vector{Int}}()
+                valid = true
+                for p1 = 0:d-1
+                    valid || break
+                    for p2 = 0:d-1
+                        (p1 == 0 && p2 == 0) && continue
+                        indu = compute_integralnewdu(p1, p2, s1_try, s2_try, rhoB_cand, rho, rho_j, M_g_j, d)
+                        if indu === nothing
+                            println("  Candidate ", rhoB_cand, " failed du_to_int_mod_d at p=($p1,$p2)")
+                            valid = false
+                            break
+                        end
+                        if indu == [0, 0]
+                            println("  Candidate ", rhoB_cand, " gives [0,0] at p=($p1,$p2)")
+                            valid = false
+                            break
+                        end
+                        if indu in seen
+                            println("  Candidate ", rhoB_cand, " not injective at p=($p1,$p2): ", indu, " already seen")
+                            valid = false
+                            break
+                        end
+                        push!(seen, indu)
+                    end
+                end
+
+                if valid
+                    s1, s2 = s1_try, s2_try
+                    rho_B = rhoB_cand
+                    println("  Success with rho_B = ", rhoB_cand)
+                    break
+                else
+                    println("  Candidate ", rhoB_cand, " failed injectivity/validity check")
+                end
             catch e
                 println("  Failed with rho_B = ", rhoB_cand, ": ", e)
                 continue
@@ -486,6 +667,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         println("  Using rho_B = ", rho_B)
         println("  s1 = ", s1, " s2 = ", s2)
 
+        test1 = true
         for p1 = 0:d-1
             for p2 = 0:d-1
                 (p1 == 0 && p2 == 0) && continue
@@ -498,31 +680,36 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 product = elem1 * elem2
 
                 u2, u1 = find_rho_j_and_coords(product, rho_j)
+                println("    p=($p1,$p2): u1=", u1, " u2=", u2)
 
                 du = [to_du_mod_d(u1, d), to_du_mod_d(u2, d)]
 
                 raw_newdu = M_g_j * du
                 newdu = [to_du_mod_d(raw_newdu[1], d), to_du_mod_d(raw_newdu[2], d)]
 
-                # multiply by d and convert to integers mod d
                 integralnewdu = Int[]
                 for u in newdu
                     du_int = d * u
-                    num = Int(numerator(du_int))
-                    den = Int(denominator(du_int))
-                    if den == 1
-                        push!(integralnewdu, mod(num, d))
-                    else
-                        push!(integralnewdu, mod(num * invmod(den, d), d))
-                    end
+                    val = du_to_int_mod_d(du_int, d)
+                    push!(integralnewdu, val)
+                end
+
+                if p1 == 7 && p2 == 7
+                    println("  p=(7,7): integralnewdu = ", integralnewdu)
                 end
 
                 QA = BigFloat(-QQ_form(integralnewdu...) / (d * (d - 2)))
                 s = isodd(d) ? 1 : (1 + integralnewdu[1]) * (1 + integralnewdu[2])
                 new_ovs[gp[1]+1, gp[2]+1] = ζ^QA * (-1)^s * c_g_j *
                                               shin_of_tuple(gF_j, integralnewdu)
+
+                if abs(abs(shin_of_tuple(gF_j, integralnewdu) * shin_of_tuple(gF_j, -integralnewdu)) - 1.0) > 1e-10
+                    println("    FAIL at p=($p1,$p2)")
+                    test1 = false
+                end
             end
         end
+        println("  all |vv(p)vv(-p)| correct: ", test1)
     end
 
     max_imag = maximum(abs.(imag.(new_ovs)))
@@ -530,20 +717,6 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
 
     dev = ghost_overlap_test_complex(new_ovs, d)
     println("  ghost condition deviation on new_ovs = ", dev)
-
-    println("  v(p)*v(-p) for all nonzero p:")
-    for p1 = 0:d-1
-        for p2 = 0:d-1
-            (p1 == 0 && p2 == 0) && continue
-            mp1 = mod(-p1, d)
-            mp2 = mod(-p2, d)
-            product = new_ovs[p1+1, p2+1] * new_ovs[mp1+1, mp2+1]
-            println("    p=($p1,$p2): v(p)*v(-p) = ", Float64(real(product)),
-                    " + ", Float64(imag(product)), "im",
-                    "  |v(p)*v(-p)| = ", Float64(abs(product)),
-                    "  1/(d+1) = ", 1.0/(d+1))
-        end
-    end
 
     println("  Constructing fiducial projector M (unscaled)...")
     Id = Matrix{Complex{BigFloat}}(I, d, d)
@@ -656,18 +829,9 @@ function ray_class_group_representatives(K, O, m, Sigma)
     println("  ray_class: make_coprime_representatives done")
     GC.gc()
 
-    println("  ray_class: picard_reps details:")
+    println("  ray_class: picard_reps:")
     for (i, J) in enumerate(picard_reps)
-        b = basis(J)
-        b1 = elem_in_nf(b[1])
-        b2 = elem_in_nf(b[2])
-        b1_rat = coeff(b1, 0)
-        rho_J = iszero(b1_rat) ? nothing : b2 / b1_rat
-        println("    rep $i: group_elem = ", group_elems[i])
-        println("      ideal = ", J)
-        println("      basis b1 = ", b1, " b2 = ", b2)
-        println("      rho = b2/b1_rat = ", rho_J)
-        println("      norm(J) = ", norm(J))
+        println("    rep $i: ", J, " group_elem = ", group_elems[i])
     end
 
     N = num_principal_ray_classes(OK, O, m, Sigma)

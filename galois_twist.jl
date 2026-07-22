@@ -194,7 +194,7 @@ function find_s1_s2(J, rho_B, rho, u_B, P_O, mP_O, O, K, OK, d_val, rho_j)
 
     best_alpha = nothing
     best_size = Inf
-    ALPHA_SEARCH_RANGE = -60:60
+    ALPHA_SEARCH_RANGE = -150:150
     for k in ALPHA_SEARCH_RANGE
         for sgn in [1, -1]
             a_try = K(sgn) * alpha_base * eps_OK^k
@@ -304,11 +304,52 @@ end
 #
 # Returns (true, generator) if I is principal, (false, nothing) otherwise
 # (including if the search bound is exceeded — NOT a proof of non-principality).
-function is_principal_generator_O(I, O, K; search_bound::Int = 50)
+function embed_pair(x, places)
+    return (Float64(embedding(places[1])(x)), Float64(embedding(places[2])(x)))
+end
+
+# Gauss/Lagrange reduction of the 2D lattice spanned by v1, v2 (elements of a
+# real quadratic field K), using the positive-definite quadratic form
+# Q(x) = sigma1(x)^2 + sigma2(x)^2 (sum of squares over both real embeddings).
+# This is the standard reduction algorithm for 2D lattices/binary quadratic
+# forms - it finds a basis where the vectors are as short as possible, so
+# that a small bounded search over integer combinations of the REDUCED basis
+# is far more likely to reach a genuinely small element (like a generator)
+# than the same bounded search would be over an arbitrary, unreduced basis.
+function lattice_reduce_2d(v1, v2, K, places)
+    norm2(e) = e[1]^2 + e[2]^2
+    dotp(ea, eb) = ea[1]*eb[1] + ea[2]*eb[2]
+
+    e1 = embed_pair(v1, places)
+    e2 = embed_pair(v2, places)
+
+    for _ in 1:200
+        if norm2(e2) < norm2(e1)
+            v1, v2 = v2, v1
+            e1, e2 = e2, e1
+        end
+        mu = round(Int, dotp(e1, e2) / norm2(e1))
+        mu == 0 && break
+        v2 = v2 - K(mu) * v1
+        e2 = embed_pair(v2, places)
+    end
+
+    return v1, v2
+end
+
+function is_principal_generator_O(I, O, K; search_bound::Int = 1000)
     b = basis(I)
-    v1 = elem_in_nf(b[1])
-    v2 = elem_in_nf(b[2])
-    N = abs(Int(norm(I)))
+    v1_raw = elem_in_nf(b[1])
+    v2_raw = elem_in_nf(b[2])
+    places = real_places(K)
+    v1, v2 = lattice_reduce_2d(v1_raw, v2_raw, K, places)
+    N = abs(norm(I))
+
+    e1 = embed_pair(v1, places)
+    e2 = embed_pair(v2, places)
+    println("    [gen-search] target norm N = ", N)
+    println("    [gen-search] reduced basis embedded sizes: |v1|^2 = ",
+            e1[1]^2 + e1[2]^2, "  |v2|^2 = ", e2[1]^2 + e2[2]^2)
 
     function is_generator(alpha)
         iszero(alpha) && return false
@@ -324,15 +365,19 @@ function is_principal_generator_O(I, O, K; search_bound::Int = 50)
         is_generator(alpha) && return true, alpha
     end
 
+    n_norm_matches = 0
     for r in 2:search_bound
         for m in -r:r, n in -r:r
             max(abs(m), abs(n)) == r || continue   # only the new outer shell
             alpha = m*v1 + n*v2
-            if abs(Int(norm(K(alpha)))) == N
+            if abs(norm(K(alpha))) == N
+                n_norm_matches += 1
                 is_generator(alpha) && return true, alpha
             end
         end
     end
+    println("    [gen-search] search_bound=", search_bound, " exhausted; ",
+            n_norm_matches, " element(s) matched the target norm N, none confirmed as a generator")
 
     return false, nothing
 end
@@ -353,7 +398,7 @@ function find_s1_s2_O(J, rho_B, rho, u_B, P_O, mP_O, O, K, d_val, rho_j)
     # Sanity check: b_O should be invertible since it's a Picard group
     # representative. This should always hold; checked explicitly rather
     # than assumed.
-    is_inv_b, _ = isinvertible(b_O)
+    is_inv_b, _ = Hecke.is_invertible(b_O)
     is_inv_b || error("b_O is not invertible - unexpected for a Picard group representative")
 
     dO_O = ideal(O, d_val)
@@ -366,7 +411,7 @@ function find_s1_s2_O(J, rho_B, rho, u_B, P_O, mP_O, O, K, d_val, rho_j)
     # (e.g. non-principal ideals) do not apply to a principal ideal like this
     # one. This check is kept only as a cheap sanity assertion, not because
     # failure is expected.
-    is_inv_d, _ = isinvertible(dO_O)
+    is_inv_d, _ = Hecke.is_invertible(dO_O)
     is_inv_d || error("dO_O = ideal(O, d_val) is NOT invertible - this would be ",
                        "surprising for a principal ideal and likely indicates a ",
                        "Hecke API misuse rather than a genuine mathematical obstruction.")
@@ -386,8 +431,25 @@ function find_s1_s2_O(J, rho_B, rho, u_B, P_O, mP_O, O, K, d_val, rho_j)
                                          order(rhoB_lattice_O), " instead. Requesting fractional_ideal(O, ...) ",
                                          "did not guarantee the result is tagged with O.")
 
-    is_inv_lat, lattice_inv = isinvertible(rhoB_lattice_O)
-    is_inv_lat || error("Z + rho_B*Z is not invertible as an O-ideal - cannot invert")
+    # is_invertible_with_inverse has no method for fractional ideals in this
+    # Hecke version (MethodError observed). Use plain inv() directly instead,
+    # matching how the original OK-native code always did this. Self-verify
+    # the result rather than trusting it silently - but degrade to a warning
+    # (not a hard error) if isone(...) itself isn't the right predicate here,
+    # so we don't get stuck on yet another guessed function name.
+    lattice_inv = inv(rhoB_lattice_O)
+    is_unit_ideal = nothing
+    try
+        check_product = rhoB_lattice_O * lattice_inv
+        is_unit_ideal = isone(check_product)
+    catch e
+        println("  [O-native] WARNING: could not verify inv(rhoB_lattice_O) via isone(...) (", e,
+                ") - proceeding without this self-check")
+    end
+    if is_unit_ideal !== nothing
+        println("  [O-native] rhoB_lattice_O * inv(rhoB_lattice_O) == O ? ", is_unit_ideal)
+        is_unit_ideal || error("Z + rho_B*Z did NOT invert correctly as an O-ideal (product != O)")
+    end
 
     target_O = bdO_O * lattice_inv
     is_princ, alpha_base = is_principal_generator_O(target_O, O, K)
@@ -413,7 +475,7 @@ function find_s1_s2_O(J, rho_B, rho, u_B, P_O, mP_O, O, K, d_val, rho_j)
 
     best_alpha = nothing
     best_size = Inf
-    ALPHA_SEARCH_RANGE = -60:60
+    ALPHA_SEARCH_RANGE = -150:150
     for k in ALPHA_SEARCH_RANGE
         eps_k = eps_OK^k
         unit_in_O(eps_k) || continue
@@ -561,7 +623,8 @@ end
 
 function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                               is_principal_J::Bool,
-                              P_O, mP_O, rho_reps, gQ_reps, F_class)
+                              P_O, mP_O, rho_reps, gQ_reps, F_class,
+                              j_cache::Dict)
     d = Int(F.d)
     D = Int(F.D)
     a = gen(K)
@@ -683,122 +746,107 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         end
 
     else
-        u_B = mP_O \ J
-        rho_B_init = rho_reps[u_B]
-        println("  class of J = ", u_B, " rho_B (raw) = ", rho_B_init)
+        j_key = objectid(J)
 
-        j_class = F_class + u_B
-        rho_j_orig = rho_reps[j_class]
+        if haskey(j_cache, j_key)
+            u_B, j_class, rho_j, gQ_j, gF_j, QQ_form, rho_B, s1, s2 = j_cache[j_key]
+            println("  [cache] Reusing rho_B/s1/s2 for this J (class ", u_B, ") - not recomputed")
+            println("  [cache] rho_j = ", rho_j, "  rho_B = ", rho_B, "  s1 = ", s1, "  s2 = ", s2)
+        else
+            u_B = mP_O \ J
+            rho_B_init = rho_reps[u_B]
+            println("  class of J = ", u_B, " rho_B (raw) = ", rho_B_init)
 
-        # compute gQ_j from rho_j_orig and HJ-reduce it
-        c0_j = coeff(rho_j_orig, 0)
-        c1_j = coeff(rho_j_orig, 1)
-        p0_j = c0_j^2 - c1_j^2 * D
-        p1_j = -2 * c0_j
-        p2_j = 1
-        scale_j = lcm(Int(denominator(QQ(p0_j))),
-                      Int(denominator(QQ(p1_j))), 1)
-        a_int_j = Int(round(scale_j * p2_j))
-        b_int_j = Int(round(scale_j * p1_j))
-        c_int_j = Int(round(scale_j * p0_j))
-        g_int_j = gcd(a_int_j, b_int_j, c_int_j)
-        a_int_j ÷= g_int_j
-        b_int_j ÷= g_int_j
-        c_int_j ÷= g_int_j
-        gQ_j_raw = binary_quadratic_form(a_int_j, b_int_j, c_int_j)
-        V_j = reduced_hj_orbit(gQ_j_raw)
-        gQ_j = minimal_hj_stabilizer(V_j, d)
-        gF_j = AdmissibleTuple(d, F.r, gQ_j)
+            j_class = F_class + u_B
+            rho_j_orig = rho_reps[j_class]
 
-        # rho_j_orig is a root of gQ_j_raw, NOT of the HJ-reduced gQ_j:
-        # reduced_hj_orbit / minimal_hj_stabilizer move to an SL2(Z)-equivalent
-        # form, and equivalent forms generally do not share a root. Recompute
-        # rho_j directly as a root of gQ_j itself (the larger of its two real
-        # roots) so that (gQ_j, rho_j) is a matched form/root pair.
-        places_K = real_places(K)
-        emb_conj_K = embedding(places_K[1])
-        emb_main_K = embedding(places_K[2])
+            # compute gQ_j from rho_j_orig and HJ-reduce it
+            c0_j = coeff(rho_j_orig, 0)
+            c1_j = coeff(rho_j_orig, 1)
+            p0_j = c0_j^2 - c1_j^2 * D
+            p1_j = -2 * c0_j
+            p2_j = 1
+            scale_j = lcm(Int(denominator(QQ(p0_j))),
+                          Int(denominator(QQ(p1_j))), 1)
+            a_int_j = Int(round(scale_j * p2_j))
+            b_int_j = Int(round(scale_j * p1_j))
+            c_int_j = Int(round(scale_j * p0_j))
+            g_int_j = gcd(a_int_j, b_int_j, c_int_j)
+            a_int_j ÷= g_int_j
+            b_int_j ÷= g_int_j
+            c_int_j ÷= g_int_j
+            gQ_j_raw = binary_quadratic_form(a_int_j, b_int_j, c_int_j)
+            V_j = reduced_hj_orbit(gQ_j_raw)
+            gQ_j = minimal_hj_stabilizer(V_j, d)
+            gF_j = AdmissibleTuple(d, F.r, gQ_j)
 
-        D_gQj = Int(discriminant(gQ_j))
-        quotient_gQj, remainder_gQj = divrem(D_gQj, Dr)
-        remainder_gQj == 0 || error("discriminant(gQ_j) = ", D_gQj,
-                                     " is not an integer multiple of Dr = ", Dr)
-        f_gQj = isqrt(quotient_gQj)
-        f_gQj^2 == quotient_gQj || error("D_gQj / Dr = ", quotient_gQj,
-                                          " is not a perfect square (got isqrt = ", f_gQj, ")")
-        sqrt_gQj = f_gQj * sqrt_Dr
-        root_plus  = (-gQ_j.b + sqrt_gQj) / (2 * gQ_j.a)
-        root_minus = (-gQ_j.b - sqrt_gQj) / (2 * gQ_j.a)
+            # rho_j_orig is a root of gQ_j_raw, NOT of the HJ-reduced gQ_j:
+            # reduced_hj_orbit / minimal_hj_stabilizer move to an SL2(Z)-equivalent
+            # form, and equivalent forms generally do not share a root. Recompute
+            # rho_j directly as a root of gQ_j itself (the larger of its two real
+            # roots) so that (gQ_j, rho_j) is a matched form/root pair.
+            places_K = real_places(K)
+            emb_conj_K = embedding(places_K[1])
+            emb_main_K = embedding(places_K[2])
 
-        rho_j = Float64(emb_main_K(root_plus)) >= Float64(emb_main_K(root_minus)) ?
-                root_plus : root_minus
+            D_gQj = Int(discriminant(gQ_j))
+            quotient_gQj, remainder_gQj = divrem(D_gQj, Dr)
+            remainder_gQj == 0 || error("discriminant(gQ_j) = ", D_gQj,
+                                         " is not an integer multiple of Dr = ", Dr)
+            f_gQj = isqrt(quotient_gQj)
+            f_gQj^2 == quotient_gQj || error("D_gQj / Dr = ", quotient_gQj,
+                                              " is not a perfect square (got isqrt = ", f_gQj, ")")
+            sqrt_gQj = f_gQj * sqrt_Dr
+            root_plus  = (-gQ_j.b + sqrt_gQj) / (2 * gQ_j.a)
+            root_minus = (-gQ_j.b - sqrt_gQj) / (2 * gQ_j.a)
 
-        println("  product class = ", j_class, " rho_j_orig (picard rep) = ", rho_j_orig)
-        println("  rho_j (larger root of gQ_j) = ", rho_j)
-        println("  gQ_j (HJ-reduced) = ", gQ_j)
-        println("  gQ_j(rho_j, 1) = ", gQ_j(rho_j, K(1)), " (should be 0)")
+            rho_j = Float64(emb_main_K(root_plus)) >= Float64(emb_main_K(root_minus)) ?
+                    root_plus : root_minus
 
-        M_g_j = multiplication_matrix_mod_d(K(gamma), rho_j, d, D)
-        println("  M_g_j = ", M_g_j)
+            println("  product class = ", j_class, " rho_j_orig (picard rep) = ", rho_j_orig)
+            println("  rho_j (larger root of gQ_j) = ", rho_j)
+            println("  gQ_j (HJ-reduced) = ", gQ_j)
+            println("  gQ_j(rho_j, 1) = ", gQ_j(rho_j, K(1)), " (should be 0)")
 
-        QQ_form = binary_quadratic_form(gF_j.A[2,1], gF_j.A[2,2] - gF_j.A[1,1], -gF_j.A[1,2])
+            QQ_form = binary_quadratic_form(gF_j.A[2,1], gF_j.A[2,2] - gF_j.A[1,1], -gF_j.A[1,2])
 
-        c_g_j = e(-BigFloat(rademacher(gF_j.A)) / 24) /
-                 (chi * sqrt(BigFloat(d + 1)))
-        println("  c_g_j = ", c_g_j)
-
-        # The order O has conductor F.q, and any ideal representing a
-        # non-trivial Picard class of a conductor-q order will structurally
-        # carry a factor of q in its basis coordinates. When q | d (as here,
-        # q=3, d=21), requiring c1's numerator/denominator to be coprime to
-        # the *full* d is unsatisfiable by construction, not a sign of a bad
-        # candidate. Strip q's prime factors out of d before checking; the
-        # compute_integralnewdu/injectivity test below remains the real
-        # correctness gate and is unaffected by this relaxation.
-        q_val = Int(F.q)
-        d_check = d
-        for (p, _) in factor(q_val)
-            while d_check % Int(p) == 0
-                d_check ÷= Int(p)
-            end
-        end
-        println("  d = ", d, ", q = ", q_val, ", d_check (coprimality target) = ", d_check)
-
-        function find_good_rhoB(rho_B_init, K, d)
-            candidates = []
-            for n in -20:20
-                cand = rho_B_init + K(n)
-                c1 = coeff(cand, 1)
-                if gcd(Int(abs(numerator(c1))), d_check) == 1 &&
-                   gcd(Int(denominator(c1)), d_check) == 1
-                    main_val = Float64(emb_main_K(cand))
-                    conj_val = Float64(emb_conj_K(cand))
-                    if main_val < conj_val
-                        c0 = coeff(cand, 0)
-                        cand = c0 - c1 * gen(K)
-                        println("    swapped to conjugate: ", cand)
-                    end
-                    push!(candidates, cand)
+            # The order O has conductor F.q, and any ideal representing a
+            # non-trivial Picard class of a conductor-q order will structurally
+            # carry a factor of q in its basis coordinates. When q | d (as here,
+            # q=3, d=21), requiring c1's numerator/denominator to be coprime to
+            # the *full* d is unsatisfiable by construction, not a sign of a bad
+            # candidate. Strip q's prime factors out of d before checking; the
+            # compute_integralnewdu/injectivity test below remains the real
+            # correctness gate and is unaffected by this relaxation.
+            q_val = Int(F.q)
+            d_check = d
+            for (p, _) in factor(q_val)
+                while d_check % Int(p) == 0
+                    d_check ÷= Int(p)
                 end
             end
-            try
-                cand = -K(1) / rho_B_init
-                c1 = coeff(cand, 1)
-                if gcd(Int(abs(numerator(c1))), d_check) == 1 &&
-                   gcd(Int(denominator(c1)), d_check) == 1
-                    main_val = Float64(emb_main_K(cand))
-                    conj_val = Float64(emb_conj_K(cand))
-                    if main_val < conj_val
-                        c0 = coeff(cand, 0)
-                        cand = c0 - c1 * gen(K)
-                        println("    swapped to conjugate: ", cand)
+            println("  d = ", d, ", q = ", q_val, ", d_check (coprimality target) = ", d_check)
+
+            function find_good_rhoB(rho_B_init, K, d)
+                RHOB_SEARCH_RANGE = -60:60
+                candidates = []
+                for n in RHOB_SEARCH_RANGE
+                    cand = rho_B_init + K(n)
+                    c1 = coeff(cand, 1)
+                    if gcd(Int(abs(numerator(c1))), d_check) == 1 &&
+                       gcd(Int(denominator(c1)), d_check) == 1
+                        main_val = Float64(emb_main_K(cand))
+                        conj_val = Float64(emb_conj_K(cand))
+                        if main_val < conj_val
+                            c0 = coeff(cand, 0)
+                            cand = c0 - c1 * gen(K)
+                            println("    swapped to conjugate: ", cand)
+                        end
+                        push!(candidates, cand)
                     end
-                    push!(candidates, cand)
                 end
-            catch end
-            for n in -20:20
                 try
-                    cand = -K(1) / (rho_B_init + K(n))
+                    cand = -K(1) / rho_B_init
                     c1 = coeff(cand, 1)
                     if gcd(Int(abs(numerator(c1))), d_check) == 1 &&
                        gcd(Int(denominator(c1)), d_check) == 1
@@ -812,50 +860,83 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                         push!(candidates, cand)
                     end
                 catch end
+                for n in RHOB_SEARCH_RANGE
+                    try
+                        cand = -K(1) / (rho_B_init + K(n))
+                        c1 = coeff(cand, 1)
+                        if gcd(Int(abs(numerator(c1))), d_check) == 1 &&
+                           gcd(Int(denominator(c1)), d_check) == 1
+                            main_val = Float64(emb_main_K(cand))
+                            conj_val = Float64(emb_conj_K(cand))
+                            if main_val < conj_val
+                                c0 = coeff(cand, 0)
+                                cand = c0 - c1 * gen(K)
+                                println("    swapped to conjugate: ", cand)
+                            end
+                            push!(candidates, cand)
+                        end
+                    catch end
+                end
+                println("  Found ", length(candidates), " rho_B candidates with c1 num and den coprime to d_check=", d_check)
+                for cand in candidates
+                    println("    rho_B = ", cand, " c1 = ", coeff(cand, 1),
+                            " main = ", Float64(emb_main_K(cand)),
+                            " conj = ", Float64(emb_conj_K(cand)))
+                end
+                return candidates
             end
-            println("  Found ", length(candidates), " rho_B candidates with c1 num and den coprime to d_check=", d_check)
-            for cand in candidates
-                println("    rho_B = ", cand, " c1 = ", coeff(cand, 1),
-                        " main = ", Float64(emb_main_K(cand)),
-                        " conj = ", Float64(emb_conj_K(cand)))
+
+            good_rhoB_candidates = find_good_rhoB(rho_B_init, K, d)
+
+            if isempty(good_rhoB_candidates)
+                error("Could not find rho_B with c1 coprime to d_check=", d_check, " (d=", d, ")")
             end
-            return candidates
-        end
 
-        good_rhoB_candidates = find_good_rhoB(rho_B_init, K, d)
-
-        if isempty(good_rhoB_candidates)
-            error("Could not find rho_B with c1 coprime to d_check=", d_check, " (d=", d, ")")
-        end
-
-        s1, s2, rho_B = nothing, nothing, nothing
-        for rhoB_cand in good_rhoB_candidates
-            println("  Trying rho_B candidate = ", rhoB_cand)
-            try
-                s1_try, s2_try = find_s1_s2(J, rhoB_cand, rho, u_B, P_O, mP_O, O, K, OK, d, rho_j)
-                # NOTE: per-p validity/integrality check removed on request.
-                # The first candidate for which find_s1_s2 succeeds at all is
-                # now accepted unconditionally - there is no longer any check
-                # that compute_integralnewdu produces sensible, non-degenerate
-                # values across the full range of p. Combined with the lossy
-                # du_to_int_mod_d above, downstream results (new_ovs, psi) may
-                # be silently wrong even when this loop reports success.
-                s1, s2 = s1_try, s2_try
-                rho_B = rhoB_cand
-                println("  Accepted rho_B = ", rhoB_cand, " (no validity check performed)")
-                break
-            catch e
-                println("  Failed with rho_B = ", rhoB_cand, ": ", e)
-                continue
+            s1, s2, rho_B = nothing, nothing, nothing
+            for rhoB_cand in good_rhoB_candidates
+                println("  Trying rho_B candidate = ", rhoB_cand)
+                try
+                    s1_try, s2_try = find_s1_s2_O(J, rhoB_cand, rho, u_B, P_O, mP_O, O, K, d, rho_j)
+                    # NOTE: per-p validity/integrality check removed on request.
+                    # The first candidate for which find_s1_s2 succeeds at all is
+                    # now accepted unconditionally - there is no longer any check
+                    # that compute_integralnewdu produces sensible, non-degenerate
+                    # values across the full range of p. Combined with the lossy
+                    # du_to_int_mod_d above, downstream results (new_ovs, psi) may
+                    # be silently wrong even when this loop reports success.
+                    s1, s2 = s1_try, s2_try
+                    rho_B = rhoB_cand
+                    println("  Accepted rho_B = ", rhoB_cand, " (no validity check performed)")
+                    break
+                catch e
+                    println("  Failed with rho_B = ", rhoB_cand, ": ", e)
+                    continue
+                end
             end
+
+            if s1 === nothing
+                error("Could not find valid s1, s2 for any rho_B transform")
+            end
+
+            println("  Using rho_B = ", rho_B)
+            println("  s1 = ", s1, " s2 = ", s2)
+
+            j_cache[j_key] = (u_B, j_class, rho_j, gQ_j, gF_j, QQ_form, rho_B, s1, s2)
         end
 
-        if s1 === nothing
-            error("Could not find valid s1, s2 for any rho_B transform")
-        end
+        # --- gamma-dependent quantities below: recomputed on every call ---
+        M_g_j = multiplication_matrix_mod_d(K(gamma), rho_j, d, D)
+        println("  M_g_j = ", M_g_j)
 
-        println("  Using rho_B = ", rho_B)
-        println("  s1 = ", s1, " s2 = ", s2)
+        det_M_g_j = mod(M_g_j[1,1]*M_g_j[2,2] - M_g_j[1,2]*M_g_j[2,1], d)
+        gcd_det_d = gcd(det_M_g_j, d)
+        println("  det(M_g_j) mod d = ", det_M_g_j, "  gcd(det, d) = ", gcd_det_d)
+        gcd_det_d == 1 || error("M_g_j is NOT in GL_2(Z/", d, "Z): det = ", det_M_g_j,
+                                 " is not invertible mod ", d, " (gcd(det, d) = ", gcd_det_d, ")")
+
+        c_g_j = e(-BigFloat(rademacher(gF_j.A)) / 24) /
+                 (chi * sqrt(BigFloat(d + 1)))
+        println("  c_g_j = ", c_g_j)
 
         test1 = true
         for p1 = 0:d-1
@@ -1112,6 +1193,8 @@ function test_all_twists(d::Int)
     println("Principal triples: ", length(principal_triples))
     println("Non-principal triples: ", length(nonprincipal_triples))
 
+    j_cache = Dict{UInt64, Any}()   # keyed by objectid(J); caches rho_B/s1/s2/etc that only depend on J's class, not on gamma
+
     n_principal = min(5, length(principal_triples))
     println("\n=== Testing first ", n_principal, " principal twists ===")
     for (k, (J, I, gamma)) in enumerate(principal_triples[1:n_principal])
@@ -1121,7 +1204,7 @@ function test_all_twists(d::Int)
         println("  norm(gamma) = ", norm(K(gamma)))
         new_ovs, gF, psi = twisted_chi_general(F, J, gamma, K, O,
                                                 true, P_O, mP_O,
-                                                rho_reps, gQ_reps, F_class)
+                                                rho_reps, gQ_reps, F_class, j_cache)
     end
 
     n_nonprincipal = min(20, length(nonprincipal_triples))
@@ -1133,7 +1216,7 @@ function test_all_twists(d::Int)
         println("  norm(gamma) = ", norm(K(gamma)))
         new_ovs, gF, psi = twisted_chi_general(F, J, gamma, K, O,
                                                 false, P_O, mP_O,
-                                                rho_reps, gQ_reps, F_class)
+                                                rho_reps, gQ_reps, F_class, j_cache)
     end
 end
 

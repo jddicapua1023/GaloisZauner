@@ -1,12 +1,30 @@
+# galois_action_naive_search_OLD.jl
+#
+# SUPERSEDED intermediate version: find_alpha_rhoB_s1_s2_O here performs a
+# joint brute-force height search for alpha, rho_B, s1, s2 (bounded
+# rhoB_height / alpha_base_height / alpha_sign_range loops), and
+# num_principal_ray_classes/ray_class_group_representatives are the earlier,
+# less robust versions (fundamental unit taken as U_OK[2] directly rather
+# than searched for; no O-own-unit t0/j0 period correction).
+#
+# As of Aug 2026 the project owner designated the two-stage joint
+# lattice-reduction approach in galois_action_ghost_sics.jl (originally
+# galois_twist_vector_lattice_search.jl) as canonical instead - it also
+# fixes a confirmed class-inversion bug in b_O selection that this version
+# does not have a defense against. Kept here for historical reference only;
+# not part of the maintained code path, not rewired to the new include paths.
+#
+# (Originally galois_twist_naive_search.jl.)
+
 using Hecke
 using Zauner
 import Zauner: _ghost_invariants, _dualize, _approx_complex_intersection, roots, Vandermonde, pow_to_elem_sym_poly
 using GenericFFT: fft
 using LinearAlgebra
-include("ray_unit_quotient.jl")
-include("term2.jl")
-include("enumeration_with_infinite_places.jl")
-include("make_coprime_reps.jl")
+include("../01_ray_class_representatives/unit_group_quotients.jl")
+include("../01_ray_class_representatives/ray_class_enumeration.jl")
+include("../01_ray_class_representatives/coprime_representatives.jl")
+
 
 function ghost_overlaps(ψ::AbstractVector)
     φ = circshift(reverse(ψ), 1)

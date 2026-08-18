@@ -1,7 +1,15 @@
+# example_ray_class_groups_and_fields.jl
+#
+# Worked examples computing ray class group data (via residue_unit_quotient
+# / ray_unit_quotient / enumerate_principal_ray_classes) for a few small
+# quadratic-field / order / modulus choices.
+#
+# (Renamed from examples_rayclassgroupsrayclassfields.jl.)
+
 using Hecke
-include("ray_unit_quotient.jl")
-include("term2.jl")
-include("enumeration_with_infinite_places.jl")
+include("../01_ray_class_representatives/unit_group_quotients.jl")
+include("../01_ray_class_representatives/ray_class_enumeration.jl")
+
 
 # Example 1 conductor 1 m is 7
 K, a = quadratic_field(2)

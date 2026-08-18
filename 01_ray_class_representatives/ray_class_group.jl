@@ -1,8 +1,29 @@
+# ray_class_group.jl
+#
+# Top-level construction of explicit ray class group representatives,
+# combining the Picard group of O, coprime representative search, and
+# principal ray class enumeration.
+#
+#   - num_principal_ray_classes:       how many principal ray classes to
+#                                       look for (index computation).
+#   - ray_class_group_representatives: full set of explicit ray class group
+#                                       representatives, as (Picard rep,
+#                                       principal ray class rep) pairs.
+#
+# NOTE (pre-existing, not introduced by this reorganization): this file
+# calls make_coprime_representatives(O, m, mP_O, group_elems) with 4
+# arguments, but coprime_representatives.jl defines it with a required 5th
+# argument `d` with no default. This call will error as written; flagging
+# for the project owner rather than silently changing behavior.
+#
+# (Renamed from full_rayclassgrp.jl; one superseded draft of
+# ray_class_group_representatives that was block-commented out in the
+# original file has been removed - see the original upload if needed.)
+
 using Hecke
-include("ray_unit_quotient.jl")
-include("term2.jl")
-include("enumeration_with_infinite_places.jl")
-include("make_coprime_reps.jl")
+include("unit_group_quotients.jl")
+include("ray_class_enumeration.jl")
+include("coprime_representatives.jl")
 
 function num_principal_ray_classes(OK, O, m, Sigma)
     K = number_field(O)
@@ -77,46 +98,4 @@ function ray_class_group_representatives(K, O, m, Sigma)
 
     return all_reps, all_triples
 end
-
-#=
-function ray_class_group_representatives(K, O, m, Sigma)
-    OK = maximal_order(K)
-
-    # Step 1: get Picard group representatives coprime to m
-    P_O, mP_O = picard_group(O)
-    gens_P = gens(P_O)
-    divs = elementary_divisors(P_O)
-    ranges = [0:Int(d)-1 for d in divs]
-
-    group_elems = []
-    for exps in Iterators.product(ranges...)
-        g = isempty(gens_P) ? zero(P_O) : sum(exps[i] * gens_P[i] for i in 1:length(gens_P))
-        push!(group_elems, g)
-    end
-
-    picard_reps = make_coprime_representatives(O, m, mP_O, group_elems)
-
-    # Step 2: compute number of principal ray classes
-    N = num_principal_ray_classes(OK, O, m, Sigma)
-    println("Number of principal ray classes: ", N)
-
-    # Step 3: enumerate principal ray classes
-    principal_reps = enumerate_principal_ray_classes(K, O, m, Sigma, N)
-
-    # Step 4: combine — for each Picard rep, twist by each principal ray class
-    all_reps = []
-
-    for J in picard_reps
-        # trivial principal class: just J itself
-        push!(all_reps, J)
-
-        # nontrivial principal classes: J * I
-        for (I, gamma, h) in principal_reps
-            push!(all_reps, J * I)
-        end
-    end
-
-    return all_reps
-end
-=#
 

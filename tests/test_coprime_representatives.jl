@@ -1,8 +1,21 @@
+# test_coprime_representatives.jl
+#
+# Worked examples/manual tests + scratch diagnostics for
+# make_coprime_representatives (coprime_representatives.jl).
+#
+# NOTE (pre-existing, not introduced by this reorganization): the calls to
+# make_coprime_representatives below pass 4 arguments, but
+# coprime_representatives.jl defines it with a required 5th argument `d`
+# (no default). These calls will error as written; flagging for the
+# project owner rather than silently changing behavior.
+#
+# (Renamed from coprime_reps_test.jl; content otherwise unchanged, including
+# the trailing block-commented diagnostic scratch work.)
+
 using Hecke
-include("ray_unit_quotient.jl")
-include("term2.jl")
-include("enumeration_with_infinite_places.jl")
-include("make_coprime_reps.jl")
+include("../01_ray_class_representatives/ray_class_enumeration.jl")
+include("../01_ray_class_representatives/coprime_representatives.jl")
+
 
 # Example 1: Q(sqrt(5)), non-maximal order, m = 3
 println("Example 1")

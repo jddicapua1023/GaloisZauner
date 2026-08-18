@@ -1,9 +1,14 @@
+# test_ray_class_group.jl
+#
+# Worked examples/manual tests for num_principal_ray_classes and
+# ray_class_group_representatives (ray_class_group.jl), including the two
+# examples from the Kopp-Lagarias paper.
+#
+# (Renamed from full_rayclassgrp_tests.jl.)
+
 using Hecke
-include("ray_unit_quotient.jl")
-include("term2.jl")
-include("enumeration_with_infinite_places.jl")
-include("make_coprime_reps.jl")
-include("full_rayclassgrp.jl")
+include("../01_ray_class_representatives/ray_class_group.jl")
+
 
 
 

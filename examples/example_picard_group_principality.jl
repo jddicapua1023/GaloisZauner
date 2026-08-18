@@ -1,3 +1,12 @@
+# example_picard_group_principality.jl
+#
+# For the order O associated to AdmissibleTuple(15) (D, q from the ghost-SIC
+# admissible tuple), computes the Picard group of O and checks, for each
+# class, whether the corresponding ideal becomes principal after extension
+# to the maximal order OK.
+#
+# (Renamed from checkingN.jl.)
+
 using Hecke
 using Zauner
 

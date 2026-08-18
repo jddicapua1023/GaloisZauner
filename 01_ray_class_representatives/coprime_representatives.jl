@@ -1,3 +1,11 @@
+# coprime_representatives.jl
+#
+# Given Picard class representatives for a non-maximal order O, searches for
+# a coprime-to-m representative ideal for each class (needed so ray class
+# group representatives can be expressed via ideals coprime to the modulus).
+#
+# (Renamed from make_coprime_reps.jl.)
+
 using Hecke
 
 function make_coprime_representatives(O, m, mP, group_elems, d)

@@ -1,3 +1,10 @@
+# example_ring_class_group_representatives.jl
+#
+# Minimal worked example: Picard group (ring class group) of a non-maximal
+# order in Q(sqrt(-5)), with explicit ideal representatives for each class.
+#
+# (Renamed from ring_class_grp_reps_example.jl.)
+
 using Hecke
 
 # Q(sqrt(-5)) has class number 2 for the maximal order.

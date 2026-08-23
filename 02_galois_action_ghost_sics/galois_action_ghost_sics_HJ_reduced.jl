@@ -1189,65 +1189,18 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
             println("  class of J = ", u_B, " rho_B (raw) = ", rho_B_init)
 
             j_class = F_class + u_B
-            rho_j_orig = rho_reps[j_class]
 
-            # compute gQ_j from rho_j_orig and HJ-reduce it
-            c0_j = coeff(rho_j_orig, 0)
-            c1_j = coeff(rho_j_orig, 1)
-            p0_j = c0_j^2 - c1_j^2 * D
-            p1_j = -2 * c0_j
-            p2_j = 1
-            scale_j = lcm(Int(denominator(QQ(p0_j))),
-                          Int(denominator(QQ(p1_j))), 1)
-            a_int_j = Int(round(scale_j * p2_j))
-            b_int_j = Int(round(scale_j * p1_j))
-            c_int_j = Int(round(scale_j * p0_j))
-            g_int_j = gcd(a_int_j, b_int_j, c_int_j)
-            a_int_j ÷= g_int_j
-            b_int_j ÷= g_int_j
-            c_int_j ÷= g_int_j
-            gQ_j_raw = binary_quadratic_form(a_int_j, b_int_j, c_int_j)
-            V_j = reduced_hj_orbit(gQ_j_raw)
-            gQ_j = minimal_hj_stabilizer(V_j, d)
-            gF_j = AdmissibleTuple(d, F.r, gQ_j)
-
-            # rho_j_orig is a root of gQ_j_raw, NOT of the HJ-reduced gQ_j:
-            # reduced_hj_orbit / minimal_hj_stabilizer move to an SL2(Z)-equivalent
-            # form, and equivalent forms generally do not share a root. Recompute
-            # rho_j directly as a root of gQ_j itself (the larger of its two real
-            # roots) so that (gQ_j, rho_j) is a matched form/root pair.
-            places_K = real_places(K)
-            emb_conj_K = embedding(places_K[1])
-            emb_main_K = embedding(places_K[2])
-
-            D_gQj = Int(discriminant(gQ_j))
-            quotient_gQj, remainder_gQj = divrem(D_gQj, Dr)
-            remainder_gQj == 0 || error("discriminant(gQ_j) = ", D_gQj,
-                                         " is not an integer multiple of Dr = ", Dr)
-            f_gQj = isqrt(quotient_gQj)
-            f_gQj^2 == quotient_gQj || error("D_gQj / Dr = ", quotient_gQj,
-                                              " is not a perfect square (got isqrt = ", f_gQj, ")")
-            sqrt_gQj = f_gQj * sqrt_Dr
-            root_plus  = (-gQ_j.b + sqrt_gQj) / (2 * gQ_j.a)
-            root_minus = (-gQ_j.b - sqrt_gQj) / (2 * gQ_j.a)
-
-            rho_j = Float64(emb_main_K(root_plus)) >= Float64(emb_main_K(root_minus)) ?
-                    root_plus : root_minus
-
-            println("  product class = ", j_class, " rho_j_orig (picard rep) = ", rho_j_orig)
-            println("  rho_j (larger root of gQ_j) = ", rho_j)
-            println("  gQ_j (HJ-reduced) = ", gQ_j)
-            println("  gQ_j(rho_j, 1) = ", gQ_j(rho_j, K(1)), " (should be 0)")
-
-            QQ_form = binary_quadratic_form(gF_j.A[2,1], gF_j.A[2,2] - gF_j.A[1,1], -gF_j.A[1,2])
-
+            # d_check needs to exist before the new_rho_j search below (it's
+            # passed straight through to find_alpha_rhoB_s1_s2_O, which does
+            # not reference it, but computing it here rather than after the
+            # search keeps a single definition instead of two copies).
             # The order O has conductor F.q, and any ideal representing a
             # non-trivial Picard class of a conductor-q order will structurally
             # carry a factor of q in its basis coordinates. When q | d (as here,
             # q=3, d=21), requiring c1's numerator/denominator to be coprime
             # to the *full* d is unsatisfiable by construction, not a sign of a
             # bad candidate. Strip q's prime factors out of d before checking;
-            # the joint find_alpha_rhoB_s1_s2_O search below remains the real
+            # the joint find_alpha_rhoB_s1_s2_O search remains the real
             # correctness gate and is unaffected by this relaxation.
             q_val = Int(F.q)
             d_check = d
@@ -1257,6 +1210,118 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 end
             end
             println("  d = ", d, ", q = ", q_val, ", d_check (coprimality target) = ", d_check)
+
+            # --- NEW CONSTRUCTION OF rho_j (per project owner) ---
+            # The previous approach (rho_j_orig = rho_reps[j_class], then
+            # HJ-reduce a form built from it, then take THAT form's own root
+            # as "rho_j") was already flagged as inconsistent in an earlier
+            # debugging session (2026-07-23): reduced_hj_orbit/
+            # minimal_hj_stabilizer move to an SL2(Z)-equivalent form, and
+            # equivalent forms generally do NOT share a root - so the
+            # resulting rho_j was never actually guaranteed consistent with
+            # rho_reps[j_class]/the Picard class arithmetic that rho_B, J,
+            # alpha are all built around. This was a very plausible source
+            # of the det(M_g_j)-composition-map singularity found this
+            # session (a spurious factor of 7 for one run, d=21).
+            #
+            # New approach: derive rho_j directly and consistently from the
+            # SAME verified, disc-log-free two-stage search used for rho_B,
+            # by targeting the COMBINED class
+            #     [P] = [J] * [(gamma)*(Z*rho+Z)]
+            # (NOT the inverse of (Z*rho+Z) - corrected per project owner)
+            # instead of looking anything up via rho_reps/gQ_reps. gamma's
+            # own coordinates in the (1,rho) basis give (P2_gamma, P1_gamma)
+            # with gamma = P2_gamma*rho - P1_gamma (same convention as
+            # elem1 = p2*rho - p1 in the main grid loop below), reusing
+            # find_rho_j_and_coords itself for that decomposition (not
+            # actually needed for P itself since gamma enters as a whole
+            # element, but printed as a useful diagnostic).
+            P2_gamma, P1_gamma = find_rho_j_and_coords(K(gamma), rho)
+            println("  gamma = P2*rho - P1 with P2 = ", P2_gamma, " P1 = ", P1_gamma)
+
+            # L_rho = Z + Z*rho, as a fractional O-ideal - used directly
+            # (NOT inverted) in P below.
+            Lrho_gens = [one(K), rho]
+            Lrho_ideal = fractional_ideal(O, Lrho_gens)
+
+            gamma_ideal = fractional_ideal(O, [K(gamma)])
+            P_frac = J * gamma_ideal * Lrho_ideal
+            println("  P = J*(gamma)*(Z+Z*rho) = ", P_frac, "  N(P) = ", norm(P_frac))
+
+            # Scaling a fractional ideal by a positive rational never changes
+            # its Picard class (the scalar itself generates a principal
+            # ideal), so clear denominators to get an INTEGRAL representative
+            # of [P] to hand to find_alpha_rhoB_s1_s2_O (which expects an
+            # honest AbsSimpleNumFieldOrderIdeal, the same way J is one).
+            scale_P = denominator(P_frac)
+            P_basis_nf = [_nf_elem_of(K, g) for g in basis(P_frac)]
+            P_int_gens = [O(K(scale_P) * g) for g in P_basis_nf]
+            P_int = ideal(O, P_int_gens)
+            println("  scale_P = ", scale_P, "  P_int = ", P_int, "  N(P_int) = ", norm(P_int))
+
+            # u_B_for_P is only used by find_alpha_rhoB_s1_s2_O for a
+            # diagnostic comparison against the verified-correct class of its
+            # own internally-selected b_O (see that function's comments) -
+            # it is NOT load-bearing for correctness, so a failure here just
+            # disables that one diagnostic print rather than the search.
+            u_B_for_P = try
+                mP_O \ P_int
+            catch e
+                println("  WARNING: mP_O \\ P_int threw: ", e,
+                        " - diagnostic class-comparison print inside the ",
+                        "search below will be skipped, search itself is unaffected")
+                u_B
+            end
+
+            # rho_B_init and rho_j are accepted but NOT referenced anywhere in
+            # find_alpha_rhoB_s1_s2_O's body (confirmed by inspection) - so
+            # passing `rho` as placeholders for both is harmless.
+            _, new_rho_j, _, _ = find_alpha_rhoB_s1_s2_O(
+                P_int, rho, rho, u_B_for_P, P_O, mP_O, O, K, d, rho, d_check;
+                mn_height = 3000, q_gen_height = 3000)
+            println("  new_rho_j (from find-alpha-rho search targeting P) = ", new_rho_j)
+
+            # Q_new_rho_j: the quadratic form having new_rho_j as an actual
+            # root (built directly from its minimal polynomial - same method
+            # used for the old, now-replaced rho_j_orig-based gQ_j_raw).
+            c0_nj = coeff(new_rho_j, 0)
+            c1_nj = coeff(new_rho_j, 1)
+            p0_nj = c0_nj^2 - c1_nj^2 * D
+            p1_nj = -2 * c0_nj
+            p2_nj = 1
+            scale_nj = lcm(Int(denominator(QQ(p0_nj))),
+                           Int(denominator(QQ(p1_nj))), 1)
+            a_int_nj = Int(round(scale_nj * p2_nj))
+            b_int_nj = Int(round(scale_nj * p1_nj))
+            c_int_nj = Int(round(scale_nj * p0_nj))
+            g_int_nj = gcd(a_int_nj, b_int_nj, c_int_nj)
+            a_int_nj ÷= g_int_nj
+            b_int_nj ÷= g_int_nj
+            c_int_nj ÷= g_int_nj
+            Q_new_rho_j = binary_quadratic_form(a_int_nj, b_int_nj, c_int_nj)
+            println("  Q_new_rho_j (has new_rho_j as root, unreduced) = ", Q_new_rho_j)
+            println("  Q_new_rho_j(new_rho_j, 1) = ", Q_new_rho_j(new_rho_j, K(1)), " (should be 0)")
+
+            # gF_j/shin_of_tuple still requires a STRICTLY HJ-reduced form
+            # (confirmed by the 2026-07-23 crash: "_hj_cycle_matrices is not
+            # implemented when t.Q is not strictly HJ-reduced"). HJ-reducing
+            # Q_new_rho_j for THAT purpose only - rho_j itself (used below in
+            # find_rho_j_and_coords / the grid loop for basis decomposition)
+            # stays as new_rho_j, the actual root, regardless of what root
+            # the reduced form ends up with. OPEN QUESTION, not yet verified:
+            # whether gF_j built from the reduced form is still correct here,
+            # or whether shin_of_tuple/Rademacher also need to track through
+            # new_rho_j specifically rather than "any" HJ-reduced form in the
+            # same class. Flagging rather than silently assuming either way.
+            V_j = reduced_hj_orbit(Q_new_rho_j)
+            gQ_j = minimal_hj_stabilizer(V_j, d)
+            gF_j = AdmissibleTuple(d, F.r, gQ_j)
+            println("  gQ_j (HJ-reduced from Q_new_rho_j, for gF_j only) = ", gQ_j,
+                    "  [root of THIS form may differ from new_rho_j - open question, see comment]")
+
+            rho_j = new_rho_j
+
+            QQ_form = binary_quadratic_form(gF_j.A[2,1], gF_j.A[2,2] - gF_j.A[1,1], -gF_j.A[1,2])
 
             alpha, rho_B, s1, s2 = find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O,
                                                              O, K, d, rho_j, d_check;

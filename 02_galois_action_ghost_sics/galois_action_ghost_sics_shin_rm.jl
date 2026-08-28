@@ -3,6 +3,11 @@ using Random
 Random.seed!(672049183)
 #Random.seed!(891357246)
 
+using Random
+#Random.seed!(305817264)
+Random.seed!(672049183)
+#Random.seed!(891357246)
+
 # galois_action_ghost_sics.jl
 #
 # Uses the explicit ray class group representatives (from
@@ -111,6 +116,390 @@ function multiplication_matrix_mod_d(gamma, rho, d, D)
     M = [to_int_mod(col1[1]) to_int_mod(col2[1]);
          to_int_mod(col1[2]) to_int_mod(col2[2])]
     return M
+end
+
+# ---------------------------------------------------------------------------
+# HJ-reduction of an ARBITRARY (A, x) pair via an explicit R in GL_2(Z).
+#
+# Convention (per project owner): for M = [a b; c d] in GL_2(Z) and tau a
+# number, M*tau means (a*tau+b)/(c*tau+d). For M in SL_2(R), J_M(tau) =
+# c*tau+d is the automorphy factor. For r in Q^2, Gamma_r = {A in SL_2(Z) :
+# A*r - r in Z^2}.
+#
+# Theorem (per project owner): for r in Q^2, A in Gamma_r, R in GL_2(Z), and
+# beta in the appropriate domain D~_A with A*beta = beta, let
+# s_R(beta) = sgn(j_R(beta)) (assumed nonzero). Then
+#   shin^{s_R(beta)*R*r}_{R A R^{-1}}(R*beta) = shin^r_A(beta)         if det(R) = 1
+#                                              = shin^r_A(conj(beta))  if det(R) = -1
+#
+# find_hj_reducing_matrix below only solves the "find R" half of applying
+# this theorem: given an ARBITRARY A (not necessarily HJ-reduced) and one of
+# its two real fixed points x, it finds R in GL_2(Z) such that R*A*R^{-1} is
+# HJ-reduced (0 < rho_- < 1 < rho_+), and tells the caller which of R*x or
+# R*conj(x) is that reduced form's own (larger) root - i.e. exactly the
+# point to feed to shin_rm together with R*A*R^{-1} in order to compute
+# shin_A(x, p, d) via the theorem above. Transforming the vector r/p itself
+# (via s_R(beta)*R*r) for a full arbitrary-input shin(A,x,p,d) wrapper is a
+# separate follow-up step, not yet implemented here.
+# ---------------------------------------------------------------------------
+
+"""
+    _mobius_apply(M::AbstractMatrix{<:Integer}, z)
+
+`M·z = (a*z+b)/(c*z+d)` for `M = [a b; c d]`, the convention used throughout
+this project.
+"""
+_mobius_apply(M::AbstractMatrix{<:Integer}, z) = (M[1,1]*z + M[1,2]) / (M[2,1]*z + M[2,2])
+
+"""
+    hj_roots(A::AbstractMatrix{<:Integer})
+
+The two real fixed points of the Möbius action of `A = [a b; c d]`
+(`M·τ = (aτ+b)/(cτ+d)` convention), i.e. the two roots of
+`c*z^2 + (d-a)*z - b = 0`, computed to `BigFloat` precision from `A`'s exact
+integer entries. Errors if `c = 0` or if `A` is not hyperbolic (fixed-point
+discriminant `<= 0`, i.e. no two distinct real fixed points).
+"""
+function hj_roots(A::AbstractMatrix{<:Integer})
+    a, b, c, d = BigFloat(A[1,1]), BigFloat(A[1,2]), BigFloat(A[2,1]), BigFloat(A[2,2])
+    c != 0 || error("hj_roots: c = 0 - A is not hyperbolic in the standard (finite fixed points) sense")
+    disc = (d - a)^2 + 4*b*c   # = trace(A)^2 - 4*det(A)
+    disc > 0 || error("hj_roots: fixed-point discriminant = $disc is not positive - ",
+                       "A has no two distinct real fixed points")
+    sq = sqrt(disc)
+    return ((a - d) + sq) / (2*c), ((a - d) - sq) / (2*c)   # unordered pair
+end
+
+"""
+    _gl2z_inv(M::AbstractMatrix{<:Integer})
+
+Exact inverse of `M ∈ GL_2(Z)` (`det(M) = ±1`), as an integer matrix.
+"""
+function _gl2z_inv(M::AbstractMatrix{<:Integer})
+    a, b, c, d = M[1,1], M[1,2], M[2,1], M[2,2]
+    dt = a*d - b*c
+    (dt == 1 || dt == -1) || error("_gl2z_inv: det(M) = $dt, not in GL_2(Z)")
+    return dt .* [d -b; -c a]
+end
+
+"""
+    find_hj_reducing_matrix(A::AbstractMatrix{<:Integer}, x::BigFloat;
+                             tol::Real = 1e-20, max_steps::Int = 10_000)
+
+Given `A ∈ GL_2(Z)` and a real number `x` equal to one of the two fixed
+points of `A`'s Möbius action (`A·x = x`), finds `R ∈ GL_2(Z)` such that
+`R*A*R^{-1}` is HJ-reduced (its two fixed points `ρ₋, ρ₊` satisfy
+`0 < ρ₋ < 1 < ρ₊`).
+
+`x`'s Galois conjugate (`A`'s other fixed point) is derived directly from
+`A`'s own integer entries via `hj_roots`, and `x` is matched against those
+two roots by numeric proximity (within `tol`) as a sanity check that `x`
+really is a fixed point of `A`.
+
+The reduction algorithm is the classical translation/inversion algorithm
+for real quadratic irrationals: at each step, let `(lo, hi) = extrema` of
+the current pair of tracked root-images. If `0 < lo < 1 < hi`, done. Else if
+`lo` is not already in `(0,1)`, apply the integer shift
+`T_n = [1 -n; 0 1]` (`z ↦ z-n`, `det = 1`) with `n = floor(lo)`. Otherwise
+(`lo ∈ (0,1)` but `hi ≤ 1`), apply the inversion `S = [0 1; 1 0]`
+(`z ↦ 1/z`, `det = -1`). This always terminates (real quadratic irrationals
+have purely periodic continued-fraction-type behavior under this process).
+
+Returns a named tuple `(R, detR, A_reduced, root_used, reduced_root)`:
+- `R`             : the `GL_2(Z)` matrix found, as an `Int` matrix.
+- `detR`          : `det(R)`, either `1` or `-1`.
+- `A_reduced`     : `R*A*R^{-1}` (HJ-reduced), as an `Int` matrix.
+- `root_used`     : `:x` if `detR == 1` (meaning `R*x` is `A_reduced`'s own
+                    reduced root, `> 1`), or `:conj_x` if `detR == -1`
+                    (meaning `R*conj(x)` is instead) - per the theorem
+                    above, this is exactly which point to feed `shin_rm`
+                    together with `A_reduced` to compute `shin_A(x,p,d)`.
+- `reduced_root`  : the `BigFloat` value of that reduced root (`> 1`).
+- `x0`            : `x` itself (unmutated), returned for convenience so
+                    callers (e.g. `shin` below) don't need to recompute it.
+- `conjx0`        : `A`'s other fixed point (`x`'s Galois conjugate),
+                    likewise unmutated.
+"""
+function find_hj_reducing_matrix(A::AbstractMatrix{<:Integer}, x::BigFloat;
+                                  tol::Real = 1e-20, max_steps::Int = 10_000)
+    r1, r2 = hj_roots(A)
+
+    if abs(x - r1) < tol
+        x_val, cx_val = r1, r2
+    elseif abs(x - r2) < tol
+        x_val, cx_val = r2, r1
+    else
+        error("find_hj_reducing_matrix: x = $x matches neither fixed point ",
+              "of A (roots are $r1, $r2) within tol = $tol")
+    end
+
+    x0, cx0 = x_val, cx_val   # preserve originals; x_val/cx_val get mutated by the loop below
+
+    R = BigInt[1 0; 0 1]   # running total; R_new = (latest elementary step) * R_old
+
+    step = 0
+    while true
+        step += 1
+        step > max_steps && error("find_hj_reducing_matrix: did not reach an ",
+                                   "HJ-reduced pair after $max_steps steps")
+
+        lo, hi = minmax(x_val, cx_val)
+        (lo > 0 && lo < 1 && hi > 1) && break   # 0 < rho_- < 1 < rho_+: done
+
+        if !(lo > 0 && lo < 1)
+            n = BigInt(floor(lo))
+            T = BigInt[1 -n; 0 1]         # z -> z - n, det = 1
+            x_val -= n
+            cx_val -= n
+            R = T * R
+        else
+            S = BigInt[0 1; 1 0]          # z -> 1/z, det = -1
+            x_val = 1 / x_val
+            cx_val = 1 / cx_val
+            R = S * R
+        end
+    end
+
+    Rint = Int.(R)
+    detR = Rint[1,1]*Rint[2,2] - Rint[1,2]*Rint[2,1]
+    (detR == 1 || detR == -1) || error("find_hj_reducing_matrix: det(R) = $detR, expected ±1")
+
+    Rinv = _gl2z_inv(Rint)
+    A_reduced = Rint * Matrix(A) * Rinv
+
+    root_used, reduced_root = detR == 1 ? (:x, x_val) : (:conj_x, cx_val)
+
+    reduced_root > 1 || @warn "find_hj_reducing_matrix: reduced_root = $reduced_root " *
+                               "is not > 1 as expected for the HJ-reduced (main) root " *
+                               "- check theorem application / algorithm correctness"
+
+    return (R = Rint, detR = detR, A_reduced = A_reduced,
+            root_used = root_used, reduced_root = reduced_root,
+            x0 = x0, conjx0 = cx0)
+end
+
+"""
+    shin(A::AbstractMatrix{<:Integer}, x::BigFloat, p::Vector{<:Integer}, d::Int64;
+         tol::Real = 1e-20, max_steps::Int = 10_000)
+
+`shin_A^{p/d}(x)` for an ARBITRARY (not necessarily HJ-reduced) `A ∈
+GL_2(Z)` and real fixed point `x` of its Möbius action (`A·x = x`), computed
+by reducing to `shin_rm` via `find_hj_reducing_matrix` and the
+transformation theorem
+
+    shin^{s_R(β)·R·r}_{R A R^{-1}}(R·β) = shin^r_A(β)          if det(R) = 1
+                                         = shin^r_A(conj(β))   if det(R) = -1
+
+with `s_R(β) = sgn(J_R(β)) = sgn(c_R·β + d_R)` for `R = [a_R b_R; c_R d_R]`.
+
+Concretely: `find_hj_reducing_matrix(A, x)` gives `R`, `A_reduced =
+R*A*R^{-1}`, and tells us which β makes `R*β` equal to `reduced_root` -
+that's `β = x` when `det(R) = 1` (`root_used = :x`), or `β = conj(x)` when
+`det(R) = -1` (`root_used = :conj_x`), matching the theorem's two cases
+exactly so that in BOTH cases the right-hand side above is `shin_A^r(x)` -
+the thing we actually want, never `shin_A^r(conj(x))`.
+
+Reading the theorem with that β and `r = p/d`:
+
+    shin_A^{p/d}(x) = shin_{A_reduced}^{s_R(β)·R·(p/d)}(reduced_root)
+
+Since `R` has integer entries, `p` is an integer vector, and `s_R(β) =
+±1`, the transformed vector `s_R(β)·R·p` is again an integer vector (then
+reduced mod `d`, matching this codebase's convention elsewhere of always
+feeding `shin_rm` an integer vector already reduced mod `d`), so the
+right-hand side is exactly `shin_rm(A_reduced, reduced_root,
+mod.(s_R(β).*(R*p), d), d)`.
+"""
+function shin(A::AbstractMatrix{<:Integer}, x::BigFloat, p::Vector{<:Integer}, d::Int64;
+              tol::Real = 1e-20, max_steps::Int = 10_000)
+    red = find_hj_reducing_matrix(A, x; tol = tol, max_steps = max_steps)
+
+    beta = red.root_used == :x ? red.x0 : red.conjx0
+
+    a_R, b_R, c_R, d_R = red.R[1,1], red.R[1,2], red.R[2,1], red.R[2,2]
+    j_R_beta = c_R * beta + d_R
+    s_R = Int(sign(j_R_beta))
+    s_R != 0 || error("shin: s_R(beta) = sgn(J_R(beta)) = 0 (J_R(beta) = $j_R_beta) - ",
+                       "theorem's nonzero hypothesis fails for this (A, x, R)")
+
+    p_transformed = mod.(s_R .* (red.R * Int.(p)), d)
+
+    return shin_rm(Matrix(red.A_reduced), red.reduced_root, p_transformed, d)
+end
+
+# ---------------------------------------------------------------------------
+# Stabilizer, within a congruence subgroup Gamma_s, of a real quadratic
+# irrational rho_B under the SL_2(Z) Möbius action - needed to build the
+# per-ray-class shin table (see ray_class_shin_table below).
+#
+# Fact used: the FULL SL_2(Z)-stabilizer of a root of a primitive indefinite
+# binary quadratic form (a,b,c) of discriminant Delta = b^2-4ac is
+# <-I, L>, where L is the "fundamental automorph"
+#     L = [ (t-b*u)/2   -c*u ; a*u   (t+b*u)/2 ]
+# built from the minimal positive-integer solution (t,u) of the Pell-type
+# equation t^2 - Delta*u^2 = 4 (standard; see e.g. Buell, "Binary Quadratic
+# Forms"). Being hyperbolic (infinite order, two distinct real fixed
+# points), L cannot swap its own two fixed points, so it fixes EACH of
+# rho_B and conj(rho_B) individually - which one is realized as "L" versus
+# "L^{-1}" here depends on the sign conventions picked for (a,b,c) and
+# (t,u), so this is verified numerically below rather than assumed.
+#
+# Intersecting <-I, L> with the finite-index congruence subgroup Gamma_s
+# gives either <A> or <-I, A> for A = L^k, k the smallest positive power
+# with L^k in Gamma_s (since -I is never itself a power of L, having order
+# 2 while L has infinite order).
+# ---------------------------------------------------------------------------
+
+"""
+    minimal_pell_solution_plus4(Delta::Integer; max_u::Integer = 10_000_000)
+
+Minimal pair of positive integers `(t,u)` solving `t^2 - Delta*u^2 = 4`
+(`Delta > 0`, not a perfect square), found by direct search over
+`u = 1, 2, 3, ...` up to `max_u`.
+
+NOTE: this is a brute-force search, not a continued-fraction-based Pell
+solver - simple to verify, but could be slow if `Delta`'s fundamental
+solution has very large `u`. A CF-based solver would be the natural
+optimization if that becomes a bottleneck in practice.
+"""
+function minimal_pell_solution_plus4(Delta::Integer; max_u::Integer = 10_000_000)
+    Delta > 0 || error("minimal_pell_solution_plus4: Delta = $Delta must be positive")
+    r = isqrt(Delta)
+    r*r != Delta || error("minimal_pell_solution_plus4: Delta = $Delta is a perfect square")
+    for u in 1:max_u
+        rhs = 4 + Delta * BigInt(u)^2
+        t = isqrt(rhs)
+        if t*t == rhs
+            return Int(t), u
+        end
+    end
+    error("minimal_pell_solution_plus4: no solution found with u <= $max_u for Delta = $Delta")
+end
+
+"""
+    hj_form_automorph(a::Integer, b::Integer, c::Integer; max_u::Integer = 10_000_000)
+
+The fundamental automorph `L ∈ SL_2(Z)` of the primitive indefinite binary
+quadratic form `(a,b,c)` (`L^T·Q·L = Q`), from the minimal solution `(t,u)`
+of `t^2 - Delta*u^2 = 4` (`Delta = b^2-4ac`).
+"""
+function hj_form_automorph(a::Integer, b::Integer, c::Integer; max_u::Integer = 10_000_000)
+    Delta = b^2 - 4*a*c
+    t, u = minimal_pell_solution_plus4(Delta; max_u = max_u)
+    iseven(t - b*u) || error("hj_form_automorph: t-b*u = $(t - b*u) is odd - ",
+                              "unexpected parity failure for a genuine Pell solution")
+    L = [ (t - b*u) ÷ 2   -c*u          ;
+           a*u             (t + b*u) ÷ 2 ]
+    detL = L[1,1]*L[2,2] - L[1,2]*L[2,1]
+    detL == 1 || error("hj_form_automorph: det(L) = $detL, expected 1")
+    return L
+end
+
+"""
+    hj_automorph_for_root(rho_B, D::Int; max_u::Integer = 10_000_000, tol::Real = 1e-15)
+
+The part of the stabilizer construction that depends ONLY on `rho_B` (not
+on `s`): builds `rho_B`'s minimal-polynomial form `(a,b,c)`, its fundamental
+automorph `L` via the (expensive, brute-force) Pell-equation search, and
+verifies numerically that the returned matrix genuinely fixes `rho_B`
+itself (falling back to `L^{-1}` if not).
+
+Split out from `stabilizer_generator_in_Gamma_s` so that callers processing
+many `s` vectors that share the same `rho_B` (e.g. many ray classes in the
+same Picard-class fiber, as in `ray_class_shin_table`) can compute this
+expensive part ONCE per `rho_B` and reuse it, instead of repeating the
+brute-force Pell search for every `s`.
+"""
+function hj_automorph_for_root(rho_B, D::Int; max_u::Integer = 10_000_000, tol::Real = 1e-15)
+    c0 = coeff(rho_B, 0)
+    c1 = coeff(rho_B, 1)
+    iszero(c1) && error("hj_automorph_for_root: rho_B has zero irrational part")
+
+    p0 = c0^2 - c1^2 * D
+    p1 = -2 * c0
+    scale = lcm(Int(denominator(QQ(p0))), Int(denominator(QQ(p1))), 1)
+    a_int = scale
+    b_int = Int(round(scale * p1))
+    c_int = Int(round(scale * p0))
+    g = gcd(gcd(abs(a_int), abs(b_int)), abs(c_int))
+    g == 0 && error("hj_automorph_for_root: degenerate form (a=b=c=0) for rho_B = $rho_B")
+    a_int ÷= g; b_int ÷= g; c_int ÷= g
+    if a_int < 0
+        a_int, b_int, c_int = -a_int, -b_int, -c_int
+    end
+
+    L = hj_form_automorph(a_int, b_int, c_int; max_u = max_u)
+
+    rho_B_bf = BigFloat(c0) + BigFloat(c1) * sqrt(BigFloat(D))
+    L_rho = _mobius_apply(L, rho_B_bf)
+    if abs(L_rho - rho_B_bf) > tol
+        Linv = _gl2z_inv(L)
+        Linv_rho = _mobius_apply(Linv, rho_B_bf)
+        abs(Linv_rho - rho_B_bf) < tol ||
+            error("hj_automorph_for_root: neither L nor L^{-1} fixes rho_B numerically ",
+                  "(L*rho_B = $L_rho, L^{-1}*rho_B = $Linv_rho, rho_B = $rho_B_bf) - ",
+                  "check the (a,b,c)/automorph sign convention")
+        L = Linv
+    end
+
+    return L
+end
+
+"""
+    stabilizer_power_in_Gamma_s(L::AbstractMatrix{<:Integer}, s::Vector;
+                                 max_power::Int = 10_000)
+
+Given `L ∈ SL_2(Z)` already known to fix some `rho_B` (e.g. from
+`hj_automorph_for_root`), finds the smallest positive integer power `k`
+with `L^k ∈ Γ_s = {B ∈ SL_2(Z) : B*s - s ∈ Z^2}` (exact rational arithmetic
+on `s`, no floating tolerance - this part is cheap, unlike the Pell search
+inside `hj_automorph_for_root`). Returns `(A = L^k, has_neg_I)`, `has_neg_I`
+recording whether `-I ∈ Γ_s` too (informational only).
+"""
+function stabilizer_power_in_Gamma_s(L::AbstractMatrix{<:Integer}, s::Vector;
+                                      max_power::Int = 10_000)
+    s1, s2 = QQ(s[1]), QQ(s[2])
+    has_neg_I = isone(denominator(2*s1)) && isone(denominator(2*s2))
+
+    Lk = [1 0; 0 1]
+    for k in 1:max_power
+        Lk = L * Lk
+        new1 = Lk[1,1]*s1 + Lk[1,2]*s2
+        new2 = Lk[2,1]*s1 + Lk[2,2]*s2
+        if isone(denominator(new1 - s1)) && isone(denominator(new2 - s2))
+            return Lk, has_neg_I
+        end
+    end
+
+    error("stabilizer_power_in_Gamma_s: no power of L up to L^$max_power lies in ",
+          "Gamma_s for s = $s - either max_power is too small, or something upstream is wrong")
+end
+
+"""
+    stabilizer_generator_in_Gamma_s(rho_B, D::Int, s::Vector;
+                                     max_power::Int = 10_000, tol::Real = 1e-15,
+                                     max_u::Integer = 10_000_000)
+
+Given a real quadratic irrational `rho_B` (an element of `K = Q(sqrt(D))`,
+read via `coeff(rho_B,0)`/`coeff(rho_B,1)` in the usual convention used
+throughout this file) and `s = [s1,s2] ∈ Q^2`, finds a generator `A` of
+`{B ∈ Γ_s : B*rho_B = rho_B}` up to the possible extra factor of `-I`
+(`Γ_s = {B ∈ SL_2(Z) : B*s - s ∈ Z^2}`, the linear action of `B` on the
+column vector `s`, NOT the Möbius action).
+
+A thin wrapper composing `hj_automorph_for_root` (expensive, depends only
+on `rho_B`) and `stabilizer_power_in_Gamma_s` (cheap, depends on `s`) - kept
+for standalone use; identical output to before these were split out.
+Callers processing many `s` for the same `rho_B` should call
+`hj_automorph_for_root` once and reuse it via `stabilizer_power_in_Gamma_s`
+directly instead (see `ray_class_shin_table`).
+"""
+function stabilizer_generator_in_Gamma_s(rho_B, D::Int, s::Vector;
+                                          max_power::Int = 10_000,
+                                          tol::Real = 1e-15,
+                                          max_u::Integer = 10_000_000)
+    L = hj_automorph_for_root(rho_B, D; max_u = max_u, tol = tol)
+    return stabilizer_power_in_Gamma_s(L, s; max_power = max_power)
 end
 
 function squarefree_part(n::Int)
@@ -840,7 +1229,172 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
                                   mn_height::Int = 3000,           # bound for the joint (alpha,rho_B) primitive-vector search
                                   q_gen_height::Int = 3000,        # bound for locating a generator of Q = Jb_O * (alpha)^{-1}
                                   exclude::Vector = [],            # rho_B candidates to skip (used to retry for a DIFFERENT valid rho_B)
-                                  verbose::Bool = false)           # print internal [two-stage] search log (now called many times per outer retry loop, so off by default)
+                                  verbose::Bool = false,           # print internal [two-stage] search log (now called many times per outer retry loop, so off by default)
+                                  alpha_hint = nothing,            # if alpha_hint, rho_B_hint, b_O_hint are ALL supplied,
+                                  rho_B_hint = nothing,            # skip stage 1 (the expensive (m,n) search) entirely and
+                                  b_O_hint = nothing)              # go straight to stage 2 for this J - see block below.
+    # ADDITIVE FAST PATH (does not alter behavior when hints are omitted):
+    # alpha, rho_B, b_O depend only on the Picard class of J (u_B), NOT on
+    # J itself - the (m,n) search below that finds them uses only b_O's own
+    # ideal bdO_O = b_O*d_val*O, and b_O itself is selected purely from
+    # J's CLASS (find_b_with_verified_principal_product's search succeeds
+    # or fails identically for any two ideals differing by a principal
+    # factor). Only stage 2 (solving for s1,s2 from Jb_O = J*b_O) genuinely
+    # needs the literal J. The docstring-comment below states this
+    # explicitly: once alpha,rho_B satisfy b*d*O=alpha*(Z+rho_B*Z), a valid
+    # (s1,s2) is GUARANTEED to exist - so reusing an (alpha,rho_B,b_O)
+    # already found for another J of the SAME Picard class, and re-running
+    # only stage 2 here, produces exactly the same result a full search
+    # would have produced for this J. This lets callers building a
+    # per-ray-class table (e.g. ray_class_shin_table) do the expensive
+    # search ONCE per Picard class instead of once per ray class.
+    if alpha_hint !== nothing && rho_B_hint !== nothing && b_O_hint !== nothing
+        alpha = alpha_hint
+        rho_B = rho_B_hint
+        b_O = b_O_hint
+
+        dO_O = ideal(O, d_val)
+        places   = real_places(K)
+        emb_conj = embedding(places[1])
+        emb_main = embedding(places[2])
+
+        all(sign(alpha, p) > 0 for p in places) ||
+            error("alpha_hint is not totally positive")
+        order(b_O) == O || error("b_O_hint is not tagged with order O as expected")
+        is_inv_b, _ = Hecke.is_invertible(b_O)
+        is_inv_b || error("b_O_hint is not invertible")
+        is_coprime_bO_dO = try
+            isone(b_O + dO_O)
+        catch
+            false
+        end
+        is_coprime_bO_dO || error("b_O_hint is not coprime to dO_O (d_val=", d_val, ")")
+
+        alpha_ideal = fractional_ideal(O, [alpha])
+        rhoB_lattice_O = fractional_ideal(O, [K(1), rho_B])
+        order(rhoB_lattice_O) == O ||
+            error("rho_B_hint does not give order O for Z+Z*rho_B as expected")
+        bdO_O = b_O * dO_O
+        alpha_ideal * rhoB_lattice_O == bdO_O ||
+            error("alpha_hint, rho_B_hint do not satisfy b_O_hint*d_val*O = ",
+                  "alpha*(Z+Z*rho_B) - hints are inconsistent with b_O_hint/d_val")
+        Float64(emb_main(rho_B)) > Float64(emb_conj(rho_B)) ||
+            error("rho_B_hint does not satisfy the larger-root convention (main > conj)")
+
+        function to_nf_elem_fp(x)
+            try
+                return elem_in_nf(x)
+            catch
+            end
+            try
+                return K(x)
+            catch
+            end
+            return x
+        end
+        function to_float_fp(q)
+            return Float64(BigInt(numerator(q))) / Float64(BigInt(denominator(q)))
+        end
+
+        Jb_O = J * b_O
+        Q = Jb_O * inv(alpha_ideal)
+        Q_norm = QQ(norm(Q))
+        verbose && println("  [fast-path] norm(Q) (target norm for s2*rho_B - s1) = ", Q_norm)
+
+        Qbasis = basis(Q)
+        qb1 = to_nf_elem_fp(Qbasis[1])
+        qb2 = to_nf_elem_fp(Qbasis[2])
+
+        # Closed-form quadratic form for norm(i*qb1+j*qb2), via the exact
+        # polarization identity N(i*x+j*y) = i^2*N(x) + i*j*(N(x+y)-N(x)-N(y)) + j^2*N(y)
+        # (holds for ANY quadratic form, in particular the field norm) -
+        # lets the (i,j) loop below reject the overwhelming majority of
+        # candidates (those with the wrong norm) via cheap Int/QQ
+        # arithmetic, instead of constructing an nf_elem and calling
+        # Hecke's generic norm() for every one of up to (2*q_gen_height+1)^2
+        # candidates. Mathematically identical to the original per-candidate
+        # `QQ(abs(norm(K(cand)))) == Q_norm` check - same accept/reject
+        # decision for every (i,j), just reached more cheaply.
+        Nqb1 = QQ(norm(qb1))
+        Nqb2 = QQ(norm(qb2))
+        Ncross = QQ(norm(qb1 + qb2)) - Nqb1 - Nqb2
+
+        found_s = false
+        s1 = QQ(0)
+        s2 = QQ(0)
+        for i in -q_gen_height:q_gen_height, j in -q_gen_height:q_gen_height
+            (i == 0 && j == 0) && continue
+            nval = i^2*Nqb1 + i*j*Ncross + j^2*Nqb2
+            abs(nval) == Q_norm || continue
+
+            cand = K(i) * qb1 + K(j) * qb2
+            iszero(cand) && continue
+            cand_ideal = try
+                fractional_ideal(O, [cand])
+            catch
+                continue
+            end
+            cand_ideal == Q || continue
+
+            elem2 = Float64(emb_conj(cand)) > 0 ? cand : -cand
+
+            qc  = coeff(elem2, 1)
+            p0  = coeff(elem2, 0)
+            c2b = coeff(rho_B, 1)
+            c1b = coeff(rho_B, 0)
+            s2_try = QQ(qc / c2b)
+            s1_try = QQ(qc * c1b / c2b - p0)
+
+            elem_check = alpha * (K(s2_try) * rho_B - K(s1_try))
+            elem_check_ideal = try
+                fractional_ideal(O, [elem_check])
+            catch
+                continue
+            end
+            elem_check_ideal == Jb_O || continue
+
+            in_bO = try
+                elem_check in b_O
+            catch
+                false
+            end
+            in_bO || continue
+
+            rhoB_conj_check = Float64(emb_conj(rho_B))
+            s1_f_check = to_float_fp(s1_try)
+            s2_f_check = to_float_fp(s2_try)
+            (s2_f_check * rhoB_conj_check - s1_f_check) > 0 || continue
+
+            s1, s2 = s1_try, s2_try
+            found_s = true
+            break
+        end
+        found_s || error("Could not find s1, s2 within q_gen_height=", q_gen_height,
+                          " using the hinted alpha, rho_B, b_O for this J = ", J)
+
+        rhoB_conj = Float64(emb_conj(rho_B))
+        s1_f = to_float_fp(s1)
+        s2_f = to_float_fp(s2)
+        is_valid_final = (s2_f * rhoB_conj - s1_f) > 0
+        is_valid_final || error("Internal inconsistency in fast path: sign-flip ",
+                                 "construction should guarantee is_valid, but it does ",
+                                 "not (s1=", s1, ", s2=", s2, ")")
+
+        elem2_exact = K(s2) * rho_B - K(s1)
+        L_gens = [one(K), rho_B]
+        Lconj_gens = [quad_conj(K, g) for g in L_gens]
+        Jconj_gens = [quad_conj(K, _nf_elem_of(K, x)) for x in basis(J)]
+        crit_gens = [elem2_exact * a for a in lattice_product_gens(Lconj_gens, Jconj_gens)]
+        ok_crit, lambda_gen = is_principal_O_verified(K, O, crit_gens)
+        ok_crit || error("FINAL VERIFICATION FAILED (fast path): (s2*rho_B-s1)*",
+                          "(Z+Z*rho_B)^{-1} is NOT in the Picard class of J. ",
+                          "rho_B=", rho_B, " s1=", s1, " s2=", s2)
+
+        verbose && println("  [fast-path] FOUND: rho_B=", rho_B, " alpha=", alpha,
+                " s1=", s1, " s2=", s2, " (stage 1 skipped via hints)")
+        return alpha, rho_B, s1, s2
+    end
+
     # TWO-STAGE DESIGN. Once alpha, rho_B satisfy b*d*O = alpha*(Z+rho_B*Z)
     # with alpha totally positive, a valid (s1,s2) is GUARANTEED to exist and
     # can be solved for directly rather than searched for:
@@ -1113,14 +1667,25 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
         qb1 = to_nf_elem(Qbasis[1])
         qb2 = to_nf_elem(Qbasis[2])
 
+        # Closed-form quadratic form for norm(i*qb1+j*qb2) - see the matching
+        # comment in the fast-path branch above for the exact identity used;
+        # mathematically identical accept/reject decision to the original
+        # per-candidate `QQ(abs(norm(K(cand)))) == Q_norm` check, just far
+        # cheaper to evaluate for the (2*q_gen_height+1)^2 candidates tried.
+        Nqb1 = QQ(norm(qb1))
+        Nqb2 = QQ(norm(qb2))
+        Ncross = QQ(norm(qb1 + qb2)) - Nqb1 - Nqb2
+
         found_s = false
         s1 = QQ(0)
         s2 = QQ(0)
         for i in -q_gen_height:q_gen_height, j in -q_gen_height:q_gen_height
             (i == 0 && j == 0) && continue
+            nval = i^2*Nqb1 + i*j*Ncross + j^2*Nqb2
+            abs(nval) == Q_norm || continue
+
             cand = K(i) * qb1 + K(j) * qb2
             iszero(cand) && continue
-            QQ(abs(norm(K(cand)))) == Q_norm || continue
             cand_ideal = try
                 fractional_ideal(O, [cand])
             catch
@@ -1287,7 +1852,11 @@ end
 function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                               is_principal_J::Bool,
                               P_O, mP_O, rho_reps, gQ_reps, F_class,
-                              j_cache::Dict)
+                              j_cache::Dict;
+                              ray_class_lookup_table::Union{Nothing,Vector} = nothing,
+                              ray_class_lookup_tol::Real = 1e-10,
+                              elem1_max_power::Int = 10_000,
+                              elem1_max_u::Integer = 10_000_000)
     d = Int(F.d)
     D = Int(F.D)
     a = gen(K)
@@ -1308,6 +1877,21 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
     NJ = Int(norm(J))
     println("  Ng = ", Ng)
     println("  NJ = ", NJ)
+
+    # elem1 (used per grid point below) is now recovered via a REVERSE
+    # LOOKUP into the ray class shin table, per project owner: for a given
+    # (p1,p2), compute shin^{[p1,p2]}_A(rho) for the matrix A that's a power
+    # of rho's own fundamental automorph lying in Gamma_{[p1,p2]/d} (built
+    # exactly the way ray_class_shin_table_fast builds its own matrices),
+    # find the ray class whose table entry has this SAME shin value, and
+    # set elem1 = d*(s2*rho_B - s1) from THAT entry's own s1, s2, rho_B -
+    # not from rho/p1/p2 directly (the old, incorrect method). Both pieces
+    # this needs only depend on rho/F (not on gamma, J, or p1/p2), so they
+    # are computed once here rather than per grid point.
+    L_rho_base = hj_automorph_for_root(rho, D; max_u = elem1_max_u)
+    rho_bf_base = BigFloat(coeff(rho, 0)) + BigFloat(coeff(rho, 1)) * sqrt(BigFloat(D))
+    ray_class_lookup_table_local = ray_class_lookup_table === nothing ?
+        ray_class_shin_table_fast_quiet(F) : ray_class_lookup_table
 
     if is_principal_J
         chi_raw = kronecker_symbol(d + 1, NJ)
@@ -1357,6 +1941,12 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         return mod(num * invmod(den, d), d)
     end
 
+    # NOTE (currently unused function): elem1 below is the OLD, incorrect
+    # construction (elem1 = p2*rho - p1). The live grid loop further down
+    # now computes elem1 via a reverse lookup into the ray class shin table
+    # instead (see the comment above Ng/NJ) - this helper was NOT updated
+    # to match, since it isn't actually called anywhere; don't assume it
+    # reflects the current method if it's ever revived.
     function compute_integralnewdu(p1, p2, s1, s2, rhoB_cand, rho, rho_j, M_g_j, d)
         elem1 = K(p2) * rho - K(p1)
         elem2 = K(s2) * rhoB_cand - K(s1)
@@ -1587,7 +2177,23 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 gp = [p1, mod(NJ * Ng * p2, d)]
                 p = [p1, p2]
 
-                elem1 = K(p[2]) * rho - K(p[1])
+                # elem1 via reverse lookup - see the block comment above
+                # (right after Ng/NJ) for the full reasoning.
+                A_lookup, _ = stabilizer_power_in_Gamma_s(
+                    L_rho_base, [QQ(p1, d), QQ(p2, d)]; max_power = elem1_max_power)
+                shin_val_lookup = shin(A_lookup, rho_bf_base, [p1, p2], d)
+
+                match_idx = findfirst(
+                    e -> e !== nothing && abs(e.shin_value - shin_val_lookup) < ray_class_lookup_tol,
+                    ray_class_lookup_table_local)
+                match_idx === nothing &&
+                    error("elem1 lookup: no ray class table entry matches shin^{[",
+                          p1, ",", p2, "]}_A(rho) = ", shin_val_lookup,
+                          " within tol=", ray_class_lookup_tol,
+                          " - the table may need a finer search bound (mn_height/q_gen_height), ",
+                          "or something upstream is wrong")
+                lookup_entry = ray_class_lookup_table_local[match_idx]
+                elem1 = K(d) * (K(lookup_entry.s2) * lookup_entry.rho_B - K(lookup_entry.s1))
 
                 # Per project owner: if the per-rho_j search below is fully
                 # exhausted for a given rho_B/s1/s2, that doesn't necessarily
@@ -1604,7 +2210,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 found_overall = false
                 max_retries_rho_B_p = 20
 
-                local rho_j_p, gF_j_p, gQ_j_p, QQ_form_p, M_g_j_p, c_g_j_p,
+                local rho_j_p, A_bj_p, gF_j_p, gQ_j_p, QQ_form_p, M_g_j_p, c_g_j_p,
                       rho_j_bf_p, u1_p, u2_p
 
                 for rho_B_attempt in 1:max_retries_rho_B_p
@@ -1635,208 +2241,107 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: product = ", product,
                             "  conj(product) [direct] = ", Float64(real(emb_conj_K(product))))
 
-                # Per project owner: rho_j may meaningfully depend on p, so
-                # Stages 1/2/2.5 (finding new_rho_j, HJ-reducing to rho_HJ,
-                # and the P_int^{-1}*(Z+Z*rho_HJ)^{-1} check) now run FRESH
-                # for EACH (p1,p2), with their own exclusion list, rather
-                # than once for the whole function call. A rejection at any
-                # stage (2, 2.5, 4.7, 4.8, 4.9) excludes that new_rho_j
-                # candidate and retries Stage 1 - all scoped to THIS
-                # (p1,p2); a different grid point starts its search fresh.
-                excluded_new_rho_j_p = []
-                found_p = false
+                    # NEW rho_j construction (per project owner), replacing
+                    # the old Stage 1/2/2.5/4.7/4.8/4.9 search+verify chain
+                    # entirely: let U_elem1 be the ray class (full ideal)
+                    # used to build THIS point's elem1 (from the reverse
+                    # lookup above), b_j := [J*U_elem1] in Pic(O), and find
+                    # alpha_bj, rho_j, s1_bj, s2_bj via find_alpha_rhoB_s1_s2_O
+                    # so that b_j^{-1}*d*O = alpha_bj*(Z*rho_j+Z) (passing
+                    # J*U_elem1 itself as the "J" argument gives exactly
+                    # this, since find_alpha_rhoB_s1_s2_O's own internal
+                    # b_O is always [input]^{-1}). rho_j is now UNIQUELY
+                    # determined here (no candidate search/exclusion at
+                    # this level) - the only remaining retry axis is the
+                    # outer rho_B_attempt loop above.
+                    U_elem1 = lookup_entry.J
+                    J_bj = J * U_elem1
+                    u_Bj = mP_O \ J_bj
+                    rho_Bj_init = rho_reps[u_Bj]
+                    alpha_bj, rho_j_raw, s1_bj, s2_bj = find_alpha_rhoB_s1_s2_O(
+                        J_bj, rho_Bj_init, rho_Bj_init, u_Bj, P_O, mP_O, O, K,
+                        d, rho_Bj_init, d_check; mn_height = 3000, q_gen_height = 3000)
+                    println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: rho_j = ", rho_j_raw,
+                            "  alpha_bj = ", alpha_bj, "  s1_bj = ", s1_bj, "  s2_bj = ", s2_bj)
 
-                for attempt in 1:max_retries_p
-                    # STAGE 1: P_int^{-1}*d*O = alpha*(Z+Z*new_rho_j), alpha
-                    # totally positive, new_rho_j > conj(new_rho_j).
-                    _, new_rho_j_cand = find_alpha_rho_direct(
-                        P_int_inv, K, O, d; mn_height = 3000,
-                        exclude = excluded_new_rho_j_p)
-                    println("    p=($p1,$p2) [attempt $attempt]: new_rho_j = ", new_rho_j_cand)
+                    rho_j_bf_raw = BigFloat(coeff(rho_j_raw, 0)) + BigFloat(coeff(rho_j_raw, 1)) * sqrt(BigFloat(D))
+                    L_bj = hj_automorph_for_root(rho_j_raw, D; max_u = elem1_max_u)
+                    A_bj_cand, _ = stabilizer_power_in_Gamma_s(L_bj, [s1_bj, s2_bj]; max_power = elem1_max_power)
 
-                    # STAGE 2: Q_new_rho_j has new_rho_j as an actual root
-                    # (built from its minimal polynomial); HJ-reduce it and
-                    # take the reduced form's own root, rho_HJ.
-                    c0_nj = coeff(new_rho_j_cand, 0)
-                    c1_nj = coeff(new_rho_j_cand, 1)
-                    p0_nj = c0_nj^2 - c1_nj^2 * D
-                    p1_nj = -2 * c0_nj
-                    p2_nj = 1
-                    scale_nj = lcm(Int(denominator(QQ(p0_nj))),
-                                   Int(denominator(QQ(p1_nj))), 1)
-                    a_int_nj = Int(round(scale_nj * p2_nj))
-                    b_int_nj = Int(round(scale_nj * p1_nj))
-                    c_int_nj = Int(round(scale_nj * p0_nj))
-                    g_int_nj = gcd(a_int_nj, b_int_nj, c_int_nj)
-                    a_int_nj ÷= g_int_nj
-                    b_int_nj ÷= g_int_nj
-                    c_int_nj ÷= g_int_nj
-                    Q_new_rho_j_cand = binary_quadratic_form(a_int_nj, b_int_nj, c_int_nj)
-
-                    V_j_cand = reduced_hj_orbit(Q_new_rho_j_cand)
-                    gQ_j_cand = minimal_hj_stabilizer(V_j_cand, d)
-
-                    D_gQj = Int(discriminant(gQ_j_cand))
-                    quotient_gQj, remainder_gQj = divrem(D_gQj, Dr)
-                    remainder_gQj == 0 || error("discriminant(gQ_j) = ", D_gQj,
-                                                 " is not an integer multiple of Dr = ", Dr)
-                    f_gQj = isqrt(quotient_gQj)
-                    f_gQj^2 == quotient_gQj || error("D_gQj / Dr = ", quotient_gQj,
-                                                      " is not a perfect square (got isqrt = ", f_gQj, ")")
-                    sqrt_gQj = f_gQj * sqrt_Dr
-                    root_plus  = (-gQ_j_cand.b + sqrt_gQj) / (2 * gQ_j_cand.a)
-                    root_minus = (-gQ_j_cand.b - sqrt_gQj) / (2 * gQ_j_cand.a)
-                    rho_HJ_cand = Float64(emb_main_K(root_plus)) >= Float64(emb_main_K(root_minus)) ?
-                                  root_plus : root_minus
-
-                    rho_HJ_main_val = Float64(emb_main_K(rho_HJ_cand))
-                    rho_HJ_conj_val = Float64(emb_conj_K(rho_HJ_cand))
-                    if !(rho_HJ_main_val > rho_HJ_conj_val)
-                        println("    p=($p1,$p2) [attempt $attempt]: REJECTED at Stage 2 ",
-                                "(rho_HJ=", rho_HJ_main_val, " not > conj=", rho_HJ_conj_val, ")")
-                        push!(excluded_new_rho_j_p, new_rho_j_cand)
-                        continue
-                    end
-
-                    LrhoHJ_gens = [one(K), rho_HJ_cand]
-                    LrhoHJ_ideal = fractional_ideal(O, LrhoHJ_gens)
-                    N_LrhoHJ = norm(LrhoHJ_ideal)
-                    LrhoHJ_inv_gens = [quad_conj(K, g) // N_LrhoHJ for g in LrhoHJ_gens]
-                    LrhoHJ_inv = fractional_ideal(O, LrhoHJ_inv_gens)
-
-                    # STAGE 2.5: P_int^{-1}*(Z+Z*rho_HJ)^{-1} principal,
-                    # generated by a totally positive alpha_HJ.
-                    target_HJ_frac = P_int_inv * LrhoHJ_inv
-                    target_HJ_gens_nf = [_nf_elem_of(K, g) for g in basis(target_HJ_frac)]
-                    ok_HJ, alpha_HJ = is_principal_totally_positive_verified(K, O, target_HJ_gens_nf)
-                    if !ok_HJ
-                        println("    p=($p1,$p2) [attempt $attempt]: REJECTED at Stage 2.5 ",
-                                "(P_int^{-1}*(Z+Z*rho_HJ)^{-1} not principal+totally-positive)")
-                        push!(excluded_new_rho_j_p, new_rho_j_cand)
-                        continue
-                    end
-
-                    rho_j_cand = rho_HJ_cand
+                    # QQ_form_p/gQ_j_p/gF_j_p/c_g_j_p come from the
+                    # HJ-REDUCED matrix (per project owner) - obtained from
+                    # INSIDE the same reduction machinery the shin wrapper
+                    # itself uses (find_hj_reducing_matrix), not from the
+                    # old reduced_hj_orbit/minimal_hj_stabilizer route. Only
+                    # the reduced MATRIX is needed here (exact, integer -
+                    # no floating point involved in A_reduced itself), not
+                    # a reduced root value.
+                    red_bj = find_hj_reducing_matrix(A_bj_cand, rho_j_bf_raw)
+                    gQ_j_cand = binary_quadratic_form(red_bj.A_reduced[2,1],
+                                                       red_bj.A_reduced[2,2] - red_bj.A_reduced[1,1],
+                                                       -red_bj.A_reduced[1,2])
                     gF_j_cand = AdmissibleTuple(d, F.r, gQ_j_cand)
                     QQ_form_cand = binary_quadratic_form(gF_j_cand.A[2,1],
                                                           gF_j_cand.A[2,2] - gF_j_cand.A[1,1],
                                                           -gF_j_cand.A[1,2])
-                    M_g_j_cand = multiplication_matrix_mod_d(K(gamma), rho_j_cand, d, D)
+
+                    # Existing chain (per project owner: unchanged other
+                    # than using the new rho_j and the new elem1) - M_g_j
+                    # and the u1,u2 decomposition both use rho_j_raw (the
+                    # exact algebraic element from find_alpha_rhoB_s1_s2_O
+                    # above), matching how this chain always used a single
+                    # consistent rho_j throughout.
+                    M_g_j_cand = multiplication_matrix_mod_d(K(gamma), rho_j_raw, d, D)
 
                     det_M_g_j = mod(M_g_j_cand[1,1]*M_g_j_cand[2,2] -
                                     M_g_j_cand[1,2]*M_g_j_cand[2,1], d)
                     gcd_det_d = gcd(det_M_g_j, d)
                     if gcd_det_d != 1
-                        println("    p=($p1,$p2) [attempt $attempt]: REJECTED at det(M_g_j) check ",
-                                "(det mod d = ", det_M_g_j, ", gcd with d = ", gcd_det_d, ")")
-                        push!(excluded_new_rho_j_p, new_rho_j_cand)
+                        println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: REJECTED ",
+                                "(det(M_g_j) mod d = ", det_M_g_j, ", gcd with d = ", gcd_det_d,
+                                ") - trying a different rho_B")
+                        push!(excluded_rho_B_p, rho_B_cur)
                         continue
                     end
 
-                    rho_j_bf_cand = BigFloat(real(emb_main_K(rho_j_cand)))
+                    u2_cand, u1_cand = find_rho_j_and_coords(product, rho_j_raw)
 
-                    LrhoJ_gens = [one(K), rho_j_cand]
-                    LrhoJ_ideal_cand = fractional_ideal(O, LrhoJ_gens)
-                    N_LrhoJ = norm(LrhoJ_ideal_cand)
-                    LrhoJ_inv_gens = [quad_conj(K, g) // N_LrhoJ for g in LrhoJ_gens]
-                    LrhoJ_inv_cand = fractional_ideal(O, LrhoJ_inv_gens)
-
-                    target_48_frac = P_int_inv * LrhoJ_inv_cand
-                    target_48_gens_nf = [_nf_elem_of(K, g) for g in basis(target_48_frac)]
-
-                    u2_cand, u1_cand = find_rho_j_and_coords(product, rho_j_cand)
-
-                    diag_val = Float64(u2_cand) * Float64(real(emb_conj_K(rho_j_cand))) - Float64(u1_cand)
-                    println("    p=($p1,$p2) [attempt $attempt]: u2*conj(rho_j)-u1 = ", diag_val,
+                    diag_val = Float64(u2_cand) * Float64(real(emb_conj_K(rho_j_raw))) - Float64(u1_cand)
+                    println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: u2*conj(rho_j)-u1 = ", diag_val,
                             "  positive? ", diag_val > 0)
 
-                    # STAGE 4.7 (per project owner: reinstated): u2*conj(rho_j) - u1
-                    # must be > 0 - reject (no sign-flip fix) if it fails. NOTE:
-                    # this condition is mathematically independent of rho_j (it
-                    # equals conj(product) > 0 for ANY valid rho_j decomposition),
-                    # so retrying with a different rho_j can never fix a failure
-                    # here - only the OUTER rho_B/s1/s2 retry (which changes
-                    # product itself) can. Kept as a per-rho_j-attempt check
-                    # anyway per instruction; it will simply exhaust the rho_j
-                    # loop immediately and fall through to the rho_B retry when
-                    # conj(product) <= 0 for the current rho_B/s1/s2 choice.
+                    # Per project owner (kept from the old Stage 4.7): this
+                    # condition is mathematically about "product" (hence
+                    # about elem1/elem2/rho_B_cur), not about how rho_j was
+                    # obtained - so on failure, only trying a DIFFERENT
+                    # rho_B_cur (not a different rho_j - there isn't one to
+                    # try anymore) can fix it.
                     if !(diag_val > 0)
-                        push!(excluded_new_rho_j_p, new_rho_j_cand)
+                        println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: REJECTED ",
+                                "(u2*conj(rho_j)-u1 <= 0) - trying a different rho_B")
+                        push!(excluded_rho_B_p, rho_B_cur)
                         continue
                     end
 
-                    # STAGE 4.8 (per project owner: reinstated): a totally
-                    # positive alpha_rho_j must exist generating
-                    # P_int^{-1}*(Z+Z*rho_j)^{-1}, such that THAT SAME
-                    # alpha_rho_j satisfies alpha_rho_j*(u2*rho_j-u1) is
-                    # contained in P_int - searched over the whole family of
-                    # totally positive generators (O's fundamental unit has
-                    # norm +1, so there's a whole eps^k family of totally
-                    # positive generators of the same ideal; this searches
-                    # that family directly for one that ALSO satisfies
-                    # membership).
-                    companion = K(u2_cand) * rho_j_cand - K(u1_cand)
-                    membership_target = P_int
-                    ok_alpha_p, alpha_rho_j_cand = is_principal_totally_positive_verified_with_membership(
-                        K, O, target_48_gens_nf, companion, membership_target)
-                    if !ok_alpha_p
-                        println("    p=($p1,$p2) [attempt $attempt]: REJECTED at Stage 4.8 ",
-                                "(no totally-positive alpha_rho_j satisfying membership found)")
-                        push!(excluded_new_rho_j_p, new_rho_j_cand)
-                        continue
-                    end
+                    c_g_j_cand = e(-BigFloat(rademacher(gF_j_cand.A)) / 24) /
+                                  (chi * sqrt(BigFloat(d + 1)))
 
-                    # STAGE 4.9: alpha_rho_j*(u2*rho_j-u1)*P_int must be in
-                    # the same ray-class-group class as J*(p2*rho-p1)*(Z+Z*rho)^{-1}.
-                    LHS_elem = K(alpha_rho_j_cand) * (K(u2_cand) * rho_j_cand - K(u1_cand))
-                    LHS_frac = fractional_ideal(O, [LHS_elem]) * P_int
-
-                    RHS_frac = J * fractional_ideal(O, [elem1]) * Lrho_inv
-                    RHS_gens_nf = [_nf_elem_of(K, g) for g in basis(RHS_frac)]
-                    RHS_conj_gens = [quad_conj(K, g) for g in RHS_gens_nf]
-                    N_RHS = norm(RHS_frac)
-
-                    LHS_gens_nf = [_nf_elem_of(K, g) for g in basis(LHS_frac)]
-                    ratio_gens = [g // N_RHS for g in lattice_product_gens(LHS_gens_nf, RHS_conj_gens)]
-                    ok_same_class, _ = is_principal_O_verified(K, O, ratio_gens)
-                    if !ok_same_class
-                        println("    p=($p1,$p2) [attempt $attempt]: REJECTED at Stage 4.9 ",
-                                "(alpha_rho_j*(u2*rho_j-u1)*P_int not in same class as J*elem1*(Z+Z*rho)^{-1})")
-                        push!(excluded_new_rho_j_p, new_rho_j_cand)
-                        continue
-                    end
-
-                    println("    p=($p1,$p2) [attempt $attempt]: ALL STAGES PASSED")
-
-                    # ALL stages passed for this (p1,p2) with this candidate.
-                    rho_j_p = rho_j_cand
+                    rho_j_p = rho_j_raw
+                    A_bj_p = A_bj_cand
                     gF_j_p = gF_j_cand
                     gQ_j_p = gQ_j_cand
                     QQ_form_p = QQ_form_cand
                     M_g_j_p = M_g_j_cand
-                    c_g_j_p = e(-BigFloat(rademacher(gF_j_cand.A)) / 24) /
-                               (chi * sqrt(BigFloat(d + 1)))
-                    rho_j_bf_p = rho_j_bf_cand
+                    c_g_j_p = c_g_j_cand
+                    rho_j_bf_p = rho_j_bf_raw
                     u1_p, u2_p = u1_cand, u2_cand
-                    found_p = true
-                    break
-                end
-
-                if found_p
                     found_overall = true
                     break
-                else
-                    println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: exhausted ",
-                            max_retries_p, " rho_j candidates - excluding rho_B = ", rho_B_cur,
-                            " and searching for a different rho_B/s1/s2")
-                    push!(excluded_rho_B_p, rho_B_cur)
-                end
                 end
 
                 found_overall || error("p=($p1,$p2): exhausted ", max_retries_rho_B_p,
-                                        " rho_B/s1/s2 candidates, each of which exhausted ",
-                                        max_retries_p, " rho_j candidates - could not satisfy ",
-                                        "Stages 1/2/2.5/4.7/4.8/4.9 for this point")
+                                        " rho_B/s1/s2 candidates - could not satisfy the ",
+                                        "det(M_g_j) and u2*conj(rho_j)-u1>0 checks for this point")
 
                 if gQ_j === nothing
                     gQ_j = gQ_j_p
@@ -1862,11 +2367,17 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
 
                 QA = BigFloat(-QQ_form_p(integralnewdu...) / (d * (d - 2)))
                 s = isodd(d) ? 1 : (1 + integralnewdu[1]) * (1 + integralnewdu[2])
+                # "The acted on shin value": computed via the general shin
+                # wrapper directly on the RAW (not necessarily HJ-reduced)
+                # A_bj_p/rho_j_bf_p - per project owner, this is exactly
+                # why the general wrapper was built, so this no longer
+                # needs rho_j (or A_bj_p) to already be HJ-reduced the way
+                # shin_rm strictly requires.
                 new_ovs[gp[1]+1, gp[2]+1] = ζ^QA * (-1)^s * c_g_j_p *
-                                              shin_rm(gF_j_p.A, rho_j_bf_p, integralnewdu, d)
+                                              shin(A_bj_p, rho_j_bf_p, integralnewdu, d)
 
-                if abs(abs(shin_rm(gF_j_p.A, rho_j_bf_p, integralnewdu, d) *
-                           shin_rm(gF_j_p.A, rho_j_bf_p, -integralnewdu, d)) - 1.0) > 1e-10
+                if abs(abs(shin(A_bj_p, rho_j_bf_p, integralnewdu, d) *
+                           shin(A_bj_p, rho_j_bf_p, -integralnewdu, d)) - 1.0) > 1e-10
                     println("    FAIL at p=($p1,$p2)")
                     println("    [fail-debug] elem1=", elem1, " elem2=", elem2, " product=", product)
                     println("    [fail-debug] u1=", u1_p, " u2=", u2_p, " du=", du,
@@ -2382,6 +2893,650 @@ end
 
 ray_class_group_data(d::Int) = ray_class_group_data(AdmissibleTuple(d))
 
+# ---------------------------------------------------------------------------
+# ray_class_shin_table: for each explicit representative ideal J of a class
+# in the ray class group H_{d*infty2}^{O_f}, computes a "shin value" via:
+#   - b = a representative of [J]^{-1} in Pic(O); alpha, rho_B from
+#     find_alpha_rhoB_s1_s2_O such that b*d*O = alpha*(Z*rho_B+Z), alpha
+#     totally positive, rho_B > conj(rho_B).
+#   - s1, s2 (also from find_alpha_rhoB_s1_s2_O) with
+#     alpha*(s2*rho_B-s1)*b^{-1} in the class of J, s2*conj(rho_B)-s1 > 0,
+#     and alpha*(s2*rho_B-s1) in b (all three already enforced by that
+#     function's own search).
+#   - s = [s1,s2]; A = stabilizer_generator_in_Gamma_s(rho_B, D, s), a
+#     generator of {B in Gamma_s : B*rho_B = rho_B} up to the possible
+#     extra factor of -I.
+#   - shin value for J = shin(A, rho_B, s, d) (the wrapper built earlier),
+#     with s1, s2 re-expressed as an integer vector over d (verified exact,
+#     not rounded) to match shin's Integer-vector calling convention.
+# Prints the full table, and flags (without erroring) any pair of classes
+# whose shin values agree to within diff_tol.
+# ---------------------------------------------------------------------------
+
+"""
+    ray_class_shin_table(F::AdmissibleTuple; mn_height::Int = 3000,
+                          q_gen_height::Int = 3000, max_power::Int = 10_000,
+                          max_u::Integer = 10_000_000, diff_tol::Real = 1e-10)
+
+Builds and prints a table of shin values, one per class of the ray class
+group `H_{d*infty2}^{O_f}` associated to `F` - see the block comment above
+for the exact recipe. Returns
+`table::Vector{Tuple{Any,Union{Nothing,Vector{Int}},Union{Nothing,Complex{BigFloat}}}}`,
+a `(J, d*s, shin_value)` triple for each ray class (`nothing` in place of
+`d*s` and the value for any class where the underlying search failed -
+printed as a failure rather than aborting the whole table).
+"""
+# ---------------------------------------------------------------------------
+# _ray_class_shin_setup: the O/K/ray-class-representative/Picard-data setup
+# shared by ray_class_shin_table and ray_class_shin_table_fast. Factored out
+# so compare_ray_class_shin_tables can compute it ONCE and hand the SAME
+# all_reps/all_triples (and Picard data) to both table functions - calling
+# ray_class_group_representatives independently in each (as both functions
+# still do by default, for standalone use) is not guaranteed to reproduce
+# the same literal representative ideals or the same class ORDER on every
+# call, which otherwise silently misaligns the two tables at the same index.
+# ---------------------------------------------------------------------------
+function _ray_class_shin_setup(F::AdmissibleTuple)
+    D = Int(F.D)
+    q = Int(F.q)
+    d = Int(F.d)
+
+    K, a = quadratic_field(D)
+    Dr = squarefree_part(D)
+    sqrt_Dr = a // isqrt(D ÷ Dr)
+    omega = mod(Dr, 4) == 1 ? (K(1) + sqrt_Dr) // 2 : sqrt_Dr
+    O = Order(K, [one(K), q * omega])
+
+    dbar = mod(d, 2) == 1 ? d : 2 * d
+    m = ideal(O, dbar)
+
+    all_places = real_places(K)
+    Sigma = [all_places[2]]
+
+    all_reps, all_triples = ray_class_group_representatives(K, O, m, Sigma)
+
+    P_O, mP_O, rho_reps, gQ_reps, F_class = find_class_representatives(O, F, K)
+
+    # d_check: strip q's own prime factors out of d before the coprimality
+    # target used inside find_alpha_rhoB_s1_s2_O's search (see the identical
+    # comment/reasoning in twisted_chi_general - required whenever q | d).
+    d_check = d
+    for (p, _) in factor(q)
+        while d_check % Int(p) == 0
+            d_check ÷= Int(p)
+        end
+    end
+
+    return (D = D, q = q, d = d, K = K, O = O,
+            all_reps = all_reps, all_triples = all_triples,
+            P_O = P_O, mP_O = mP_O, rho_reps = rho_reps,
+            gQ_reps = gQ_reps, F_class = F_class, d_check = d_check)
+end
+
+function ray_class_shin_table(F::AdmissibleTuple;
+                               mn_height::Int = 3000,
+                               q_gen_height::Int = 3000,
+                               max_power::Int = 10_000,
+                               max_u::Integer = 10_000_000,
+                               diff_tol::Real = 1e-10,
+                               shared_data::Union{Nothing,NamedTuple} = nothing)
+    sd = shared_data === nothing ? _ray_class_shin_setup(F) : shared_data
+    D, q, d = sd.D, sd.q, sd.d
+    K, O = sd.K, sd.O
+    all_reps, all_triples = sd.all_reps, sd.all_triples
+    P_O, mP_O, rho_reps, gQ_reps, F_class = sd.P_O, sd.mP_O, sd.rho_reps, sd.gQ_reps, sd.F_class
+    d_check = sd.d_check
+    n_classes = length(all_reps)
+    println("ray_class_shin_table: |H_{d*infty2}^{O_f}| = ", n_classes)
+
+    table = Vector{Tuple{Any,Union{Nothing,Vector},Union{Nothing,Complex{BigFloat}}}}(undef, n_classes)
+
+    # Cache of (alpha, rho_B, b_O) keyed by Picard class u_B: these depend
+    # only on u_B, not on the literal ray-class ideal J (see the
+    # ADDITIVE FAST PATH comment inside find_alpha_rhoB_s1_s2_O) - measured
+    # to dominate the per-class runtime (~28s/class), so ray classes sharing
+    # a Picard-class fiber reuse the FIRST one's (alpha,rho_B,b_O) via the
+    # fast-path hints instead of repeating that search. b_O itself isn't
+    # returned by find_alpha_rhoB_s1_s2_O (so its return signature - and
+    # every existing caller of it - stays untouched); it's obtained
+    # separately, once per Picard class, via the same
+    # find_b_with_verified_principal_product call that function uses
+    # internally.
+    alpha_rhoB_bO_cache = Dict{Any,Tuple{Any,Any,Any}}()
+    dO_O_shared = ideal(O, d)
+    d1_ideal_shared = ideal(O, d + 1)
+
+    # Timing instrumentation (diagnostic only - does not affect results) to
+    # see empirically where time is actually going, rather than guessing.
+    t_alpha_rhoB = 0.0
+    t_stabilizer = 0.0
+    t_shin = 0.0
+
+    for (idx, J) in enumerate(all_reps)
+        println("\n--- ray class ", idx, " of ", n_classes, " ---")
+        println("  J = ", J)
+        try
+            u_B = mP_O \ J
+            rho_B_init = rho_reps[u_B]
+
+            cached = get(alpha_rhoB_bO_cache, u_B, nothing)
+            dt = @elapsed begin
+                if cached === nothing
+                    alpha, rho_B, s1, s2 = find_alpha_rhoB_s1_s2_O(
+                        J, rho_B_init, rho_B_init, u_B, P_O, mP_O, O, K,
+                        d, rho_B_init, d_check;
+                        mn_height = mn_height, q_gen_height = q_gen_height)
+                    b_O, _ = find_b_with_verified_principal_product(O, K, J, [dO_O_shared, d1_ideal_shared])
+                    alpha_rhoB_bO_cache[u_B] = (alpha, rho_B, b_O)
+                else
+                    alpha_hint, rho_B_hint, b_O_hint = cached
+                    alpha, rho_B, s1, s2 = find_alpha_rhoB_s1_s2_O(
+                        J, rho_B_init, rho_B_init, u_B, P_O, mP_O, O, K,
+                        d, rho_B_init, d_check;
+                        mn_height = mn_height, q_gen_height = q_gen_height,
+                        alpha_hint = alpha_hint, rho_B_hint = rho_B_hint, b_O_hint = b_O_hint)
+                end
+            end
+            t_alpha_rhoB += dt
+            println("  alpha = ", alpha, "  rho_B = ", rho_B, "  (", round(dt, digits=3), " s)",
+                    cached === nothing ? "  [fresh]" : "  [cached alpha/rho_B/b_O]")
+            println("  s1 = ", s1, "  s2 = ", s2)
+
+            s_vec = [s1, s2]
+            dt = @elapsed begin
+                A, has_neg_I = stabilizer_generator_in_Gamma_s(
+                    rho_B, D, s_vec; max_power = max_power, max_u = max_u)
+            end
+            t_stabilizer += dt
+            println("  A = ", A, "  (also has -I in Gamma_s stabilizer? ", has_neg_I,
+                    ")  (", round(dt, digits=3), " s)")
+
+            p1_exact = s1 * d
+            p2_exact = s2 * d
+            (isone(denominator(p1_exact)) && isone(denominator(p2_exact))) ||
+                error("s = [$s1,$s2] does not have denominator dividing d = $d ",
+                      "(s*d = [$p1_exact, $p2_exact]) - cannot express as an integer ",
+                      "vector over d as expected")
+            p_vec = [Int(numerator(p1_exact)), Int(numerator(p2_exact))]
+
+            rho_B_bf = BigFloat(coeff(rho_B, 0)) + BigFloat(coeff(rho_B, 1)) * sqrt(BigFloat(D))
+
+            dt = @elapsed begin
+                val = shin(A, rho_B_bf, p_vec, d)
+            end
+            t_shin += dt
+            println("  shin value = ", val, "  (", round(dt, digits=3), " s)")
+            table[idx] = (J, p_vec, val)
+        catch e
+            println("  FAILED: ", e)
+            table[idx] = (J, nothing, nothing)
+        end
+    end
+
+    println("\n=== Timing summary (diagnostic only) ===")
+    println("  total time in find_alpha_rhoB_s1_s2_O:      ", round(t_alpha_rhoB, digits=1), " s")
+    println("  total time in stabilizer_generator_in_Gamma_s: ", round(t_stabilizer, digits=1), " s")
+    println("  total time in shin:                          ", round(t_shin, digits=1), " s")
+
+    println("\n=== Checking pairwise shin-value differences (tol = ", diff_tol, ") ===")
+    any_failure = false
+    for i in 1:n_classes, j in (i+1):n_classes
+        vi = table[i][3]
+        vj = table[j][3]
+        (vi === nothing || vj === nothing) && continue
+        if abs(vi - vj) < diff_tol
+            any_failure = true
+            println("  *** FAILURE: shin values for ray classes ", i, " and ", j,
+                    " differ by less than ", diff_tol, " (|diff| = ", abs(vi - vj), ") ***")
+        end
+    end
+    any_failure || println("  No collisions found above tol = ", diff_tol, ".")
+
+    println("\n=== Full shin value table ===")
+    for (idx, (J, ds_vec, val)) in enumerate(table)
+        println("  class ", idx, ": J = ", J,
+                "  d*s = ", ds_vec === nothing ? "FAILED" : ds_vec,
+                "  shin = ", val === nothing ? "FAILED" : val)
+    end
+
+    return table
+end
+
+ray_class_shin_table(d::Int) = ray_class_shin_table(AdmissibleTuple(d))
+
+# ---------------------------------------------------------------------------
+# ray_class_shin_table_fast: a SEPARATE, faster implementation of the same
+# table as ray_class_shin_table, for cross-checking correctness (per-class
+# values should agree with ray_class_shin_table's up to floating tolerance).
+#
+# Recipe: for each Picard class, do the full (slow) find_alpha_rhoB_s1_s2_O
+# search exactly once, on the "anchor" ray class representative (the one
+# with trivial principal-part, I_O = O - ray_class_group_representatives
+# always includes exactly this entry first for every Picard class). This
+# gives alpha, rho_B, b_O, s1, s2, hence a generator
+#     elem2_anchor = alpha*(s2*rho_B - s1)
+# of J0*b_O (J0 = the anchor's own ideal), already sign-adjusted so that
+# emb_conj(elem2_anchor) > 0.
+#
+# Every OTHER ray class in the same Picard fiber is exactly J0*I_O for some
+# principal O-ideal I_O = (gamma) (the same set of (I_O,gamma) pairs is
+# reused across every Picard class - see ray_class_group_representatives).
+# Since gamma is an actual element of O (not just of K), and b_O is an
+# O-ideal (so closed under multiplication by any O-element):
+#   - gamma*elem2_anchor automatically lies in b_O (elem2_anchor does, and
+#     b_O absorbs multiplication by O-elements);
+#   - (gamma*elem2_anchor) = (gamma)*(elem2_anchor) = I_O*(J0*b_O)
+#     = (J0*I_O)*b_O, as ideals, purely by elementary ideal-multiplication
+#     (elem2_anchor generates J0*b_O by construction).
+# So gamma*elem2_anchor (sign-adjusted, since gamma need only be positive
+# at the ONE real place in Sigma, not necessarily at its conjugate) is
+# EXACTLY a valid generator for this ray class's own version of "elem2" -
+# solving for its (s1,s2) via the SAME closed-form linear solve
+# find_alpha_rhoB_s1_s2_O uses internally (the "principal class" style
+# generator-to-(s1,s2) step) needs no search at all. Both of the algebraic
+# facts above are checked explicitly below anyway (never trusted blindly),
+# so any flaw in this reasoning surfaces as an error rather than a silently
+# wrong value.
+# ---------------------------------------------------------------------------
+
+"""
+    ray_class_shin_table_fast(F::AdmissibleTuple; mn_height::Int = 3000,
+                               q_gen_height::Int = 3000, max_power::Int = 10_000,
+                               max_u::Integer = 10_000_000, diff_tol::Real = 1e-10)
+
+Faster alternative construction of the same table as `ray_class_shin_table`
+(see the block comment above for the recipe) - a separate implementation
+for cross-checking correctness, not a replacement. Same return type and
+same printed diagnostics (per-class table, pairwise-collision check) as
+`ray_class_shin_table`.
+"""
+function ray_class_shin_table_fast(F::AdmissibleTuple;
+                                    mn_height::Int = 3000,
+                                    q_gen_height::Int = 3000,
+                                    max_power::Int = 10_000,
+                                    max_u::Integer = 10_000_000,
+                                    diff_tol::Real = 1e-10,
+                                    shared_data::Union{Nothing,NamedTuple} = nothing)
+    sd = shared_data === nothing ? _ray_class_shin_setup(F) : shared_data
+    D, q, d = sd.D, sd.q, sd.d
+    K, O = sd.K, sd.O
+    all_reps, all_triples = sd.all_reps, sd.all_triples
+    P_O, mP_O, rho_reps, gQ_reps, F_class = sd.P_O, sd.mP_O, sd.rho_reps, sd.gQ_reps, sd.F_class
+    d_check = sd.d_check
+    n_classes = length(all_reps)
+    println("ray_class_shin_table_fast: |H_{d*infty2}^{O_f}| = ", n_classes)
+
+    all_places = real_places(K)
+    emb_conj = embedding(all_places[1])
+    emb_main = embedding(all_places[2])
+
+    trivial_I_O = ideal(O, 1)
+
+    table = Vector{Tuple{Any,Union{Nothing,Vector},Union{Nothing,Complex{BigFloat}}}}(undef, n_classes)
+
+    # Per-Picard-class cache populated once, at that class's anchor entry.
+    fiber_cache = Dict{Any,NamedTuple}()
+
+    t_anchor = 0.0
+    t_fast = 0.0
+
+    for (idx, (J, I_O, gamma, is_principal_J)) in enumerate(all_triples)
+        Jfull = all_reps[idx]
+        println("\n--- ray class ", idx, " of ", n_classes, " ---")
+        println("  J (Picard rep) = ", J, "   I_O = ", I_O, "   gamma = ", gamma)
+        println("  full ideal = ", Jfull)
+        try
+            u_B = mP_O \ J
+            is_anchor = (I_O == trivial_I_O)
+
+            local alpha, rho_B, s1, s2
+            if is_anchor
+                dt = @elapsed begin
+                    rho_B_init = rho_reps[u_B]
+                    alpha, rho_B, s1, s2 = find_alpha_rhoB_s1_s2_O(
+                        Jfull, rho_B_init, rho_B_init, u_B, P_O, mP_O, O, K,
+                        d, rho_B_init, d_check;
+                        mn_height = mn_height, q_gen_height = q_gen_height)
+                    b_O, _ = find_b_with_verified_principal_product(
+                        O, K, Jfull, [ideal(O, d), ideal(O, d + 1)])
+                    elem2_anchor = K(s2) * rho_B - K(s1)
+                    abs(Float64(emb_conj(elem2_anchor))) > 0 || error("elem2_anchor is zero under emb_conj")
+                    Float64(emb_conj(elem2_anchor)) > 0 ||
+                        error("elem2_anchor is not sign-adjusted as expected (emb_conj <= 0)")
+                    L = hj_automorph_for_root(rho_B, D; max_u = max_u)
+                    fiber_cache[u_B] = (alpha = alpha, rho_B = rho_B, b_O = b_O,
+                                         elem2_anchor = elem2_anchor, L = L, J0 = Jfull)
+                end
+                t_anchor += dt
+                println("  [ANCHOR] alpha = ", alpha, "  rho_B = ", rho_B,
+                        "  (", round(dt, digits=3), " s)")
+            else
+                haskey(fiber_cache, u_B) ||
+                    error("no anchor cached yet for this Picard class - expected the trivial-I_O ",
+                          "entry to appear first within each Picard-class block of all_triples")
+                dt = @elapsed begin
+                    fc = fiber_cache[u_B]
+                    alpha, rho_B, b_O = fc.alpha, fc.rho_B, fc.b_O
+
+                    w = K(gamma) * fc.elem2_anchor
+                    elem2 = Float64(emb_conj(w)) > 0 ? w : -w
+
+                    qc  = coeff(elem2, 1)
+                    p0  = coeff(elem2, 0)
+                    c2b = coeff(rho_B, 1)
+                    c1b = coeff(rho_B, 0)
+                    s2 = QQ(qc / c2b)
+                    s1 = QQ(qc * c1b / c2b - p0)
+
+                    # Defensive verification - the same two conditions
+                    # find_alpha_rhoB_s1_s2_O itself checks for every
+                    # candidate, plus the sign condition. Never trust the
+                    # algebraic derivation above blindly.
+                    rhoB_conj_val = Float64(emb_conj(rho_B))
+                    s1_f = Float64(BigInt(numerator(s1))) / Float64(BigInt(denominator(s1)))
+                    s2_f = Float64(BigInt(numerator(s2))) / Float64(BigInt(denominator(s2)))
+                    (s2_f * rhoB_conj_val - s1_f) > 0 ||
+                        error("fast-fiber: sign condition s2*conj(rho_B) - s1 > 0 failed")
+
+                    elem_check = alpha * (K(s2) * rho_B - K(s1))
+                    elem_check_ideal = fractional_ideal(O, [elem_check])
+                    Jfull_bO = Jfull * b_O
+                    elem_check_ideal == Jfull_bO ||
+                        error("fast-fiber: elem_check does not generate Jfull*b_O as expected")
+                    (elem_check in b_O) ||
+                        error("fast-fiber: elem_check is not in b_O as expected")
+                end
+                t_fast += dt
+                println("  [fast-fiber] alpha = ", alpha, "  rho_B = ", rho_B,
+                        "  (", round(dt, digits=3), " s)")
+            end
+
+            println("  s1 = ", s1, "  s2 = ", s2)
+
+            s_vec = [s1, s2]
+            L = fiber_cache[u_B].L
+            A, has_neg_I = stabilizer_power_in_Gamma_s(L, s_vec; max_power = max_power)
+            println("  A = ", A, "  (also has -I in Gamma_s stabilizer? ", has_neg_I, ")")
+
+            p1_exact = s1 * d
+            p2_exact = s2 * d
+            (isone(denominator(p1_exact)) && isone(denominator(p2_exact))) ||
+                error("s = [$s1,$s2] does not have denominator dividing d = $d ",
+                      "(s*d = [$p1_exact, $p2_exact]) - cannot express as an integer ",
+                      "vector over d as expected")
+            p_vec = [Int(numerator(p1_exact)), Int(numerator(p2_exact))]
+
+            rho_B_bf = BigFloat(coeff(rho_B, 0)) + BigFloat(coeff(rho_B, 1)) * sqrt(BigFloat(D))
+
+            val = shin(A, rho_B_bf, p_vec, d)
+            println("  shin value = ", val)
+            table[idx] = (Jfull, p_vec, val)
+        catch e
+            println("  FAILED: ", e)
+            table[idx] = (all_reps[idx], nothing, nothing)
+        end
+    end
+
+    println("\n=== Timing summary (diagnostic only) ===")
+    println("  total time in ANCHOR computations:     ", round(t_anchor, digits=1), " s")
+    println("  total time in fast-fiber computations: ", round(t_fast, digits=1), " s")
+
+    println("\n=== Checking pairwise shin-value differences (tol = ", diff_tol, ") ===")
+    any_failure = false
+    for i in 1:n_classes, j in (i+1):n_classes
+        vi = table[i][3]
+        vj = table[j][3]
+        (vi === nothing || vj === nothing) && continue
+        if abs(vi - vj) < diff_tol
+            any_failure = true
+            println("  *** FAILURE: shin values for ray classes ", i, " and ", j,
+                    " differ by less than ", diff_tol, " (|diff| = ", abs(vi - vj), ") ***")
+        end
+    end
+    any_failure || println("  No collisions found above tol = ", diff_tol, ".")
+
+    println("\n=== Full shin value table (fast) ===")
+    for (idx, (J, ds_vec, val)) in enumerate(table)
+        println("  class ", idx, ": J = ", J,
+                "  d*s = ", ds_vec === nothing ? "FAILED" : ds_vec,
+                "  shin = ", val === nothing ? "FAILED" : val)
+    end
+
+    return table
+end
+
+ray_class_shin_table_fast(d::Int) = ray_class_shin_table_fast(AdmissibleTuple(d))
+
+# ---------------------------------------------------------------------------
+# ray_class_shin_table_fast_quiet: identical computation to
+# ray_class_shin_table_fast, but (a) prints nothing at all, and (b) returns
+# each entry's s1, s2, rho_B alongside its shin value (not just d*s), since
+# a REVERSE lookup by shin value (find which ray class produced a given
+# shin value, then read off ITS s1/s2/rho_B) is exactly what's needed to
+# fix elem1 in twisted_chi_general - see the comment there. A separate
+# function rather than modifying ray_class_shin_table_fast itself, so its
+# existing return type/behavior (and compare_ray_class_shin_tables, which
+# depends on it) are untouched.
+# ---------------------------------------------------------------------------
+
+"""
+    ray_class_shin_table_fast_quiet(F::AdmissibleTuple; mn_height::Int = 3000,
+                                     q_gen_height::Int = 3000, max_power::Int = 10_000,
+                                     max_u::Integer = 10_000_000,
+                                     shared_data::Union{Nothing,NamedTuple} = nothing)
+
+Same computation as `ray_class_shin_table_fast`, silenced (no `println` at
+all) and returning richer per-entry data for reverse lookup by shin value.
+
+Returns `Vector{Union{Nothing,NamedTuple}}`, one entry per ray class, each
+either `nothing` (that class's computation failed) or a named tuple
+`(J, s1, s2, rho_B, shin_value)`.
+"""
+function _ray_class_shin_table_fast_quiet_impl(F::AdmissibleTuple;
+                                          mn_height::Int = 3000,
+                                          q_gen_height::Int = 3000,
+                                          max_power::Int = 10_000,
+                                          max_u::Integer = 10_000_000,
+                                          shared_data::Union{Nothing,NamedTuple} = nothing)
+    sd = shared_data === nothing ? _ray_class_shin_setup(F) : shared_data
+    D, q, d = sd.D, sd.q, sd.d
+    K, O = sd.K, sd.O
+    all_reps, all_triples = sd.all_reps, sd.all_triples
+    P_O, mP_O, rho_reps, gQ_reps, F_class = sd.P_O, sd.mP_O, sd.rho_reps, sd.gQ_reps, sd.F_class
+    d_check = sd.d_check
+    n_classes = length(all_reps)
+
+    all_places = real_places(K)
+    emb_conj = embedding(all_places[1])
+    emb_main = embedding(all_places[2])
+
+    trivial_I_O = ideal(O, 1)
+
+    table = Vector{Union{Nothing,NamedTuple}}(undef, n_classes)
+    fiber_cache = Dict{Any,NamedTuple}()
+
+    for (idx, (J, I_O, gamma, is_principal_J)) in enumerate(all_triples)
+        Jfull = all_reps[idx]
+        try
+            u_B = mP_O \ J
+            is_anchor = (I_O == trivial_I_O)
+
+            local alpha, rho_B, s1, s2
+            if is_anchor
+                rho_B_init = rho_reps[u_B]
+                alpha, rho_B, s1, s2 = find_alpha_rhoB_s1_s2_O(
+                    Jfull, rho_B_init, rho_B_init, u_B, P_O, mP_O, O, K,
+                    d, rho_B_init, d_check;
+                    mn_height = mn_height, q_gen_height = q_gen_height)
+                b_O, _ = find_b_with_verified_principal_product(
+                    O, K, Jfull, [ideal(O, d), ideal(O, d + 1)])
+                elem2_anchor = K(s2) * rho_B - K(s1)
+                abs(Float64(emb_conj(elem2_anchor))) > 0 || error("elem2_anchor is zero under emb_conj")
+                Float64(emb_conj(elem2_anchor)) > 0 ||
+                    error("elem2_anchor is not sign-adjusted as expected (emb_conj <= 0)")
+                L = hj_automorph_for_root(rho_B, D; max_u = max_u)
+                fiber_cache[u_B] = (alpha = alpha, rho_B = rho_B, b_O = b_O,
+                                     elem2_anchor = elem2_anchor, L = L, J0 = Jfull)
+            else
+                haskey(fiber_cache, u_B) ||
+                    error("no anchor cached yet for this Picard class - expected the trivial-I_O ",
+                          "entry to appear first within each Picard-class block of all_triples")
+                fc = fiber_cache[u_B]
+                alpha, rho_B, b_O = fc.alpha, fc.rho_B, fc.b_O
+
+                w = K(gamma) * fc.elem2_anchor
+                elem2 = Float64(emb_conj(w)) > 0 ? w : -w
+
+                qc  = coeff(elem2, 1)
+                p0  = coeff(elem2, 0)
+                c2b = coeff(rho_B, 1)
+                c1b = coeff(rho_B, 0)
+                s2 = QQ(qc / c2b)
+                s1 = QQ(qc * c1b / c2b - p0)
+
+                rhoB_conj_val = Float64(emb_conj(rho_B))
+                s1_f = Float64(BigInt(numerator(s1))) / Float64(BigInt(denominator(s1)))
+                s2_f = Float64(BigInt(numerator(s2))) / Float64(BigInt(denominator(s2)))
+                (s2_f * rhoB_conj_val - s1_f) > 0 ||
+                    error("fast-fiber: sign condition s2*conj(rho_B) - s1 > 0 failed")
+
+                elem_check = alpha * (K(s2) * rho_B - K(s1))
+                elem_check_ideal = fractional_ideal(O, [elem_check])
+                Jfull_bO = Jfull * b_O
+                elem_check_ideal == Jfull_bO ||
+                    error("fast-fiber: elem_check does not generate Jfull*b_O as expected")
+                (elem_check in b_O) ||
+                    error("fast-fiber: elem_check is not in b_O as expected")
+            end
+
+            s_vec = [s1, s2]
+            L = fiber_cache[u_B].L
+            A, has_neg_I = stabilizer_power_in_Gamma_s(L, s_vec; max_power = max_power)
+
+            p1_exact = s1 * d
+            p2_exact = s2 * d
+            (isone(denominator(p1_exact)) && isone(denominator(p2_exact))) ||
+                error("s = [$s1,$s2] does not have denominator dividing d = $d ",
+                      "(s*d = [$p1_exact, $p2_exact]) - cannot express as an integer ",
+                      "vector over d as expected")
+            p_vec = [Int(numerator(p1_exact)), Int(numerator(p2_exact))]
+
+            rho_B_bf = BigFloat(coeff(rho_B, 0)) + BigFloat(coeff(rho_B, 1)) * sqrt(BigFloat(D))
+
+            val = shin(A, rho_B_bf, p_vec, d)
+            table[idx] = (J = Jfull, s1 = s1, s2 = s2, rho_B = rho_B, shin_value = val)
+        catch e
+            table[idx] = nothing
+        end
+    end
+
+    return table
+end
+
+"""
+    ray_class_shin_table_fast_quiet(F::AdmissibleTuple; kwargs...)
+
+Genuinely-silent public entry point for `_ray_class_shin_table_fast_quiet_impl`
+(same keyword arguments). "Quiet" means quiet: this wraps the call in
+`redirect_stdout` so that even output from functions it calls internally
+(e.g. `ray_class_group_representatives`, which prints its own diagnostics -
+including a full listing of every Picard-class representative - regardless
+of any caller's verbosity preference) is suppressed, not just this file's
+own `println` calls.
+"""
+function ray_class_shin_table_fast_quiet(F::AdmissibleTuple; kwargs...)
+    result = Ref{Any}(nothing)
+    redirect_stdout(devnull) do
+        result[] = _ray_class_shin_table_fast_quiet_impl(F; kwargs...)
+    end
+    return result[]
+end
+
+ray_class_shin_table_fast_quiet(d::Int) = ray_class_shin_table_fast_quiet(AdmissibleTuple(d))
+
+# ---------------------------------------------------------------------------
+# compare_ray_class_shin_tables: runs BOTH ray_class_shin_table (slow) and
+# ray_class_shin_table_fast, then compares their shin values class by class.
+# Prints true/false per ray class, and true/false overall.
+# ---------------------------------------------------------------------------
+
+"""
+    compare_ray_class_shin_tables(F::AdmissibleTuple; tol::Real = 1e-10, kwargs...)
+
+Runs `ray_class_shin_table(F; kwargs...)` and `ray_class_shin_table_fast(F; kwargs...)`,
+then compares their shin values class by class (`abs(diff) < tol`). Prints
+`true`/`false` for each ray class, then prints and returns whether ALL
+classes agree.
+
+Both tables are built from the SAME shared setup (`_ray_class_shin_setup`,
+computed once and passed to both via the `shared_data` keyword each table
+function accepts) - calling `ray_class_group_representatives` independently
+in each table is not guaranteed to reproduce the same literal
+representative ideals or class order on every call, which otherwise
+silently misaligns the two tables at the same index even when both are
+individually correct.
+
+A class where either table FAILED for that entry, or where the two tables'
+underlying ideal `J` still don't line up at that index (shouldn't happen
+now that both use the same shared setup, but checked anyway rather than
+assumed), is counted as `false` (never silently skipped or counted as a
+match).
+
+Returns `(all_match::Bool, per_class::Vector{Bool})`.
+"""
+function compare_ray_class_shin_tables(F::AdmissibleTuple; tol::Real = 1e-10, kwargs...)
+    println("=== Computing shared setup (O, K, ray class representatives, Picard data) ===")
+    sd = _ray_class_shin_setup(F)
+
+    println("\n=== Running ray_class_shin_table (slow) ===")
+    table_slow = ray_class_shin_table(F; shared_data = sd, kwargs...)
+
+    println("\n=== Running ray_class_shin_table_fast ===")
+    table_fast = ray_class_shin_table_fast(F; shared_data = sd, kwargs...)
+
+    n_slow = length(table_slow)
+    n_fast = length(table_fast)
+    n_slow == n_fast ||
+        error("compare_ray_class_shin_tables: tables have different lengths ",
+              "(slow has $n_slow, fast has $n_fast) - cannot compare class by class")
+
+    per_class = Vector{Bool}(undef, n_slow)
+
+    println("\n=== Per-class comparison (tol = ", tol, ") ===")
+    for idx in 1:n_slow
+        J_slow, _, val_slow = table_slow[idx]
+        J_fast, _, val_fast = table_fast[idx]
+
+        same_J = try
+            J_slow == J_fast
+        catch
+            false
+        end
+        same_J || println("  class ", idx, ": WARNING - underlying ideal J differs between the ",
+                "two tables at this index (slow J = ", J_slow, ", fast J = ", J_fast,
+                ") - the two tables may not be aligned the same way; comparing by index anyway")
+
+        if val_slow === nothing || val_fast === nothing
+            per_class[idx] = false
+            println("  class ", idx, ": false  (slow = ",
+                    val_slow === nothing ? "FAILED" : val_slow,
+                    ", fast = ", val_fast === nothing ? "FAILED" : val_fast, ")")
+        else
+            ok = same_J && abs(val_slow - val_fast) < tol
+            per_class[idx] = ok
+            println("  class ", idx, ": ", ok, "  (|diff| = ", abs(val_slow - val_fast), ")")
+        end
+    end
+
+    all_match = all(per_class)
+    println("\n=== Overall result ===")
+    println("All shin values match: ", all_match)
+
+    return all_match, per_class
+end
+
+compare_ray_class_shin_tables(d::Int; kwargs...) = compare_ray_class_shin_tables(AdmissibleTuple(d); kwargs...)
+
 function test_all_twists(d::Int)
     F = AdmissibleTuple(d)
     @show F
@@ -2444,6 +3599,11 @@ function test_all_twists(d::Int)
 
     j_cache = Dict{FinGenAbGroupElem, Any}()   # keyed by u_B (J's Picard class); caches rho_B/s1/s2/etc that only depend on J's class, not on gamma or on which specific J object was passed in
 
+    println("\nComputing ray class shin lookup table once for this run ",
+            "(used by every twisted_chi_general call below for elem1) ...")
+    ray_class_lookup_table = ray_class_shin_table_fast_quiet(F)
+    println("  done: ", length(ray_class_lookup_table), " entries.")
+
     n_principal = min(5, length(principal_triples))
     println("\n=== Testing first ", n_principal, " principal twists ===")
     for (k, (J, I, gamma)) in enumerate(principal_triples[1:n_principal])
@@ -2453,7 +3613,8 @@ function test_all_twists(d::Int)
         println("  norm(gamma) = ", norm(K(gamma)))
         new_ovs, gF, psi = twisted_chi_general(F, J, gamma, K, O,
                                                 true, P_O, mP_O,
-                                                rho_reps, gQ_reps, F_class, j_cache)
+                                                rho_reps, gQ_reps, F_class, j_cache;
+                                                ray_class_lookup_table = ray_class_lookup_table)
     end
 
     n_nonprincipal = min(20, length(nonprincipal_triples))
@@ -2465,7 +3626,8 @@ function test_all_twists(d::Int)
         println("  norm(gamma) = ", norm(K(gamma)))
         new_ovs, gF, psi = twisted_chi_general(F, J, gamma, K, O,
                                                 false, P_O, mP_O,
-                                                rho_reps, gQ_reps, F_class, j_cache)
+                                                rho_reps, gQ_reps, F_class, j_cache;
+                                                ray_class_lookup_table = ray_class_lookup_table)
     end
 end
 

@@ -3,10 +3,6 @@ using Random
 Random.seed!(672049183)
 #Random.seed!(891357246)
 
-using Random
-#Random.seed!(305817264)
-Random.seed!(672049183)
-#Random.seed!(891357246)
 
 # galois_action_ghost_sics.jl
 #
@@ -591,9 +587,22 @@ function find_class_representatives(O, F, K)
     end
 
     D_Q = Int(discriminant(F.Q))
-    _, f_Q = coredisc(D_Q)
-    sqrt_DQ = f_Q * sqrt_Dr
+    D_fund, f_Q = coredisc(D_Q)
+    D_fund == D ||
+        error("find_class_representatives: coredisc(discriminant(F.Q)) = $D_fund does not ",
+              "match the field's own fundamental discriminant D = $D - F.Q may not actually ",
+              "live in K")
+    # BUGFIX: sqrt_DQ must equal sqrt(D_Q) = sqrt(f_Q^2 * D_fund) = f_Q * sqrt(D_fund).
+    # sqrt(D_fund) is exactly K's own generator `a` (a = gen(K) = sqrt(D), and D_fund == D
+    # as just checked) - NOT sqrt_Dr, which equals sqrt(Dr) = a/isqrt(D÷Dr), a DIFFERENT
+    # (smaller, by a factor of isqrt(D÷Dr)) quantity. Using sqrt_Dr here silently produced
+    # a wrong (too-small) rho_F whenever isqrt(D÷Dr) != 1, i.e. whenever D is not itself
+    # squarefree - exactly this case (D=44=4*11, isqrt(4)=2).
+    sqrt_DQ = f_Q * a
     rho_F = (-F.Q.b + sqrt_DQ) / (2 * F.Q.a)
+    println("F.Q = ", F.Q, "  (a,b,c) = (", F.Q.a, ",", F.Q.b, ",", F.Q.c, ")",
+            "  disc(F.Q) = ", D_Q, "  coredisc = (", D_fund, ",", f_Q, ")",
+            "  sqrt_DQ = ", sqrt_DQ, "  rho_F (fixed) = ", rho_F)
 
     if F_class === nothing
         for g in P_O
@@ -2186,12 +2195,56 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 match_idx = findfirst(
                     e -> e !== nothing && abs(e.shin_value - shin_val_lookup) < ray_class_lookup_tol,
                     ray_class_lookup_table_local)
-                match_idx === nothing &&
+                if match_idx === nothing
+                    # DIAGNOSTIC: A_lookup was built from the REDUCED fraction
+                    # (QQ(p1,d), QQ(p2,d) auto-reduce), but shin() just above
+                    # was called with the RAW, possibly-unreduced integers
+                    # [p1,p2] and d. If shin's internal phase/multiplier
+                    # formula isn't reduction-invariant, [p1,p2]/d and the
+                    # reduced [p1÷g,p2÷g]/(d÷g) - the SAME rational point -
+                    # could give genuinely different answers. Check directly.
+                    g_common = gcd(gcd(p1, p2), d)
+                    if g_common > 1
+                        p1_red, p2_red, d_red = p1 ÷ g_common, p2 ÷ g_common, d ÷ g_common
+                        shin_val_reduced = shin(A_lookup, rho_bf_base, [p1_red, p2_red], d_red)
+                        println("  [reduction diagnostic] gcd(p1,p2,d) = ", g_common,
+                                "  reduced point = [", p1_red, ",", p2_red, "]/", d_red)
+                        println("  [reduction diagnostic] shin(unreduced [", p1, ",", p2, "]/", d, ") = ",
+                                shin_val_lookup)
+                        println("  [reduction diagnostic] shin(reduced   [", p1_red, ",", p2_red, "]/", d_red, ") = ",
+                                shin_val_reduced)
+                        println("  [reduction diagnostic] |diff| = ", abs(shin_val_lookup - shin_val_reduced))
+                        match_idx_red = findfirst(
+                            e -> e !== nothing && abs(e.shin_value - shin_val_reduced) < ray_class_lookup_tol,
+                            ray_class_lookup_table_local)
+                        println("  [reduction diagnostic] does the REDUCED value match the table? ",
+                                match_idx_red !== nothing)
+
+                        # Closest-match diagnostic: distinguishes "some table
+                        # entry has a wrong stored value near this one" (a
+                        # near-miss, small gap) from "no entry anywhere close"
+                        # (a genuine gap in what the table computed for this
+                        # class, despite no `nothing` slots).
+                        valid_idxs = findall(e -> e !== nothing, ray_class_lookup_table_local)
+                        gaps = [abs(ray_class_lookup_table_local[i].shin_value - shin_val_lookup) for i in valid_idxs]
+                        closest_pos = argmin(gaps)
+                        closest_i = valid_idxs[closest_pos]
+                        closest_entry = ray_class_lookup_table_local[closest_i]
+                        println("  [closest-match diagnostic] smallest gap to any table entry = ", gaps[closest_pos])
+                        println("  [closest-match diagnostic] closest entry: J = ", closest_entry.J,
+                                "  s1 = ", closest_entry.s1, "  s2 = ", closest_entry.s2,
+                                "  rho_B = ", closest_entry.rho_B,
+                                "  shin_value = ", closest_entry.shin_value)
+                    else
+                        println("  [reduction diagnostic] gcd(p1,p2,d) = 1 - this point is already ",
+                                "primitive, reduction is not the explanation here")
+                    end
                     error("elem1 lookup: no ray class table entry matches shin^{[",
                           p1, ",", p2, "]}_A(rho) = ", shin_val_lookup,
                           " within tol=", ray_class_lookup_tol,
                           " - the table may need a finer search bound (mn_height/q_gen_height), ",
                           "or something upstream is wrong")
+                end
                 lookup_entry = ray_class_lookup_table_local[match_idx]
                 elem1 = K(d) * (K(lookup_entry.s2) * lookup_entry.rho_B - K(lookup_entry.s1))
 
@@ -2277,9 +2330,37 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     # no floating point involved in A_reduced itself), not
                     # a reduced root value.
                     red_bj = find_hj_reducing_matrix(A_bj_cand, rho_j_bf_raw)
-                    gQ_j_cand = binary_quadratic_form(red_bj.A_reduced[2,1],
-                                                       red_bj.A_reduced[2,2] - red_bj.A_reduced[1,1],
-                                                       -red_bj.A_reduced[1,2])
+                    gQ_j_cand_raw = binary_quadratic_form(red_bj.A_reduced[2,1],
+                                                           red_bj.A_reduced[2,2] - red_bj.A_reduced[1,1],
+                                                           -red_bj.A_reduced[1,2])
+                    # BUGFIX: A_reduced's raw entries have no reason to be
+                    # jointly coprime (it's just some GL_2(Z) matrix), so the
+                    # form built directly from them can be a non-primitive
+                    # multiple of the true form - inflating its discriminant
+                    # by content^2 and its apparent conductor by `content`,
+                    # which then fails AdmissibleTuple's "conductor q of Q
+                    # must divide f_j" check even though the TRUE (reduced)
+                    # form's conductor is correct. Divide out the content
+                    # first, matching the same primitivization already done
+                    # in find_class_representatives's own candidate-form
+                    # construction (g_int = gcd(a,b,c); a_int ÷= g_int; ...).
+                    let content_c = gcd(gcd(gQ_j_cand_raw.a, gQ_j_cand_raw.b), gQ_j_cand_raw.c)
+                        println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: gQ_j_cand_raw = ",
+                                gQ_j_cand_raw, "  content(gcd) = ", content_c)
+                    end
+                    content_j = gcd(gcd(gQ_j_cand_raw.a, gQ_j_cand_raw.b), gQ_j_cand_raw.c)
+                    gQ_j_cand = binary_quadratic_form(divexact(gQ_j_cand_raw.a, content_j),
+                                                       divexact(gQ_j_cand_raw.b, content_j),
+                                                       divexact(gQ_j_cand_raw.c, content_j))
+                    let a_c, b_c, c_c, disc_c, fund_c, cond_c
+                        a_c, b_c, c_c = gQ_j_cand.a, gQ_j_cand.b, gQ_j_cand.c
+                        disc_c = Int(discriminant(gQ_j_cand))
+                        fund_c, cond_c = coredisc(disc_c)
+                        println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: gQ_j_cand (primitivized) = ", gQ_j_cand,
+                                "  (a,b,c) = (", a_c, ",", b_c, ",", c_c, ")",
+                                "  disc = ", disc_c, "  coredisc = (", fund_c, ",", cond_c, ")",
+                                "  O's own q = ", q_val, "  F.r = ", F.r)
+                    end
                     gF_j_cand = AdmissibleTuple(d, F.r, gQ_j_cand)
                     QQ_form_cand = binary_quadratic_form(gF_j_cand.A[2,1],
                                                           gF_j_cand.A[2,2] - gF_j_cand.A[1,1],
@@ -3541,48 +3622,29 @@ function test_all_twists(d::Int)
     F = AdmissibleTuple(d)
     @show F
 
-    D = Int(F.D)
-    q = Int(F.q)
+    # BUGFIX: previously this function duplicated _ray_class_shin_setup's own
+    # K/O construction inline (quadratic_field(D) + Order(K,...) called a
+    # second time here), AND separately called ray_class_shin_table_fast_quiet(F)
+    # which calls _ray_class_shin_setup(F) a THIRD time internally. Each call
+    # to quadratic_field/Order produces a NEW object even for identical input,
+    # so J (built from this function's own O) and lookup_entry.J (built from
+    # the lookup table's own separately-constructed O) ended up as ideals of
+    # two different (though mathematically identical) order OBJECTS -
+    # triggering Hecke's "Ideals do not have the same order" the first time
+    # twisted_chi_general tried to multiply J * U_elem1 together.
+    # FIX: build the setup ONCE via _ray_class_shin_setup, use its K/O for
+    # everything below, and pass it as shared_data so ray_class_shin_table_fast_quiet
+    # reuses the SAME K/O instead of constructing its own.
+    sd = _ray_class_shin_setup(F)
+    D, q, d = sd.D, sd.q, sd.d
+    K, O = sd.K, sd.O
+    all_reps, all_triples = sd.all_reps, sd.all_triples
+    P_O, mP_O, rho_reps, gQ_reps, F_class = sd.P_O, sd.mP_O, sd.rho_reps, sd.gQ_reps, sd.F_class
 
-    Dr = squarefree_part(D)
-    K, a = quadratic_field(D)
-    OK = maximal_order(K)
-    GC.gc()
-    GC.gc()
-
-    sqrt_Dr = a // isqrt(D ÷ Dr)
-    omega = mod(Dr, 4) == 1 ? (K(1) + sqrt_Dr) // 2 : sqrt_Dr
-    O = Order(K, [one(K), q * omega])
     println("conductor of O is: ", conductor(O))
-    GC.gc()
-
-    P_O_temp, _ = picard_group(O)
-    println("Class group of O has order: ", order(P_O_temp))
-    GC.gc()
-
+    println("Class group of O has order: ", order(P_O))
     println("D = ", D, ", q = ", q)
-
-    d = Int(F.d)
-    if mod(d, 2) == 1
-        dbar = d
-    else
-        dbar = 2d
-    end
-
-    m = ideal(O, dbar)
-    GC.gc()
-
-    all_places = real_places(K)
-    Sigma = [all_places[2]]
-    println("Using Sigma = second real place only: ", Sigma)
-    GC.gc()
-    GC.gc()
-
-    all_reps, all_triples = ray_class_group_representatives(K, O, m, Sigma)
-
     println("Total triples: ", length(all_triples))
-
-    P_O, mP_O, rho_reps, gQ_reps, F_class = find_class_representatives(O, F, K)
     println("Class representatives:")
     for (g, rho) in rho_reps
         println("  class ", g, ": rho = ", rho, " gQ = ", gQ_reps[g])
@@ -3601,8 +3663,14 @@ function test_all_twists(d::Int)
 
     println("\nComputing ray class shin lookup table once for this run ",
             "(used by every twisted_chi_general call below for elem1) ...")
-    ray_class_lookup_table = ray_class_shin_table_fast_quiet(F)
+    ray_class_lookup_table = ray_class_shin_table_fast_quiet(F; shared_data = sd)
     println("  done: ", length(ray_class_lookup_table), " entries.")
+
+    n_missing = count(x -> x === nothing, ray_class_lookup_table)
+    println("  missing table entries: ", n_missing, " out of ", length(ray_class_lookup_table))
+    if n_missing > 0
+        println("  missing indices: ", findall(x -> x === nothing, ray_class_lookup_table))
+    end
 
     n_principal = min(5, length(principal_triples))
     println("\n=== Testing first ", n_principal, " principal twists ===")
@@ -3690,7 +3758,7 @@ function test_ray_class_group_size_first_n_tuples(n::Int)
     end
 end
 
-test_all_twists(21)
+#test_all_twists(21)
 
 #test_ray_class_group_size_first_n_tuples(101)
 
@@ -3708,3 +3776,424 @@ function ray_class_group_data_first_n_tuples(n::Int)
 end
 
 #ray_class_group_data_first_n_tuples(101)
+
+# ---------------------------------------------------------------------------
+# diagnose_elem1_lookup: inspects A_lookup / shin^{[p1,p2]}_A(rho) directly
+# for a given (p1,p2), bypassing the full twisted_chi_general retry
+# machinery - for tracking down why a specific point's reverse lookup into
+# the ray class shin table fails (e.g. an unreasonably large |shin| value).
+# ---------------------------------------------------------------------------
+
+"""
+    true_picard_class_of_root(K, O, P_O, mP_O, rho; unit_bound::Int = 300)
+
+Determines the TRUE Picard class of `Z+Z*rho` by testing it against all
+`|P_O|` group elements directly, WITHOUT going through `gQ_reps`/
+`reduced_hj_orbit`/`minimal_hj_stabilizer`/`form_sign_fix` (suspected of
+conflating narrow classes when `O` has no unit of norm -1, since
+`form_sign_fix`'s `<a,b,c> -> <-a,b,-c>` is `-Q(x,-y)`, an overall sign flip
+composed with a det=-1 substitution - NOT a GL_2(Z) equivalence unless a
+norm -1 unit exists to identify it with a genuine class-preserving map).
+
+For each g in P_O, J_g := mP_O(g) (the FORWARD map - i.e. Hecke's own
+ideal representative for class g, not the discrete-log direction that was
+independently found untrustworthy earlier in this project). Since
+`J_g*conj(J_g)` is always principal, `class(Z+Z*rho) = class(J_g)` iff
+`(Z+Z*rho)*conj(J_g)` is principal - tested via `is_principal_O_verified`,
+exactly the same disc-log-free technique already used elsewhere in this
+file (e.g. `find_alpha_rhoB_s1_s2_O`'s final verification).
+
+Returns `(g, lambda)` for the matching class, where `lambda` is the EXACT
+verified generator found for `(Z+Z*rho)*conj(J_g)` (only meaningful as a
+`Z+Z*rho = lambda*O` statement when `J_g = O` itself, i.e. `g` is the
+IDENTITY element of `P_O` - callers wanting that specific relationship
+should call this and use `lambda` only when `g == zero(P_O)`; for non-
+identity `g`, `lambda` still certifies the class match but is not directly
+`Z+Z*rho`'s own generator). Returning `lambda` here (rather than having
+callers re-invoke `is_principal_O_verified` separately with differently-
+formatted generators for the "same" lattice) avoids a real inconsistency
+observed in practice: `is_principal_O_verified` can give different
+true/false results for generator sets spanning the identical lattice,
+depending on exactly how those generators are packaged - so the safest
+policy is to trust and reuse whichever specific call already succeeded,
+never re-derive the same fact via a differently-formatted call.
+
+Errors if zero or more than one class matches (the latter would indicate
+`is_principal_O_verified`'s unit_bound is too small and is spuriously
+failing for the true class as well, not that two classes are both correct).
+"""
+function true_picard_class_of_root(K, O, P_O, mP_O, rho; unit_bound::Int = 300)
+    I_rho_gens = [K(1), rho]
+    matches = []
+    for g in P_O
+        J_g = mP_O(g)
+        Jconj_gens = [quad_conj(K, _nf_elem_of(K, x)) for x in basis(J_g)]
+        gens = lattice_product_gens(I_rho_gens, Jconj_gens)
+        ok, lam = is_principal_O_verified(K, O, gens; unit_bound = unit_bound)
+        println("  true_picard_class_of_root: g = ", g, "  (Z+Z*rho)*conj(J_g) principal? ", ok)
+        ok && push!(matches, (g, lam))
+    end
+    length(matches) == 1 ||
+        error("true_picard_class_of_root: found ", length(matches), " matching classes ",
+              "(expected exactly 1) - matches = ", matches, ". If 0, unit_bound may be too ",
+              "small; if >1, something is inconsistent with is_principal_O_verified itself.")
+    return matches[1]
+end
+
+
+
+"""
+    diagnose_elem1_lookup(d_val::Int; p1::Int = 0, p2::Int = 1)
+
+Prints, step by step: `rho` and its `BigFloat` value; the full stabilizer
+`L_rho_base` of `rho` (and whether it actually fixes `rho`, and its
+determinant); `A_lookup` for the given `(p1,p2)` (its entries' size,
+determinant, whether it fixes `rho`, and whether it satisfies
+`A*r - r ∈ Z^2` for `r = [p1/d, p2/d]`); the `find_hj_reducing_matrix`
+result used internally by `shin`; and finally the `shin` value itself and
+its magnitude (expected close to 1 for a well-behaved point).
+"""
+function diagnose_elem1_lookup(d_val::Int; p1::Int = 0, p2::Int = 1)
+    F = AdmissibleTuple(d_val)
+    D = Int(F.D)
+    d = Int(F.d)
+    q = Int(F.q)
+
+    K, a = quadratic_field(D)
+    Dr = squarefree_part(D)
+    sqrt_Dr = a // isqrt(D ÷ Dr)
+    omega = mod(Dr, 4) == 1 ? (K(1) + sqrt_Dr) // 2 : sqrt_Dr
+    O = Order(K, [one(K), q * omega])
+
+    P_O, mP_O, rho_reps, gQ_reps, F_class = find_class_representatives(O, F, K)
+    rho = rho_reps[F_class]
+    println("rho = ", rho)
+
+    rho_bf = BigFloat(coeff(rho, 0)) + BigFloat(coeff(rho, 1)) * sqrt(BigFloat(D))
+    println("rho_bf = ", rho_bf)
+
+    # The full stabilizer of rho under SL_2(Z) - the expensive Pell-based part.
+    L_rho_base = hj_automorph_for_root(rho, D)
+    println("\nL_rho_base = ", L_rho_base)
+    println("det(L_rho_base) = ", L_rho_base[1,1]*L_rho_base[2,2] - L_rho_base[1,2]*L_rho_base[2,1])
+    println("L_rho_base * rho_bf (Mobius) = ", (L_rho_base[1,1]*rho_bf + L_rho_base[1,2]) /
+                                                (L_rho_base[2,1]*rho_bf + L_rho_base[2,2]),
+            "  (should equal rho_bf)")
+
+    # The specific point requested.
+    r_vec = [QQ(p1, d), QQ(p2, d)]
+    println("\nr = [p1/d, p2/d] = ", r_vec)
+
+    A_lookup, has_neg_I = stabilizer_power_in_Gamma_s(L_rho_base, r_vec)
+    println("\nA_lookup = ", A_lookup)
+    det_A = A_lookup[1,1]*A_lookup[2,2] - A_lookup[1,2]*A_lookup[2,1]
+    println("det(A_lookup) = ", det_A)
+    println("has_neg_I = ", has_neg_I)
+    println("A_lookup entries (max abs) = ", maximum(abs.(A_lookup)))
+
+    # Sanity: does A_lookup actually fix rho?
+    A_rho = (A_lookup[1,1]*rho_bf + A_lookup[1,2]) / (A_lookup[2,1]*rho_bf + A_lookup[2,2])
+    println("A_lookup * rho_bf (Mobius) = ", A_rho, "  (should equal rho_bf)")
+
+    # Sanity: does A_lookup actually satisfy A*r - r in Z^2?
+    Ar1 = A_lookup[1,1]*r_vec[1] + A_lookup[1,2]*r_vec[2]
+    Ar2 = A_lookup[2,1]*r_vec[1] + A_lookup[2,2]*r_vec[2]
+    println("A_lookup*r - r = [", Ar1 - r_vec[1], ", ", Ar2 - r_vec[2], "]  (should be integers)")
+
+    # Now the actual shin value - this is what blows up.
+    println("\nComputing shin(A_lookup, rho_bf, [p1,p2], d) ...")
+    red = find_hj_reducing_matrix(A_lookup, rho_bf)
+    println("find_hj_reducing_matrix result:")
+    println("  R = ", red.R, "  det(R) = ", red.detR)
+    println("  A_reduced = ", red.A_reduced)
+    println("  root_used = ", red.root_used, "  reduced_root = ", red.reduced_root)
+    println("  A_reduced entries (max abs) = ", maximum(abs.(red.A_reduced)))
+
+    shin_val = shin(A_lookup, rho_bf, [p1, p2], d)
+    println("\nshin_val = ", shin_val)
+    println("abs(shin_val) = ", abs(shin_val), "  (should be close to 1 if this is well-behaved)")
+
+    # Precision test: A_lookup/A_reduced have very large entries here, so
+    # check whether the blowup is simply the default BigFloat precision
+    # (256 bits) being insufficient for this matrix size, rather than a
+    # logic error. If abs(shin_val) comes back close to 1 at higher
+    # precision, that confirms it - the fix is to raise precision (globally
+    # via setprecision, or locally within shin/shin_rm) rather than to
+    # change any of the algebra above.
+    old_prec = precision(BigFloat)
+    for prec in (1024, 4096, 16384)
+        setprecision(BigFloat, prec) do
+            rho_bf_p = BigFloat(coeff(rho, 0)) + BigFloat(coeff(rho, 1)) * sqrt(BigFloat(D))
+            sv = shin(A_lookup, rho_bf_p, [p1, p2], d)
+            println("  [precision = ", prec, " bits] shin_val = ", sv, "  abs = ", abs(sv))
+        end
+    end
+
+    return shin_val
+end
+
+# ---------------------------------------------------------------------------
+# test_ray_class_covariance: checks whether shin^{[p1,p2]}_{A_lookup}(rho)
+# (rho = F's OWN base root, NOT the table's rho_B) is related to the ray
+# class table's own entry for rho's Picard class via the covariance theorem:
+#
+#   shin^{s_R(beta)*R*r}_{R A R^{-1}}(R*beta) = shin^r_A(beta)          if det(R)=1
+#                                              = shin^r_A(conj(beta))   if det(R)=-1
+#
+# applied with A = A_lookup, beta = rho, R = gamma (the SL_2(Z)/GL_2(Z)
+# element taking rho to the table's rho_B for the SAME Picard class).
+#
+# gamma is found WITHOUT any search: since Z+Z*rho and Z+Z*rho_B are both
+# fractional O-ideals in the SAME class (both represent u_B = F_class), there
+# is an explicit mu in K with mu*(Z+Z*rho_B) = Z+Z*rho EXACTLY (found via
+# is_principal_O_verified on the ideal quotient (Z+Z*rho)*(Z+Z*rho_B)^{-1}).
+# Writing mu = c*rho+d and mu*rho_B = a*rho+b in the {rho,1} basis (both
+# forced to have INTEGER coordinates, since mu*(Z+Z*rho_B) = Z+Z*rho exactly,
+# not just up to finite index) gives gamma = [a b; c d] in GL_2(Z) satisfying
+# gamma . rho = rho_B by construction - no continued-fraction/Pell search
+# needed, unlike hj_automorph_for_root.
+# ---------------------------------------------------------------------------
+
+"""
+    test_ray_class_covariance(d_val::Int; p1::Int = 0, p2::Int = 1)
+
+Tests whether the "missing" value `shin^{[p1,p2]}_{A_lookup}(rho)` (`rho` =
+`F`'s own base root, as used in `diagnose_elem1_lookup`) is explained by the
+project-owner covariance theorem relating it to the ray class table's own
+anchor entry for the SAME Picard class (the entry built from `J = ideal(O,1)`,
+i.e. the table's `rho_B` for `u_B = F_class`).
+
+Prints, step by step:
+- `rho`, the table's `rho_B` for the same Picard class, and `A_lookup`/
+  `A_table` for each;
+- `shin_lookup = shin^{[p1,p2]}_{A_lookup}(rho)` and the table's own anchor
+  `shin_table_entry = shin^{s_vec*d}_{A_table}(rho_B)`;
+- the explicit `gamma` in `GL_2(Z)` with `gamma . rho = rho_B` (found via
+  the ideal-quotient generator `mu`, not a search), its determinant, and a
+  numeric check that it really does send `rho` to `rho_B`;
+- the theorem's transformed vector `p_transformed = s_gamma(rho) * gamma *
+  [p1,p2]` (mod `d`), compared against the table anchor's own `p_vec`;
+- if `det(gamma) = 1`: an independent re-derivation of `shin_lookup` via
+  `shin(gamma*A_lookup*gamma^{-1}, rho_B, p_transformed, d)`, which the
+  theorem guarantees must equal `shin_lookup` exactly - this is a pure
+  consistency check on the gamma/sign-convention bookkeeping above, not new
+  information about completeness;
+- finally, whether `p_transformed` (mod `d`) actually matches the table
+  anchor's `p_vec`, and whether `shin_lookup` matches `shin_table_entry`.
+  A match on `p_transformed` WITHOUT a match on the shin values would point
+  to `A_table` being a different power/sign of the stabilizer generator than
+  `gamma*A_lookup*gamma^{-1}` (a genuine, checkable bug candidate); no match
+  on `p_transformed` at all would mean `[p1,p2]` for `rho` corresponds to a
+  DIFFERENT ray class than the anchor entry, and the real comparison should
+  be against that other class's table entry instead.
+
+Returns a NamedTuple with all the computed quantities for further inspection.
+"""
+function test_ray_class_covariance(d_val::Int; p1::Int = 0, p2::Int = 1)
+    F = AdmissibleTuple(d_val)
+    sd = _ray_class_shin_setup(F)
+    D, q, d = sd.D, sd.q, sd.d
+    K, O = sd.K, sd.O
+    P_O, mP_O, rho_reps, gQ_reps, F_class, d_check =
+        sd.P_O, sd.mP_O, sd.rho_reps, sd.gQ_reps, sd.F_class, sd.d_check
+
+    all_places = real_places(K)
+    emb_conj = embedding(all_places[1])
+    emb_main = embedding(all_places[2])
+
+    # ---- Base point: F's own root rho, and A_lookup for [p1,p2] ----
+    rho = rho_reps[F_class]
+    rho_bf = BigFloat(coeff(rho, 0)) + BigFloat(coeff(rho, 1)) * sqrt(BigFloat(D))
+    println("rho (F's own base root) = ", rho)
+    println("rho_bf = ", rho_bf)
+
+    L_rho = hj_automorph_for_root(rho, D)
+    r_vec = [QQ(p1, d), QQ(p2, d)]
+    A_lookup, _ = stabilizer_power_in_Gamma_s(L_rho, r_vec)
+    println("A_lookup = ", A_lookup)
+
+    shin_lookup = shin(A_lookup, rho_bf, [p1, p2], d)
+    println("shin^[", p1, ",", p2, "]_A_lookup(rho) = ", shin_lookup)
+    println("  |shin_lookup| = ", abs(shin_lookup))
+
+    # ---- Table's anchor entry for rho's TRUE Picard class (NOT F_class,
+    # which comes from gQ_reps/reduced_hj_orbit/form_sign_fix - suspected of
+    # conflating narrow classes for this order, since O has no unit of norm
+    # -1; see true_picard_class_of_root's docstring) ----
+    println("\n--- determining rho's TRUE Picard class (bypassing gQ_reps/F_class) ---")
+    true_u_B, lambda_rho = true_picard_class_of_root(K, O, P_O, mP_O, rho)
+    println("true Picard class of Z+Z*rho = ", true_u_B,
+            "   (F_class as reported by find_class_representatives = ", F_class, ")")
+    true_u_B == F_class ||
+        println("  *** CONFIRMED MISMATCH: F_class is WRONG for this rho - the reduced-form ",
+                "comparison (gQ_reps[F_class] == F.Q) does not correctly track rho's actual ",
+                "ideal class. Using true_u_B = ", true_u_B, " from here on. ***")
+    println("--- end true-class determination ---\n")
+
+    u_B = true_u_B
+    J_anchor = mP_O(u_B)
+    rho_B_init = rho_reps[u_B]
+    alpha, rho_B, s1_tab, s2_tab = find_alpha_rhoB_s1_s2_O(
+        J_anchor, rho_B_init, rho_B_init, u_B, P_O, mP_O, O, K,
+        d, rho_B_init, d_check)
+    println("\nTable anchor (J_anchor = mP_O(true_u_B)): alpha = ", alpha, "  rho_B = ", rho_B)
+    println("  s1 = ", s1_tab, "  s2 = ", s2_tab)
+
+    s_vec_tab = [s1_tab, s2_tab]
+    L_rhoB = hj_automorph_for_root(rho_B, D)
+    A_tab, has_neg_I_tab = stabilizer_power_in_Gamma_s(L_rhoB, s_vec_tab)
+    rho_B_bf = BigFloat(coeff(rho_B, 0)) + BigFloat(coeff(rho_B, 1)) * sqrt(BigFloat(D))
+
+    p1_tab_exact = s1_tab * d
+    p2_tab_exact = s2_tab * d
+    (isone(denominator(p1_tab_exact)) && isone(denominator(p2_tab_exact))) ||
+        error("table anchor s = [$s1_tab,$s2_tab] does not have denominator dividing d = $d")
+    p_vec_tab = [Int(numerator(p1_tab_exact)), Int(numerator(p2_tab_exact))]
+
+    shin_tab = shin(A_tab, rho_B_bf, p_vec_tab, d)
+    println("  A_table = ", A_tab, "  p_vec_table = ", p_vec_tab,
+            "  (has_neg_I = ", has_neg_I_tab, ")")
+    println("  shin_table_entry = ", shin_tab, "  |shin_table_entry| = ", abs(shin_tab))
+
+    # ---- Verify rho_B's own TRUE class matches rho's TRUE class (true_u_B)
+    # before trying to find gamma between them - do NOT assume this just
+    # because both trace back to "u_B" internally; find_alpha_rhoB_s1_s2_O's
+    # rho_B satisfies bdO_O = alpha*(Z+Z*rho_B) with b_O representing
+    # [J_anchor]^{-1}, so Z+Z*rho_B's class is class(b_O) = -true_u_B, which
+    # only equals true_u_B itself if true_u_B is an order-2 (self-inverse)
+    # element of P_O - check directly rather than assuming. ----
+    println("\n--- determining rho_B's TRUE Picard class ---")
+    true_rhoB_class, lambda_rhoB = true_picard_class_of_root(K, O, P_O, mP_O, rho_B)
+    println("true Picard class of Z+Z*rho_B = ", true_rhoB_class,
+            "   (rho's true class = ", true_u_B, ")")
+    println("--- end determination ---\n")
+
+    true_rhoB_class == true_u_B ||
+        error("rho and rho_B are NOT actually in the same Picard class (true classes ",
+              true_u_B, " vs ", true_rhoB_class, ") - no gamma taking rho to rho_B can ",
+              "exist. This would mean find_alpha_rhoB_s1_s2_O's rho_B for this J_anchor is ",
+              "not in the class this test expected; needs its own separate investigation.")
+
+    # ---- Find mu with mu*(Z+Z*rho_B) = Z+Z*rho.
+    # PREFERRED PATH (used whenever the shared class is the IDENTITY element
+    # of P_O, as it always is when starting from J_anchor = ideal(O,1)):
+    # true_picard_class_of_root's own lambda_rho/lambda_rhoB already satisfy
+    # lambda_rho*O = Z+Z*rho and lambda_rhoB*O = Z+Z*rho_B EXACTLY (since
+    # J_g = mP_O(zero(P_O)) = O itself there, so the conjugate-product gens
+    # reduce to (Z+Z*rho)*O = Z+Z*rho with no extra factor at all) - so
+    # mu = lambda_rho/lambda_rhoB works immediately, reusing values already
+    # verified successful above, with NO second is_principal_O_verified
+    # call on any differently-formatted generator set. This sidesteps a
+    # real inconsistency observed in practice: calling
+    # is_principal_O_verified(K,O,[K(1),rho]) directly (2 generators) gave a
+    # DIFFERENT (false) answer than calling it on the mathematically
+    # equivalent 4-generator lattice_product_gens form used inside
+    # true_picard_class_of_root, for the exact same lattice Z+Z*rho.
+    # FALLBACK (only reached if the shared class is non-identity): the
+    # general ideal-quotient approach via inv() - not exercised or verified
+    # to be safe from the same generator-formatting sensitivity, but kept
+    # in case a future call to this function starts from a non-identity
+    # anchor class.
+    local mu
+    if true_u_B == zero(P_O)
+        mu = lambda_rho / lambda_rhoB
+        println("\n(identity-class fast path) mu = lambda_rho/lambda_rhoB = ", mu)
+    else
+        println("\n(non-identity shared class ", true_u_B, " - falling back to the general ",
+                "ideal-quotient approach via inv(); this path is less tested)")
+        I_rho   = fractional_ideal(O, [K(1), rho])
+        I_rho_B = fractional_ideal(O, [K(1), rho_B])
+        Q_mu = I_rho * inv(I_rho_B)
+        Qb_nf = [_nf_elem_of(K, x) for x in basis(Q_mu)]
+        ok_mu, mu_found = is_principal_O_verified(K, O, Qb_nf; unit_bound = 300)
+        ok_mu || error("Could not find mu with mu*(Z+Z*rho_B) = Z+Z*rho via the general ",
+                       "ideal-quotient fallback, even though both are verified to be in the ",
+                       "same true Picard class ", true_u_B, " - this may be exactly the same ",
+                       "generator-formatting sensitivity noted above; try a different gens ",
+                       "packaging for Q_mu, or increase unit_bound further")
+        mu = mu_found
+    end
+    println("mu (with mu*(Z+Z*rho_B) = Z+Z*rho) = ", mu)
+
+    # Express z (given via coeff(z,0)/coeff(z,1) in the {1,sqrt(D)} basis) in
+    # the {rho,1} basis instead: z = c*rho + dc, solved exactly since {rho,1}
+    # is a Q-basis of K (rho irrational).
+    r0_raw, r1_raw = coeff(rho, 0), coeff(rho, 1)
+    function coords_in_rho_basis(z)
+        z0, z1 = coeff(z, 0), coeff(z, 1)
+        c  = QQ(z1 / r1_raw)
+        dc = QQ(z0 - c * r0_raw)
+        return c, dc
+    end
+
+    c_g, d_g = coords_in_rho_basis(mu)          # mu        = c_g*rho + d_g
+    a_g, b_g = coords_in_rho_basis(mu * rho_B)  # mu*rho_B  = a_g*rho + b_g
+
+    for (nm, x) in (("a_g", a_g), ("b_g", b_g), ("c_g", c_g), ("d_g", d_g))
+        isone(denominator(x)) ||
+            error("gamma entry $nm = $x is not an integer - mu was not the correct ",
+                  "ideal-class generator (mu*(Z+Z*rho_B) should equal Z+Z*rho EXACTLY, ",
+                  "which forces integer gamma entries; a non-integer here means the ",
+                  "unit-twist chosen by is_principal_O_verified doesn't land the lattices ",
+                  "on top of each other, only in the same class up to a rational scalar)")
+    end
+    gamma = [Int(numerator(a_g)) Int(numerator(b_g)); Int(numerator(c_g)) Int(numerator(d_g))]
+    det_gamma = gamma[1,1]*gamma[2,2] - gamma[1,2]*gamma[2,1]
+    println("gamma = ", gamma, "  det(gamma) = ", det_gamma)
+    abs(det_gamma) == 1 || error("det(gamma) = $det_gamma, not +/-1 - gamma is not in ",
+                                  "GL_2(Z) as expected")
+
+    gamma_rho_bf = (gamma[1,1]*rho_bf + gamma[1,2]) / (gamma[2,1]*rho_bf + gamma[2,2])
+    println("gamma . rho (Mobius, BigFloat check) = ", gamma_rho_bf)
+    println("rho_B (BigFloat, for comparison)     = ", rho_B_bf)
+    println("  |gamma.rho - rho_B| = ", abs(gamma_rho_bf - rho_B_bf), "  (should be ~0)")
+
+    # ---- Apply the theorem with R = gamma, beta = rho, A = A_lookup ----
+    j_gamma_rho = gamma[2,1]*rho_bf + gamma[2,2]   # automorphy factor c_R*beta + d_R
+    s_gamma = Int(sign(j_gamma_rho))
+    println("\ns_gamma(rho) = sign(c_gamma*rho + d_gamma) = ", s_gamma)
+
+    p_transformed_raw = s_gamma .* (gamma * [p1, p2])
+    p_transformed = mod.(p_transformed_raw, d)
+    println("p_transformed (before mod d) = ", p_transformed_raw)
+    println("p_transformed mod d          = ", p_transformed)
+    println("table anchor p_vec mod d     = ", mod.(p_vec_tab, d))
+    p_matches = p_transformed == mod.(p_vec_tab, d)
+    println("  match? ", p_matches)
+
+    shin_conj = nothing
+    if det_gamma == 1
+        A_conj = gamma * A_lookup * _gl2z_inv(gamma)
+        println("\ndet(gamma) = 1, so the theorem gives:")
+        println("  shin^{p_transformed}_{A_conj}(rho_B) should equal shin_lookup exactly")
+        shin_conj = shin(A_conj, rho_B_bf, p_transformed, d)
+        println("shin(A_conj, rho_B_bf, p_transformed, d) = ", shin_conj)
+        println("shin_lookup (original)                    = ", shin_lookup)
+        println("  |diff| = ", abs(shin_conj - shin_lookup),
+                "  (should be ~0 - this only checks the gamma/sign bookkeeping above, ",
+                "NOT completeness)")
+    else
+        println("\ndet(gamma) = -1: the theorem gives shin_A_lookup(conj(rho)), not ",
+                "shin_A_lookup(rho), on the right-hand side. The direct re-derivation ",
+                "check above doesn't apply in this branch.")
+    end
+
+    println("\n=== Summary ===")
+    println("shin_lookup (A_lookup, rho, [", p1, ",", p2, "])      = ", shin_lookup,
+            "   |.| = ", abs(shin_lookup))
+    println("shin_table_entry (A_table, rho_B, p_vec_table) = ", shin_tab,
+            "   |.| = ", abs(shin_tab))
+    println("p_transformed matches table anchor's p_vec (mod d)? ", p_matches)
+    println("shin_lookup matches shin_table_entry?               ",
+            abs(shin_lookup - shin_tab) < 1e-6)
+
+    return (rho = rho, rho_B = rho_B, gamma = gamma, det_gamma = det_gamma,
+            A_lookup = A_lookup, A_table = A_tab,
+            p_transformed = p_transformed, p_vec_tab = p_vec_tab,
+            shin_lookup = shin_lookup, shin_table_entry = shin_tab,
+            shin_conj_recheck = shin_conj)
+end
+
+#test_ray_class_covariance(21; p1 = 0, p2 = 1)
+
+test_all_twists(21)

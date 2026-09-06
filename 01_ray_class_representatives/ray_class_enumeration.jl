@@ -147,7 +147,6 @@ function enumerate_principal_ray_classes(K, ord, m, Sigma, N)
     function is_trivial_class(alpha)
         g = elem_in_nf(alpha)
         I_g = try ideal(ord, ord(g)) catch; return false end
-        isone(I_g) && return true
         for u in L_prime
             candidate = g * u
             if same_mod_m(candidate, one(K)) && same_sign_on_Sigma(candidate, one(K))
@@ -160,9 +159,19 @@ function enumerate_principal_ray_classes(K, ord, m, Sigma, N)
     function are_equivalent(beta, gamma)
         g = elem_in_nf(beta)
         d = elem_in_nf(gamma)
-        I_g = try ideal(ord, ord(g)) catch; return false end
-        I_d = try ideal(ord, ord(d)) catch; return false end
-        I_g == I_d && return true
+        # NOTE: do NOT short-circuit on I_g == I_d (same ideal) or use it as a
+        # necessary condition either. Ray-equivalence of two principal-in-O
+        # generators gamma, delta depends only on whether delta/gamma is
+        # ray-trivial up to a global unit -- i.e. exactly the congruence
+        # gamma*u == delta (mod m) tested by the loop below. This holds
+        # regardless of whether (gamma) and (delta) are the same ideal:
+        # generators of genuinely different-norm principal ideals can still
+        # be ray-equivalent, and generators of the SAME ideal can fail to be
+        # ray-equivalent if they differ by a non-ray-trivial unit. The old
+        # code's "I_g == I_d && return true" shortcut incorrectly forced the
+        # former case to always merge, over-collapsing distinct ray classes.
+        _ = (try ideal(ord, ord(g)) catch; return false end)
+        _ = (try ideal(ord, ord(d)) catch; return false end)
         for u in L_prime
             candidate = g * u
             if same_mod_m(candidate, d) && same_sign_on_Sigma(candidate, d)
@@ -327,11 +336,10 @@ end
 function ray_class_are_equivalent(K, OK, ord, m, Sigma, L_prime, sign_at_place, beta, gamma)
     g = elem_in_nf(beta)
     d = elem_in_nf(gamma)
-    I_g = try ideal(ord, ord(g)) catch; nothing end
-    I_d = try ideal(ord, ord(d)) catch; nothing end
-    if I_g !== nothing && I_d !== nothing && I_g == I_d
-        return true
-    end
+    # See NOTE in enumerate_principal_ray_classes' are_equivalent: same-ideal
+    # is neither sufficient nor necessary for ray-equivalence, so we must not
+    # short-circuit on I_g == I_d. The L_prime loop below is the correct and
+    # complete test on its own.
     for u in L_prime
         candidate = g * u
         if ray_class_same_mod_m(K, OK, ord, m, candidate, d) &&
@@ -345,4 +353,3 @@ end
 function ray_class_is_trivial_class(K, OK, ord, m, Sigma, L_prime, sign_at_place, alpha)
     return ray_class_are_equivalent(K, OK, ord, m, Sigma, L_prime, sign_at_place, alpha, one(K))
 end
-

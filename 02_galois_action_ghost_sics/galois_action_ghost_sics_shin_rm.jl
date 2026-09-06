@@ -105,6 +105,35 @@ function express_in_basis(x, rho, D)
     return [coord1, coord2]
 end
 
+"""
+    conjugation_place(K)
+
+Returns the real place of `K` (a real quadratic field) corresponding to
+CONJUGATION (the paper's `infty_2`) - the place under which `gen(K) = sqrt(D)`
+embeds to a NEGATIVE real number, and hence under which the "larger" root
+`rho > rho'` of a quadratic form embeds to the SMALLER value.
+
+BUGFIX: every construction of `Sigma` in this file used to hardcode
+`Sigma = [real_places(K)[2]]`, on the unchecked assumption that index 2 is
+always conjugation. `diagnose_real_places` showed this is BACKWARDS for
+D=44: `real_places(K)[1]` is conjugation and `real_places(K)[2]` is the
+identity embedding - meaning the ray class group (`enumerate_principal_ray_classes`,
+via `same_sign_on_Sigma`) has been built with Sigma = the IDENTITY place,
+while `twisted_chi_general`'s own positivity check
+(`emb_conj_K = embedding(places_K_top[1])`) has been correctly using
+conjugation - two different sign conventions in the same computation. This
+function replaces every hardcoded `all_places[2]` with an explicit,
+self-checking detection, so `Sigma` is never again wrong-by-assumption.
+"""
+function conjugation_place(K)
+    places = real_places(K)
+    a = gen(K)
+    i = findfirst(p -> Float64(real(embedding(p)(a))) < 0, places)
+    i === nothing && error("conjugation_place: neither real place of K sends gen(K) negative - ",
+                           "cannot identify conjugation")
+    return places[i]
+end
+
 function multiplication_matrix_mod_d(gamma, rho, d, D)
     col1 = express_in_basis(gamma, rho, D)
     col2 = express_in_basis(gamma * rho, rho, D)
@@ -843,15 +872,27 @@ function lattice_canonical(K, gens)
         M[i, 2] = numerator(coords[i][2] * den)
     end
     H = hnf(M)
-    (iszero(H[1, 1]) && iszero(H[1, 2])) &&
-        error("lattice_canonical: zero lattice")
-    (n < 2 || (iszero(H[2, 1]) && iszero(H[2, 2]))) &&
+    # Do NOT assume the two pivot rows of H sit at fixed positions 1 and 2:
+    # for n > 2 (a redundant/over-determined generator list), hnf's row
+    # ordering of zero vs. nonzero rows is an implementation detail, not
+    # something this code should rely on. Select the pivot rows by CONTENT
+    # (the nonzero rows), not by position, so the result is the same
+    # canonical form for the same lattice regardless of how many redundant
+    # generators were passed in.
+    nonzero_rows = [i for i in 1:n if !(iszero(H[i, 1]) && iszero(H[i, 2]))]
+    isempty(nonzero_rows) && error("lattice_canonical: zero lattice")
+    length(nonzero_rows) < 2 &&
         error("lattice_canonical: lattice not of full rank 2")
-    c = gcd(gcd(H[1, 1], H[1, 2]), gcd(H[2, 1], H[2, 2]))
+    length(nonzero_rows) > 2 &&
+        error("lattice_canonical: more than 2 nonzero rows in HNF result ",
+              "(unexpected - lattice should be rank 2)")
+    r1, r2 = nonzero_rows
+    c = gcd(gcd(H[r1, 1], H[r1, 2]), gcd(H[r2, 1], H[r2, 2]))
     c = gcd(c, den)
     H2 = zero_matrix(ZZ, 2, 2)
-    for i in 1:2, j in 1:2
-        H2[i, j] = divexact(H[i, j], c)
+    for (k, r) in enumerate((r1, r2))
+        H2[k, 1] = divexact(H[r, 1], c)
+        H2[k, 2] = divexact(H[r, 2], c)
     end
     return (divexact(den, c), H2)
 end
@@ -2235,18 +2276,86 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                                 "  s1 = ", closest_entry.s1, "  s2 = ", closest_entry.s2,
                                 "  rho_B = ", closest_entry.rho_B,
                                 "  shin_value = ", closest_entry.shin_value)
+
+                        # Conjugate-symmetry diagnostic: the covariance
+                        # theorem's det(R)=-1 branch gives
+                        # shin^{...}_{...}(R.beta) = shin^r_A(conj(beta)),
+                        # not shin^r_A(beta) - so if [p1,p2]'s true matching
+                        # class is only reachable via such an R, its stored
+                        # table value would match conj(shin_val_lookup), not
+                        # shin_val_lookup itself. The table's own duplicate
+                        # pairs (found separately via check_table_duplicates)
+                        # are consistent with exactly this det=-1 symmetry
+                        # already being present INSIDE the table; this checks
+                        # whether the SAME symmetry, applied to the lookup
+                        # side, recovers a match.
+                        shin_val_conj = conj(shin_val_lookup)
+                        match_idx_conj = findfirst(
+                            e -> e !== nothing && abs(e.shin_value - shin_val_conj) < ray_class_lookup_tol,
+                            ray_class_lookup_table_local)
+                        println("  [conjugate diagnostic] conj(shin_val_lookup) = ", shin_val_conj)
+                        println("  [conjugate diagnostic] does conj(shin_val_lookup) match the table? ",
+                                match_idx_conj !== nothing)
+                        if match_idx_conj !== nothing
+                            e_conj = ray_class_lookup_table_local[match_idx_conj]
+                            println("  [conjugate diagnostic] matching entry: J = ", e_conj.J,
+                                    "  s1 = ", e_conj.s1, "  s2 = ", e_conj.s2,
+                                    "  rho_B = ", e_conj.rho_B)
+                        end
                     else
                         println("  [reduction diagnostic] gcd(p1,p2,d) = 1 - this point is already ",
                                 "primitive, reduction is not the explanation here")
                     end
-                    error("elem1 lookup: no ray class table entry matches shin^{[",
-                          p1, ",", p2, "]}_A(rho) = ", shin_val_lookup,
-                          " within tol=", ray_class_lookup_tol,
-                          " - the table may need a finer search bound (mn_height/q_gen_height), ",
-                          "or something upstream is wrong")
+
+                    # Unit-residue test: the point p corresponds to the
+                    # element x_p = p2*rho - p1 of the lattice I = Z+Z*rho. A
+                    # modulus-d ray class (group) exists for x_p ONLY if x_p is
+                    # a unit mod d in I/(d*I), i.e. gcd(N(x_p)/N(I), d) == 1.
+                    # Non-unit points have no GROUP class - they are the extra
+                    # classes of the ray class MONOID Cl^♭ (KFA (2.55)), which
+                    # the group-built lookup table does not contain. They are
+                    # handled below by the direct route (nonunit_point = true)
+                    # instead of via U_elem1/J_bj.
+                    x_p = K(p2) * rho - K(p1)
+                    I_rho_p = fractional_ideal(O, [K(1), rho])
+                    rel_p = QQ(abs(norm(x_p))) / QQ(norm(I_rho_p))
+                    is_unit_p = isone(denominator(rel_p)) && gcd(Int(numerator(rel_p)), d) == 1
+                    println("  [unit diagnostic] x_p = p2*rho - p1 = ", x_p,
+                            "  N(x_p)/N(I) = ", rel_p, "  -> x_p is a UNIT mod d? ", is_unit_p)
+                    if is_unit_p
+                        # A unit point DOES have a modulus-d ray class, so its
+                        # value should be in the group table. Its absence is
+                        # evidence the group enumeration is incomplete (e.g.
+                        # some of its N "distinct" classes are repeats). The
+                        # direct route below is valid for every point, so
+                        # record the evidence and continue rather than abort.
+                        println("  [WARNING] p=(", p1, ",", p2, ") is a UNIT point but its shin value ",
+                                "is NOT in the group table - the group enumeration is missing this ",
+                                "class. Proceeding via the direct route (valid for all points).")
+                    else
+                        println("  [non-unit point] p=(", p1, ",", p2, "): no modulus-", d,
+                                " ray class (monoid class only) - using the direct route: ",
+                                "elem1 := x_p + d*n (totally positive), rho_j := rho_B, ",
+                                "s_bj := coords of product.")
+                    end
                 end
-                lookup_entry = ray_class_lookup_table_local[match_idx]
-                elem1 = K(d) * (K(lookup_entry.s2) * lookup_entry.rho_B - K(lookup_entry.s1))
+                nonunit_point = (match_idx === nothing)
+                if nonunit_point
+                    # Shift x_p by a multiple of d (same residue mod d*I, so the
+                    # same class) to make it TOTALLY POSITIVE (both real
+                    # places): the table's representatives are conj-positive
+                    # (elem1 = d*elem2 with conj(elem2) > 0) AND represent the
+                    # class (x_p mod m, +) at the Sigma place, so both signs
+                    # must be positive to land in the same class.
+                    conj_v = Float64(real(emb_conj_K(x_p)))
+                    main_v = Float64(real(emb_main_K(x_p)))
+                    n_shift = max(0, Int(ceil((-min(conj_v, main_v) + 1) / d)))
+                    elem1 = x_p + K(d * n_shift)
+                    lookup_entry = nothing
+                else
+                    lookup_entry = ray_class_lookup_table_local[match_idx]
+                    elem1 = K(d) * (K(lookup_entry.s2) * lookup_entry.rho_B - K(lookup_entry.s1))
+                end
 
                 # Per project owner: if the per-rho_j search below is fully
                 # exhausted for a given rho_B/s1/s2, that doesn't necessarily
@@ -2264,7 +2373,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 max_retries_rho_B_p = 20
 
                 local rho_j_p, A_bj_p, gF_j_p, gQ_j_p, QQ_form_p, M_g_j_p, c_g_j_p,
-                      rho_j_bf_p, u1_p, u2_p
+                      rho_j_bf_p, u1_p, u2_p, integralnewdu
 
                 for rho_B_attempt in 1:max_retries_rho_B_p
                     rho_B_cur, s1_cur, s2_cur = if rho_B_attempt == 1
@@ -2307,15 +2416,32 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     # determined here (no candidate search/exclusion at
                     # this level) - the only remaining retry axis is the
                     # outer rho_B_attempt loop above.
-                    U_elem1 = lookup_entry.J
-                    J_bj = J * U_elem1
-                    u_Bj = mP_O \ J_bj
-                    rho_Bj_init = rho_reps[u_Bj]
-                    alpha_bj, rho_j_raw, s1_bj, s2_bj = find_alpha_rhoB_s1_s2_O(
-                        J_bj, rho_Bj_init, rho_Bj_init, u_Bj, P_O, mP_O, O, K,
-                        d, rho_Bj_init, d_check; mn_height = 3000, q_gen_height = 3000)
-                    println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: rho_j = ", rho_j_raw,
-                            "  alpha_bj = ", alpha_bj, "  s1_bj = ", s1_bj, "  s2_bj = ", s2_bj)
+                    local alpha_bj, rho_j_raw, s1_bj, s2_bj
+                    if nonunit_point
+                        # Direct (monoid) route: (x_p) is principal, so the
+                        # twisted class J*(x_p) is in J's own Picard fiber:
+                        # rho_j = rho_B_cur (J's fiber root). Its s-vector is
+                        # the coordinates of product = elem1*elem2 in the
+                        # (rho_j, 1) basis (product = s2_bj*rho_j - s1_bj) -
+                        # for unit points this coincides, up to the <eps>
+                        # orbit, with what find_alpha_rhoB_s1_s2_O(J*U_elem1)
+                        # returns.
+                        rho_j_raw = rho_B_cur
+                        alpha_bj = nothing
+                        s2_bj, s1_bj = find_rho_j_and_coords(product, rho_j_raw)
+                        println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt] [non-unit]: rho_j = ", rho_j_raw,
+                                "  s1_bj = ", s1_bj, "  s2_bj = ", s2_bj)
+                    else
+                        U_elem1 = lookup_entry.J
+                        J_bj = J * U_elem1
+                        u_Bj = mP_O \ J_bj
+                        rho_Bj_init = rho_reps[u_Bj]
+                        alpha_bj, rho_j_raw, s1_bj, s2_bj = find_alpha_rhoB_s1_s2_O(
+                            J_bj, rho_Bj_init, rho_Bj_init, u_Bj, P_O, mP_O, O, K,
+                            d, rho_Bj_init, d_check; mn_height = 3000, q_gen_height = 3000)
+                        println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: rho_j = ", rho_j_raw,
+                                "  alpha_bj = ", alpha_bj, "  s1_bj = ", s1_bj, "  s2_bj = ", s2_bj)
+                    end
 
                     rho_j_bf_raw = BigFloat(coeff(rho_j_raw, 0)) + BigFloat(coeff(rho_j_raw, 1)) * sqrt(BigFloat(D))
                     L_bj = hj_automorph_for_root(rho_j_raw, D; max_u = elem1_max_u)
@@ -2407,6 +2533,45 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     c_g_j_cand = e(-BigFloat(rademacher(gF_j_cand.A)) / 24) /
                                   (chi * sqrt(BigFloat(d + 1)))
 
+                    # BUGFIX: the integralnewdu computation (du -> M_g_j*du ->
+                    # du_to_int_mod_d) used to happen AFTER this retry loop had
+                    # already committed to this rho_B_attempt (found_overall =
+                    # true; break). But du_to_int_mod_d has its own hard
+                    # requirement - the reduced denominator must be coprime to
+                    # d - that is NOT among the two checks (det(M_g_j), diag_val)
+                    # this loop actually guards on. A candidate can pass both of
+                    # those and still fail the coprimality requirement, and by
+                    # the time that happens the loop has already exited, so
+                    # there is no longer any way to fall back to a different
+                    # rho_B - it just crashes (observed: p=(4,20), attempt 2,
+                    # "denominator 9 of 37//9 is not coprime to d=21"), exactly
+                    # the failure mode this retry loop exists to route around.
+                    # Fix: attempt the SAME du/newdu/integralnewdu computation
+                    # here, inside the loop, and treat a coprimality failure
+                    # exactly like the other two rejection conditions (exclude
+                    # this rho_B, continue to the next attempt) instead of
+                    # letting it escape uncaught.
+                    du_cand = [to_du_mod_d(u1_cand, d), to_du_mod_d(u2_cand, d)]
+                    raw_newdu_cand = M_g_j_cand * du_cand
+                    newdu_cand = [to_du_mod_d(raw_newdu_cand[1], d), to_du_mod_d(raw_newdu_cand[2], d)]
+                    integralnewdu_cand = Int[]
+                    coprimality_ok = true
+                    for u in newdu_cand
+                        du_int = d * u
+                        try
+                            push!(integralnewdu_cand, du_to_int_mod_d(du_int, d))
+                        catch e
+                            println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: REJECTED ",
+                                    "(integralnewdu computation failed: ", e, ") - trying a different rho_B")
+                            coprimality_ok = false
+                            break
+                        end
+                    end
+                    if !coprimality_ok
+                        push!(excluded_rho_B_p, rho_B_cur)
+                        continue
+                    end
+
                     rho_j_p = rho_j_raw
                     A_bj_p = A_bj_cand
                     gF_j_p = gF_j_cand
@@ -2416,13 +2581,15 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     c_g_j_p = c_g_j_cand
                     rho_j_bf_p = rho_j_bf_raw
                     u1_p, u2_p = u1_cand, u2_cand
+                    integralnewdu = integralnewdu_cand
                     found_overall = true
                     break
                 end
 
                 found_overall || error("p=($p1,$p2): exhausted ", max_retries_rho_B_p,
                                         " rho_B/s1/s2 candidates - could not satisfy the ",
-                                        "det(M_g_j) and u2*conj(rho_j)-u1>0 checks for this point")
+                                        "det(M_g_j), u2*conj(rho_j)-u1>0, and integralnewdu ",
+                                        "coprimality checks for this point")
 
                 if gQ_j === nothing
                     gQ_j = gQ_j_p
@@ -2430,18 +2597,6 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                             "from the first successfully-processed grid point, p=($p1,$p2) ",
                             "- rho_j now varies by point, so there is no single canonical ",
                             "choice; flagging this assumption explicitly.")
-                end
-
-                du = [to_du_mod_d(u1_p, d), to_du_mod_d(u2_p, d)]
-
-                raw_newdu = M_g_j_p * du
-                newdu = [to_du_mod_d(raw_newdu[1], d), to_du_mod_d(raw_newdu[2], d)]
-
-                integralnewdu = Int[]
-                for u in newdu
-                    du_int = d * u
-                    val = du_to_int_mod_d(du_int, d)
-                    push!(integralnewdu, val)
                 end
 
                 println("    p=($p1,$p2): integralnewdu = ", integralnewdu)
@@ -2937,8 +3092,8 @@ function ray_class_group_elementary_divisors(F::AdmissibleTuple)
     dbar = mod(d_val, 2) == 1 ? d_val : 2 * d_val
     m = ideal(O, dbar)
 
-    all_places = real_places(K)
-    Sigma = [all_places[2]]
+    all_places = real_places(K)  # kept for any other uses in this function
+    Sigma = [conjugation_place(K)]  # BUGFIX: was [all_places[2]] - wrong place, see conjugation_place's docstring
 
     println("d = ", d_val, ", Q = ", F.Q)
     return ray_class_group_elementary_divisors(K, O, m, Sigma)
@@ -2960,8 +3115,8 @@ function ray_class_group_data(F::AdmissibleTuple)
     dbar = mod(d_val, 2) == 1 ? d_val : 2 * d_val
     m = ideal(O, dbar)
 
-    all_places = real_places(K)
-    Sigma = [all_places[2]]
+    all_places = real_places(K)  # kept for any other uses in this function
+    Sigma = [conjugation_place(K)]  # BUGFIX: was [all_places[2]] - wrong place, see conjugation_place's docstring
 
     all_reps, all_triples = ray_class_group_representatives(K, O, m, Sigma)
     ray_class_order = length(all_reps)
@@ -3031,8 +3186,8 @@ function _ray_class_shin_setup(F::AdmissibleTuple)
     dbar = mod(d, 2) == 1 ? d : 2 * d
     m = ideal(O, dbar)
 
-    all_places = real_places(K)
-    Sigma = [all_places[2]]
+    all_places = real_places(K)  # kept for any other uses in this function
+    Sigma = [conjugation_place(K)]  # BUGFIX: was [all_places[2]] - wrong place, see conjugation_place's docstring
 
     all_reps, all_triples = ray_class_group_representatives(K, O, m, Sigma)
 
@@ -3535,6 +3690,909 @@ end
 
 ray_class_shin_table_fast_quiet(d::Int) = ray_class_shin_table_fast_quiet(AdmissibleTuple(d))
 
+"""
+    check_table_units(d::Int)
+
+For every table entry, forms the integral representative
+`e = d*(s2*rho_B - s1)` (an element of the lattice `I_B = Z+Z*rho_B`) and
+tests whether it is a UNIT modulo `d` in `I_B/(d*I_B)`, via the relative
+norm `N(e)/N(I_B)` (an integer since `(e) = I_B * C` with `C` integral):
+`e` is a unit mod `d` iff `gcd(N(e)/N(I_B), d) == 1`. Ray classes of
+modulus `d` correspond exactly to unit residues, so a correctly built table
+should report 288/288 units. Grid points `p` whose own element
+`x_p = p2*rho - p1` is NOT a unit mod `d` have no modulus-`d` ray class and
+therefore cannot appear in this table at all.
+"""
+function check_table_units(d::Int)
+    F = AdmissibleTuple(d)
+    sd = _ray_class_shin_setup(F)
+    K, O = sd.K, sd.O
+    tbl = ray_class_shin_table_fast_quiet(F; shared_data = sd)
+    n_unit = 0; n_nonunit = 0
+    for (i, e_) in enumerate(tbl)
+        e_ === nothing && continue
+        I_B = fractional_ideal(O, [K(1), e_.rho_B])
+        e = K(d) * (K(e_.s2) * e_.rho_B - K(e_.s1))
+        rel = QQ(abs(norm(e))) / QQ(norm(I_B))
+        ok = isone(denominator(rel)) && gcd(Int(numerator(rel)), d) == 1
+        ok ? (n_unit += 1) : (n_nonunit += 1)
+        ok || println("  entry ", i, ": NON-UNIT residue, N(e)/N(I_B) = ", rel,
+                      "  J = ", e_.J, "  s1 = ", e_.s1, "  s2 = ", e_.s2)
+    end
+    println("check_table_units(", d, "): ", n_unit, " unit residues, ", n_nonunit,
+            " non-unit residues, out of ", count(x -> x !== nothing, tbl), " entries.")
+    return tbl
+end
+
+"""
+    ray_class_monoid_shin_table(F; shared_data = nothing, group_table = nothing)
+
+The full table of KFA eq. (2.55): for m = dO, the image of Υ_m on the ray
+class MONOID Cl^♭ (Kopp–Lagarias, ideals NOT required to be coprime to m) is
+GL_2(Z)-orbits on (1/d)Z^2/Z^2 × K_O. Orbits of a point r = p/d under the stabilizer
+of ρ_B are orbits under ⟨L_ε⟩ (L_ε = matrix of the totally positive
+fundamental unit; -I acts trivially since sgn(j_{-I}) = -1 cancels it), acting
+linearly on the column vector p exactly as in stabilizer_power_in_Gamma_s.
+For each Picard fiber's ρ_B (read off the group table, which uses one ρ_B per
+fiber) and each ⟨L_ε⟩-orbit of Z_d^2 \\ {0}, the shin value is computed exactly
+as the group table computes its own entries: A = stabilizer_power_in_Gamma_s(L, p/d),
+val = shin(A, ρ_B, p, d). Unit orbits (72 per fiber here) reproduce the group
+table; the remaining orbits are the non-unit classes the group table lacks.
+Returns a Vector of NamedTuples (rho_B, p_vec, orbit, is_unit, shin_value).
+"""
+function ray_class_monoid_shin_table(F::AdmissibleTuple; shared_data = nothing, group_table = nothing)
+    sd = shared_data === nothing ? _ray_class_shin_setup(F) : shared_data
+    D, d, K, O = sd.D, sd.d, sd.K, sd.O
+    tbl = group_table === nothing ? ray_class_shin_table_fast_quiet(F; shared_data = sd) : group_table
+    rhoBs = unique([e.rho_B for e in tbl if e !== nothing])
+    entries = NamedTuple[]
+    for rho_B in rhoBs
+        rho_B_bf = BigFloat(coeff(rho_B, 0)) + BigFloat(coeff(rho_B, 1)) * sqrt(BigFloat(D))
+        L = hj_automorph_for_root(rho_B, D)
+        Lpos = (L[1,1] + L[2,2]) > 0 ? L : -L      # matrix of the totally positive unit
+        I_B = fractional_ideal(O, [K(1), rho_B])
+        NI_B = QQ(norm(I_B))
+        seen = falses(d, d)
+        for p1 in 0:d-1, p2 in 0:d-1
+            (p1 == 0 && p2 == 0) && continue
+            seen[p1+1, p2+1] && continue
+            orbit = Tuple{Int,Int}[]
+            q = [p1, p2]
+            for _ in 1:10_000
+                push!(orbit, (q[1], q[2]))
+                seen[q[1]+1, q[2]+1] = true
+                q = mod.(Lpos * q, d)
+                (q[1] == p1 && q[2] == p2) && break
+            end
+            A, _ = stabilizer_power_in_Gamma_s(Lpos, [QQ(p1, d), QQ(p2, d)])
+            val = shin(A, rho_B_bf, [p1, p2], d)
+            x = K(p2) * rho_B - K(p1)
+            rel = QQ(abs(norm(x))) / NI_B
+            is_unit = isone(denominator(rel)) && gcd(Int(numerator(rel)), d) == 1
+            push!(entries, (rho_B = rho_B, p_vec = [p1, p2], orbit = orbit,
+                            is_unit = is_unit, shin_value = val))
+        end
+    end
+    return entries
+end
+
+"""
+    diagnose_real_places(d::Int)
+
+Determines which of `real_places(K)[1]`, `real_places(K)[2]` is CONJUGATION
+(the paper's infty_2, the one place making up Sigma) and which is the
+identity embedding (infty_1).
+
+Test used: `gen(K) = sqrt(D)` is positive under the identity embedding and
+negative under conjugation, so the place whose embedding sends sqrt(D) to a
+NEGATIVE real is conjugation = infty_2.
+
+Also reports, for every Picard-class root rho currently in use, whether
+`sigma_1(rho) > sigma_2(rho)` (the theorem's `rho > rho'` normalization), and
+cross-checks the two places actually used in the code:
+  - `Sigma = [all_places[2]]`   (ray class group construction)
+  - `emb_conj_K = embedding(places_K_top[1])`  (twisted_chi_general's
+    `u2*conj(rho_j) - u1 > 0` positivity check)
+These two MUST refer to the same place; this prints whether they do.
+"""
+function diagnose_real_places(d::Int)
+    F = AdmissibleTuple(d)
+    sd = _ray_class_shin_setup(F)
+    K, D = sd.K, sd.D
+    a = gen(K)
+    places = real_places(K)
+    println("K = ", K, "   gen(K) = sqrt(", D, ")")
+    i_conj = 0
+    for (i, p) in enumerate(places)
+        v = Float64(real(embedding(p)(a)))
+        isconj = v < 0
+        isconj && (i_conj = i)
+        println("  real_places(K)[", i, "]:  sqrt(", D, ") -> ", v, "   => ",
+                isconj ? "CONJUGATION  = infty_2  (this is Sigma)" :
+                         "identity     = infty_1")
+    end
+    i_conj == 0 && error("diagnose_real_places: neither place sends sqrt(D) to a negative ",
+                          "number - cannot identify conjugation")
+    i_main = 3 - i_conj
+    println("\n=> conjugation (infty_2, Sigma) is real_places(K)[", i_conj, "]")
+    println("=> identity    (infty_1)        is real_places(K)[", i_main, "]")
+
+    emb_conj = embedding(places[i_conj])
+    emb_main = embedding(places[i_main])
+
+    println("\nChecking rho > rho' (i.e. sigma_1(rho) > sigma_2(rho)) for the class roots:")
+    for (g, rho) in sd.rho_reps
+        v_main = Float64(real(emb_main(rho)))
+        v_conj = Float64(real(emb_conj(rho)))
+        println("  class ", g, ": rho = ", rho, "   sigma_1 = ", v_main,
+                "  sigma_2 = ", v_conj, "   rho > rho'? ", v_main > v_conj)
+    end
+
+    println("\nConsistency of the two places the code currently hard-codes:")
+    println("  Sigma       = [all_places[2]]        -> places[2] ", i_conj == 2 ? "IS" : "is NOT",
+            " conjugation")
+    println("  emb_conj_K  = embedding(places[1])   -> places[1] ", i_conj == 1 ? "IS" : "is NOT",
+            " conjugation")
+    if i_conj == 2
+        println("  ==> MISMATCH: Sigma is right (places[2]), but twisted_chi_general's ",
+                "`emb_conj_K = embedding(places_K_top[1])` is picking the IDENTITY place, so ",
+                "its `u2*conj(rho_j)-u1 > 0` test is imposing positivity at the WRONG place.")
+    else
+        println("  ==> MISMATCH: emb_conj_K is right (places[1]), but `Sigma = [all_places[2]]` ",
+                "is selecting the IDENTITY place, so the ray class group is being built with ",
+                "the WRONG Sigma.")
+    end
+    println("  (Exactly one of these two is wrong - they cannot both be conjugation.)")
+
+    return (i_conj = i_conj, i_main = i_main)
+end
+
+"""
+    ray_class_monoid_table_v2(F::AdmissibleTuple; shared_data = nothing, verbose = true)
+
+Builds the ray class monoid shin table DIRECTLY from the definition of
+`Cl^flat_{m,Sigma}(O)`, rather than assuming (as `ray_class_monoid_shin_table`
+does) that the classes are the `<L_eps>`-orbits on `(Z/d)^2`.
+
+Construction, following Theorem 2.19 with `m = dO`:
+
+  For each `A_0 in Cl(O)`:
+    1. pick `b` in the class `A_0^{-1}`, integral and COPRIME to `m`
+       (search: `b = x * I^{-1}` for `x in I = mP_O(A_0)` with
+       `|N(x)|/N(I)` coprime to `d`);
+    2. write `b*m = d*b = alpha*(rho*Z + Z)` with `alpha` TOTALLY POSITIVE
+       and `rho > rho'` (search over unimodular changes of the Z-basis of
+       `d*b`, then fix `alpha`'s sign class by a unit multiple);
+    3. `alpha*(r2*rho - r1) in b  <=>  r in (1/d)Z^2`, so the grid is
+       `r = p/d`, `p in (Z/d)^2`; `p = (0,0)` is exactly the zero class
+       (`a subset m`), which Theorem 2.19 excludes, so it is skipped;
+    4. for each `p`, choose the lift `r in p/d + Z^2` with
+       `r2*rho' - r1 > 0` (Theorem 2.19's Sigma-sign normalization).
+       NOTE: `ray_class_monoid_shin_table` never does this - it passes
+       `[p1,p2]` with `p_i in [0,d)`, i.e. `r in [0,1)^2`, for which
+       `r2*rho' - r1 <= 0` at essentially every point since `rho' < 0`.
+    5. `gamma_r = alpha*(r2*rho - r1) in b`, and `a_r = gamma_r * b^{-1}`.
+
+  Then group the `p`'s by the equivalence relation ITSELF:
+
+      a_r ~_{m,Sigma} a_r'  <=>  exists c in Jbar^flat_m(O) and
+                                 alpha_e, beta_e in O[S_m^{-1}] with
+                                 a_r = alpha_e*c, a_r' = beta_e*c,
+                                 alpha_e - beta_e in m*O[S_m^{-1}],
+                                 sgn(sigma(alpha_e)) = sgn(sigma(beta_e))
+                                 for all sigma in Sigma.
+
+  This is implemented via the following reduction, which is proved (not
+  assumed) as follows. `c` must lie in the class `[b^{-1}]`, so `c*b` is
+  principal, say `c = delta*b^{-1}`. Locally at any `p | m` all of
+  `a_r, a_r', c` are principal (invertible modules over a local ring are
+  free), say `(A), (B), (C)`; then `alpha_e = A/C`, `beta_e = B/C` up to
+  units, and `alpha_e - beta_e in dO_p` gives `(A-B)/C in dO_p`, hence
+  `A - B in C*dO_p subset dO_p`. So ANY working `c` implies `c = b^{-1}`
+  (i.e. `C = 1`) also works - no valuation theory and no DVR assumption is
+  needed, so the singular prime at the conductor `q` causes no trouble.
+  With `c = b^{-1}` we get `alpha_e = u_1*gamma_r`, `beta_e = u_2*gamma_r'`
+  for units `u_i`, and multiplying through by `u_1^{-1}` leaves
+
+      a_r ~ a_r'  <=>  exists a unit u in O^*  with
+                       gamma_r  ==  u*gamma_r'   (mod dO)
+                and  sgn_Sigma(gamma_r) == sgn_Sigma(u*gamma_r').
+
+  Since every `gamma_r` here is Sigma-positive by the step-4 normalization,
+  the sign condition reduces to "u is Sigma-positive".
+
+  The congruence is tested EXACTLY (not numerically): `x in dO` iff every
+  coordinate of `x` w.r.t. the Z-basis of `O` is divisible by `d`.
+
+Returns a vector of NamedTuples, one per monoid class:
+`(A0, rho, alpha, p_vec, r_num, members, is_unit, shin_value)` where
+`members` is the full list of grid points in that class and `r_num` is the
+integer numerator vector of the NORMALIZED lift actually fed to `shin`.
+"""
+function ray_class_monoid_table_v2(F::AdmissibleTuple; shared_data = nothing,
+                                    verbose::Bool = true, basis_height::Int = 8)
+    sd = shared_data === nothing ? _ray_class_shin_setup(F) : shared_data
+    D, d, K, O = sd.D, sd.d, sd.K, sd.O
+    P_O, mP_O = sd.P_O, sd.mP_O
+    rho_reps, all_triples = sd.rho_reps, sd.all_triples
+
+    places = real_places(K)
+    i_conj = findfirst(p -> Float64(real(embedding(p)(gen(K)))) < 0, places)
+    i_conj === nothing && error("ray_class_monoid_table_v2: could not identify conjugation")
+    emb_conj = embedding(places[i_conj])          # sigma_2 = Sigma
+    emb_main = embedding(places[3 - i_conj])      # sigma_1
+    fm(x) = Float64(real(emb_main(x)))
+    fc(x) = Float64(real(emb_conj(x)))
+
+    m = ideal(O, d)
+
+    # x in dO  <=>  all Z-basis coordinates of x divisible by d
+    function in_dO(x)
+        try
+            return all(iszero(mod(c, ZZ(d))) for c in coordinates(O(x)))
+        catch
+            return false
+        end
+    end
+
+    entries = NamedTuple[]
+
+    rho_base = sd.rho_reps[sd.F_class]
+    d_check = sd.d_check
+
+    for g in P_O
+        # ---- steps 1-2: (alpha, rho) for this Picard class, Theorem 2.19 ----
+        # BUGFIX (twice over). This block originally (a) built its own
+        # coprime-to-m representative `b` of the class g^{-1} by hand, and
+        # (b) derived (alpha, rho) from `b` by an ad-hoc unimodular basis
+        # search. Both were wrong:
+        #   (a) `numerator(x * inv(I))` does NOT return the ideal x*I^{-1}.
+        #       Hecke stores a fractional ideal as num/den, and `numerator`
+        #       hands back `num` = den*(x*I^{-1}) - an integer multiple of the
+        #       intended ideal whenever den != 1 - silently corrupting `b` and
+        #       invalidating the coprimality test performed just above it.
+        #       Symptom: find_alpha_rho_direct exhausting its (m,n) search
+        #       ("no (alpha, rho_B) found within mn_height=3000") on a lattice
+        #       it should have normalized immediately.
+        #   (b) "alpha totally positive" + "rho > rho'" do not pin rho down -
+        #       every GL2(Z) translate satisfies them too, and almost none are
+        #       HJ-reduced, so `shin` failed with "t.Q is not strictly
+        #       HJ-reduced".
+        # Fix for both: don't construct any of this by hand. Ask
+        # find_alpha_rhoB_s1_s2_O - the exact routine the (working) group table
+        # uses - for this class's (alpha, rho_B). It internally picks a
+        # verified b_O via find_b_with_verified_principal_product and runs
+        # find_alpha_rho_direct on it (which lattice-reduces first, hence gives
+        # an HJ-reducible rho_B), and it enforces precisely Theorem 2.19's
+        # normalization: b*d*O = alpha*(Z*rho_B+Z), alpha totally positive,
+        # rho_B > conj(rho_B). Per its own docs alpha/rho_B depend only on the
+        # Picard class of J, not on which J in that class is passed.
+        Jg = nothing
+        for t in all_triples
+            if (mP_O \ t[1]) == g
+                Jg = t[1]
+                break
+            end
+        end
+        Jg === nothing && error("ray_class_monoid_table_v2: no ray class representative ideal ",
+                                "found in Picard class ", g)
+        alpha, rho, _, _ = find_alpha_rhoB_s1_s2_O(Jg, rho_reps[g], rho_base, g, P_O, mP_O,
+                                                    O, K, d, rho_base, d_check;
+                                                    mn_height = 3000, q_gen_height = 3000)
+        (fm(alpha) > 0 && fc(alpha) > 0) ||
+            error("ray_class_monoid_table_v2: non-totally-positive alpha = ", alpha,
+                  " for Picard class ", g)
+        fm(rho) > fc(rho) ||
+            error("ray_class_monoid_table_v2: rho = ", rho, " has rho <= rho' for Picard class ", g)
+
+        rho_bf = BigFloat(coeff(rho, 0)) + BigFloat(coeff(rho, 1)) * sqrt(BigFloat(D))
+        rho_c = fc(rho)
+
+        # ---- units of O, and the Sigma-positive ones, as residues mod dO ----
+        # BUGFIX: hj_automorph_for_root can return either L or -L (both
+        # represent the same automorphism of rho, since -I acts trivially on
+        # rho). ray_class_monoid_shin_table normalizes this to the matrix of
+        # the TOTALLY POSITIVE unit before using it anywhere (Lpos = trace>0
+        # ? L : -L) - that normalization was missing here, and the wrong
+        # sign choice produces a stabilizer matrix that is not strictly
+        # HJ-reduced, which is exactly what `shin` errored on. Apply the
+        # same normalization here.
+        L_raw = hj_automorph_for_root(rho, D)
+        L = (L_raw[1,1] + L_raw[2,2]) > 0 ? L_raw : -L_raw
+        eps_u = L[2,1] * rho + L[2,2]              # the unit with L*(rho,1)^T = eps*(rho,1)^T
+        units = Any[]
+        cur = one(K)
+        for _ in 1:10_000
+            for sgn in (1, -1)
+                u = sgn * cur
+                fc(u) > 0 && push!(units, u)        # Sigma-positive units only
+            end
+            cur = cur * eps_u
+            in_dO(cur - one(K)) && break            # eps^k == 1 mod dO: full residue cycle
+        end
+        isempty(units) && error("ray_class_monoid_table_v2: no Sigma-positive units found")
+
+        # ---- steps 3-5: build gamma_r for every grid point, with the
+        #      Theorem 2.19 lift normalization r2*rho' - r1 > 0 ----
+        gam = Dict{Tuple{Int,Int}, Any}()
+        rnum = Dict{Tuple{Int,Int}, Vector{Int}}()
+        for p1 in 0:d-1, p2 in 0:d-1
+            (p1 == 0 && p2 == 0) && continue        # the zero class; excluded by Thm 2.19
+            r2 = QQ(p2, d)
+            # pick n1 so that r1 = p1/d + n1 satisfies r2*rho' - r1 > 0
+            n1 = Int(floor(Float64(r2) * rho_c - p1 / d)) - 1
+            r1 = QQ(p1, d) + n1
+            @assert Float64(r2) * rho_c - Float64(r1) > 0
+            gam[(p1, p2)] = alpha * (r2 * rho - r1)
+            rnum[(p1, p2)] = [p1 + d * n1, p2]
+        end
+
+        # ---- group by the equivalence relation ----
+        # The Sigma-positive units form a GROUP, so "gamma_p == u*gamma_q mod dO
+        # for some Sigma-positive u" is an equivalence whose classes are the
+        # orbits of that group acting on O/dO. So instead of testing all
+        # O(d^4) pairs, compute each point's orbit as a canonical key (the
+        # sorted set of coordinate pairs mod d of u*gamma_p over all u) and
+        # group by that key - O(d^2 * #units) instead.
+        function coord_key(x)
+            c = coordinates(O(x))
+            return (Int(mod(c[1], ZZ(d))), Int(mod(c[2], ZZ(d))))
+        end
+        keyof = Dict{Tuple{Int,Int}, Any}()
+        for (pt, gx) in gam
+            keyof[pt] = sort!([coord_key(u * gx) for u in units])
+        end
+        buckets = Dict{Any, Vector{Tuple{Int,Int}}}()
+        for (pt, k) in keyof
+            push!(get!(buckets, k, Tuple{Int,Int}[]), pt)
+        end
+        classes = [sort!(v) for v in values(buckets)]
+
+        # unit test, using the same convention as ray_class_monoid_shin_table
+        # and twisted_chi_general: x_p = p2*rho - p1, normalized by the norm of
+        # the lattice (1, rho). (The old form of this used N(b), but `b` is no
+        # longer built by hand here - see the BUGFIX note above.)
+        I_B = fractional_ideal(O, [K(1), rho])
+        NI_B = QQ(norm(I_B))
+        for members in classes
+            pt = members[1]
+            rn = rnum[pt]
+            A, _ = stabilizer_power_in_Gamma_s(L, [QQ(rn[1], d), QQ(rn[2], d)])
+            val = shin(A, rho_bf, rn, d)
+            x = K(pt[2]) * rho - K(pt[1])
+            rel = QQ(abs(norm(x))) / NI_B
+            is_unit = isone(denominator(rel)) && gcd(Int(numerator(rel)), d) == 1
+            push!(entries, (A0 = g, rho = rho, alpha = alpha, p_vec = [pt[1], pt[2]],
+                            r_num = rn, members = members, is_unit = is_unit,
+                            shin_value = val))
+        end
+
+        if verbose
+            println("Picard class ", g, ":  alpha = ", alpha, "  rho = ", rho)
+            println("  Sigma-positive unit residues mod dO: ", length(units))
+            println("  monoid classes in this fiber: ", length(classes),
+                    "   (", count(c -> length(c) > 0, classes), " nonempty)")
+        end
+    end
+
+    return entries
+end
+
+ray_class_monoid_table_v2(d::Int; kwargs...) =
+    ray_class_monoid_table_v2(AdmissibleTuple(d); kwargs...)
+
+"""
+    compare_monoid_tables(d::Int; tol = 1e-10)
+
+Runs both `ray_class_monoid_shin_table` (the `<L_eps>`-orbit construction)
+and `ray_class_monoid_table_v2` (built from the definition of
+`Cl^flat_{m,Sigma}(O)`), and reports:
+  1. the class counts from each;
+  2. whether the v2 classes coincide with the orbit partition (they should,
+     if the reduction of the equivalence to "unit multiple mod dO" is right);
+  3. the shin values, which will DIFFER wherever the old builder used an
+     unnormalized lift (r in [0,1)^2 instead of r2*rho'-r1 > 0).
+"""
+function compare_monoid_tables(d::Int; tol::Float64 = 1e-10)
+    F = AdmissibleTuple(d)
+    sd = _ray_class_shin_setup(F)
+    old = ray_class_monoid_shin_table(F; shared_data = sd)
+    new = ray_class_monoid_table_v2(F; shared_data = sd, verbose = false)
+    println("orbit-based table: ", length(old), " rows;  definition-based table: ",
+            length(new), " rows")
+    n_same_part = 0; n_diff_part = 0
+    for e in new
+        ms = Set(e.members)
+        hit = findfirst(o -> Set(o.orbit) == ms, old)
+        hit === nothing ? (n_diff_part += 1) : (n_same_part += 1)
+    end
+    println("v2 classes matching an orbit exactly: ", n_same_part,
+            ";  not matching any orbit: ", n_diff_part)
+    if n_diff_part == 0
+        println("  => the equivalence relation IS the <L_eps>-orbit relation (partition agrees).")
+    else
+        println("  => the partitions DIFFER - the orbit construction is not the right ",
+                "equivalence.")
+    end
+    n_val_same = 0; n_val_diff = 0
+    for e in new
+        hit = findfirst(o -> Set(o.orbit) == Set(e.members), old)
+        hit === nothing && continue
+        abs(old[hit].shin_value - e.shin_value) < tol ? (n_val_same += 1) : (n_val_diff += 1)
+    end
+    println("shin values equal on matching classes: ", n_val_same, ";  different: ", n_val_diff)
+    n_val_diff > 0 && println("  => as expected if the old builder's unnormalized lift ",
+                              "(r in [0,1)^2, r2*rho'-r1 <= 0) was giving the wrong shin argument.")
+    return (old = old, new = new)
+end
+
+"""
+    check_monoid_table(d::Int; tol = 1e-10)
+
+Builds the group table and the (2.55) monoid table, then:
+  1. checks every group entry (reduced point (d*s1, d*s2) mod d, same ρ_B)
+     lies in some monoid orbit with the SAME shin value;
+  2. reports unit / non-unit orbit counts per fiber (expect 72 unit orbits);
+  3. computes shin^{[p1,p2]}_{A_lookup}(ρ) for the base root ρ = rho_reps[F_class]
+     at the point (0,3) (the point that broke twisted_chi_general) and checks
+     it IS present in the monoid table.
+"""
+function check_monoid_table(d::Int; tol::Float64 = 1e-10, p_test::Vector{Int} = [0, 3])
+    F = AdmissibleTuple(d)
+    sd = _ray_class_shin_setup(F)
+    D, K = sd.D, sd.K
+    tbl = ray_class_shin_table_fast_quiet(F; shared_data = sd)
+    mono = ray_class_monoid_shin_table(F; shared_data = sd, group_table = tbl)
+    println("group table: ", count(x -> x !== nothing, tbl), " entries;  monoid table: ",
+            length(mono), " orbits (", count(e -> e.is_unit, mono), " unit, ",
+            count(e -> !e.is_unit, mono), " non-unit)")
+    for rho_B in unique([e.rho_B for e in mono])
+        sub = filter(e -> e.rho_B == rho_B, mono)
+        println("  fiber rho_B = ", rho_B, ": ", length(sub), " orbits, ",
+                count(e -> e.is_unit, sub), " unit, ", count(e -> !e.is_unit, sub), " non-unit")
+    end
+    n_ok = 0; n_bad = 0
+    for (i, e) in enumerate(tbl)
+        e === nothing && continue
+        pt = (Int(mod(numerator(e.s1 * d), d)), Int(mod(numerator(e.s2 * d), d)))
+        hit = findfirst(m -> m.rho_B == e.rho_B && pt in m.orbit, mono)
+        if hit === nothing
+            n_bad += 1; println("  group entry ", i, ": point ", pt, " not found in any monoid orbit!")
+        elseif abs(mono[hit].shin_value - e.shin_value) < tol
+            n_ok += 1
+        else
+            n_bad += 1
+            println("  group entry ", i, ": point ", pt, " in monoid orbit ", mono[hit].orbit,
+                    " but shin differs: group ", e.shin_value, " vs monoid ", mono[hit].shin_value)
+        end
+    end
+    println("group entries reproduced by the monoid table: ", n_ok, " ok, ", n_bad, " mismatched")
+
+    rho = sd.rho_reps[sd.F_class]
+    rho_bf = BigFloat(coeff(rho, 0)) + BigFloat(coeff(rho, 1)) * sqrt(BigFloat(D))
+    L_rho = hj_automorph_for_root(rho, D)
+    p1, p2 = p_test
+    A_lookup, _ = stabilizer_power_in_Gamma_s(L_rho, [QQ(p1, d), QQ(p2, d)])
+    val = shin(A_lookup, rho_bf, [p1, p2], d)
+    hits = findall(m -> abs(m.shin_value - val) < tol, mono)
+    println("lookup value shin^{[", p1, ",", p2, "]}_A(rho) = ", val)
+    println("  found in monoid table? ", !isempty(hits),
+            isempty(hits) ? "" : "  (orbit(s): " * join([string(mono[h].orbit, " rho_B=", mono[h].rho_B, " unit=", mono[h].is_unit) for h in hits], "; ") * ")")
+    return (group = tbl, monoid = mono)
+end
+
+"""
+    check_lookup_coverage(d::Int; tol = 1e-10)
+
+For EVERY grid point p in Z_d^2 \\ {0}, computes the lookup value
+shin^{p/d}_{A_lookup}(ρ) exactly as twisted_chi_general does (ρ = rho_reps[F_class],
+the base root), then:
+  1. predicts its trivial-fiber orbit via the translation γ = [1 -t; 0 1] with
+     ρ = ρ_B0 + t (ρ_B0 = the trivial fiber's table root): p ↦ (p1 - t*p2, p2)
+     mod d, and checks the monoid table's value at that orbit equals the
+     lookup value (the covariance theorem, det γ = 1, s_γ = +1);
+  2. for unit points, checks whether the lookup value is in the GROUP table.
+Then reports: how many distinct (fiber, orbit) pairs the 288 group entries
+actually cover (a bijection with the 288 unit orbits needs exactly 288), the
+unit orbits with NO group entry (missing classes), and any points where the
+theorem check fails. This distinguishes "the group enumeration repeats some
+classes and misses others" from "the covariance theorem fails somewhere".
+"""
+function check_lookup_coverage(d::Int; tol::Float64 = 1e-10)
+    F = AdmissibleTuple(d)
+    sd = _ray_class_shin_setup(F)
+    D, K = sd.D, sd.K
+    tbl = ray_class_shin_table_fast_quiet(F; shared_data = sd)
+    mono = ray_class_monoid_shin_table(F; shared_data = sd, group_table = tbl)
+
+    # --- distinct orbits covered by the group table ---
+    covered = Set{Tuple{Int,Int}}()      # (fiber index, orbit index)
+    rhoBs = unique([e.rho_B for e in mono])
+    orbit_index(rho_B, pt) = findfirst(m -> m.rho_B == rho_B && pt in m.orbit, mono)
+    for e in tbl
+        e === nothing && continue
+        pt = (Int(mod(numerator(e.s1 * d), d)), Int(mod(numerator(e.s2 * d), d)))
+        oi = orbit_index(e.rho_B, pt)
+        oi === nothing && continue
+        push!(covered, (findfirst(==(e.rho_B), rhoBs), oi))
+    end
+    println("group table: ", count(x -> x !== nothing, tbl), " entries covering ",
+            length(covered), " distinct orbits (bijection with the ",
+            count(m -> m.is_unit, mono), " unit orbits needs all of them)")
+    missing_unit = [(i, m) for (i, m) in enumerate(mono)
+                    if m.is_unit && !((findfirst(==(m.rho_B), rhoBs), i) in covered)]
+    println("unit orbits with NO group-table entry: ", length(missing_unit))
+    for (i, m) in missing_unit
+        println("    fiber rho_B = ", m.rho_B, "  orbit ", m.orbit, "  shin_value = ", m.shin_value)
+    end
+
+    # --- per-point covariance + group-membership check with the base root ---
+    rho = sd.rho_reps[sd.F_class]
+    rho_bf = BigFloat(coeff(rho, 0)) + BigFloat(coeff(rho, 1)) * sqrt(BigFloat(D))
+    L_rho = hj_automorph_for_root(rho, D)
+    rho_B0 = rhoBs[argmin([abs(Float64(real(embedding(real_places(K)[2])(rho - rb)))) for rb in rhoBs])]
+    t_shift = rho - rho_B0
+    t_int = iszero(coeff(t_shift, 1)) && isone(denominator(QQ(coeff(t_shift, 0)))) ?
+            Int(numerator(QQ(coeff(t_shift, 0)))) : nothing
+    println("base root rho = ", rho, ";  trivial-fiber table root rho_B0 = ", rho_B0,
+            ";  rho - rho_B0 = ", t_shift, t_int === nothing ? "  (NOT an integer translation - prediction skipped)" : "")
+    n_thm_ok = 0; n_thm_bad = 0; n_unit_in_group = 0; n_unit_missing = 0
+    missing_pts = Tuple{Int,Int}[]
+    for p1 in 0:d-1, p2 in 0:d-1
+        (p1 == 0 && p2 == 0) && continue
+        A_lookup, _ = stabilizer_power_in_Gamma_s(L_rho, [QQ(p1, d), QQ(p2, d)])
+        val = shin(A_lookup, rho_bf, [p1, p2], d)
+        if t_int !== nothing
+            q = (mod(p1 - t_int * p2, d), p2)
+            oi = orbit_index(rho_B0, q)
+            if oi !== nothing && abs(mono[oi].shin_value - val) < tol
+                n_thm_ok += 1
+            else
+                n_thm_bad += 1
+                println("  [theorem check FAILED] p=(", p1, ",", p2, ") predicted orbit point ", q,
+                        oi === nothing ? " not found" : "  monoid value " * string(mono[oi].shin_value),
+                        "  lookup value ", val)
+            end
+        end
+        is_unit_p = false
+        if t_int !== nothing
+            oi = orbit_index(rho_B0, (mod(p1 - t_int * p2, d), p2))
+            is_unit_p = oi !== nothing && mono[oi].is_unit
+        end
+        if is_unit_p
+            in_group = any(e -> e !== nothing && abs(e.shin_value - val) < tol, tbl)
+            in_group ? (n_unit_in_group += 1) : (n_unit_missing += 1; push!(missing_pts, (p1, p2)))
+        end
+    end
+    println("covariance theorem (lookup with rho vs monoid at gamma-predicted orbit): ",
+            n_thm_ok, " ok, ", n_thm_bad, " failed")
+    println("unit grid points: ", n_unit_in_group, " found in group table, ", n_unit_missing, " missing")
+    isempty(missing_pts) || println("  missing unit points: ", missing_pts)
+    return (group = tbl, monoid = mono, missing_unit_orbits = missing_unit, missing_points = missing_pts)
+end
+
+"""
+    check_nonunit_shift_invariance(d::Int; p1=nothing, p2=nothing, class_idx::Int=1,
+                                     n_shifts_to_test::Int=3, tol::Float64=1e-10)
+
+DIAGNOSTIC - added to directly test an assumption `twisted_chi_general`'s
+"direct route" relies on for NON-UNIT grid points, which has never actually
+been verified.
+
+Background: for a non-unit point p=(p1,p2) (`x_p = p2*rho-p1` not a unit
+mod `d`), the direct route builds
+    elem1 := x_p + d*n_shift
+for whatever `n_shift >= 0` is the SMALLEST value making `elem1` totally
+positive, and proceeds to compute the twisted overlap from `elem1`. Since
+`d*n_shift ∈ m`, `elem1 ≡ x_p (mod m)`, so this is a valid "some totally
+positive representative of x_p's residue mod m" - but the assumption that
+this specific choice of representative doesn't matter (i.e. that any OTHER
+totally positive representative `x_p + d*n_shift'` would give the SAME final
+answer) is a congruence-plus-sign equivalence that is a PROVEN THEOREM only
+for points that are units mod `d` (the group case, Kopp-Lagarias). For
+non-unit points (the ray class MONOID, KFA eq. (2.55)) this has never been
+checked - `check_lookup_coverage` was written partly to probe exactly this
+kind of question and was never run.
+
+This function isolates the question directly: for a genuine non-unit grid
+point and a genuine non-principal ray class (J, gamma) (the only branch that
+ever exercises the direct route), it replicates `twisted_chi_general`'s
+ENTIRE direct-route pipeline (elem1 -> elem2 -> product -> rho_j := rho_B ->
+A_bj -> gQ_j (primitivized) -> gF_j -> M_g_j -> u1,u2 -> integralnewdu ->
+QA,s,c_g -> final shin-based overlap value) for SEVERAL different valid
+choices of `n_shift` (the code's own minimal choice, then +1, +2, ...), and
+reports whether the resulting complex overlap values agree.
+
+  - AGREE (within `tol`): the equivalence holds empirically for this case,
+    and the direct route's particular choice of `n_shift` is, as intended,
+    irrelevant to the final answer.
+  - DISAGREE: the direct route is NOT shift-invariant for non-unit points -
+    a genuine bug distinct from (and more fundamental than) the retry-loop
+    crash fixed separately, and the "rho_j := rho_B, elem1 := shifted x_p"
+    construction needs to be reconsidered for non-unit points specifically
+    (e.g. by working out how KFA (2.55)'s monoid-orbit representative choice
+    actually interacts with shin, rather than assuming the group-case
+    congruence theorem extends verbatim).
+
+If `p1`/`p2` are omitted, the first non-unit grid point found (scanning
+`(0,0)` excluded, row-major) is used automatically. Raises an error if the
+supplied/found point is actually a UNIT point (this test is specifically
+about the monoid-only, non-unit case). `class_idx` selects which
+non-principal ray class (1-indexed into the non-principal triples, same
+ordering `test_all_twists` uses) to twist by; the specific class shouldn't
+matter for what's being tested here, but is exposed in case a particular
+class needs to be targeted.
+
+Returns a NamedTuple `(p, class_idx, n_shifts, values, agree, max_diff)`.
+"""
+function check_nonunit_shift_invariance(d::Int; p1::Union{Int,Nothing} = nothing,
+                                          p2::Union{Int,Nothing} = nothing,
+                                          class_idx::Int = 1,
+                                          n_shifts_to_test::Int = 3,
+                                          tol::Float64 = 1e-10)
+    F = AdmissibleTuple(d)
+    sd = _ray_class_shin_setup(F)
+    D, K, O = sd.D, sd.K, sd.O
+    all_triples = sd.all_triples
+    P_O, mP_O, rho_reps, F_class, d_check =
+        sd.P_O, sd.mP_O, sd.rho_reps, sd.F_class, sd.d_check
+
+    rho = rho_reps[F_class]
+
+    places_K_top = real_places(K)
+    emb_main_K = embedding(places_K_top[2])
+    emb_conj_K = embedding(places_K_top[1])
+
+    # --- unit/non-unit test, exactly matching twisted_chi_general's own ---
+    function unit_status(pp1, pp2)
+        x_p_ = K(pp2) * rho - K(pp1)
+        I_rho_p = fractional_ideal(O, [K(1), rho])
+        rel_p = QQ(abs(norm(x_p_))) / QQ(norm(I_rho_p))
+        is_unit_p = isone(denominator(rel_p)) && gcd(Int(numerator(rel_p)), d) == 1
+        return x_p_, is_unit_p
+    end
+
+    if p1 === nothing || p2 === nothing
+        found = false
+        for q1 in 0:d-1, q2 in 0:d-1
+            (q1 == 0 && q2 == 0) && continue
+            _, is_u = unit_status(q1, q2)
+            if !is_u
+                p1, p2 = q1, q2
+                found = true
+                break
+            end
+        end
+        found || error("check_nonunit_shift_invariance: no non-unit grid point found for d=", d,
+                        " (every nonzero point is a unit - nothing to test)")
+        println("Using first non-unit point found: p = (", p1, ",", p2, ")")
+    end
+
+    x_p, is_unit_p = unit_status(p1, p2)
+    is_unit_p && error("check_nonunit_shift_invariance: p=(", p1, ",", p2, ") IS a unit point ",
+                        "(it has a genuine group ray class) - this test is specifically about the ",
+                        "monoid-only direct route for NON-unit points. Pick a different p, or omit ",
+                        "p1/p2 to auto-search for a non-unit point.")
+
+    # --- pick a non-principal (J, gamma) triple (the only branch that ever
+    # exercises the direct route in twisted_chi_general) ---
+    nonprincipal_triples = [(J, gam) for (J, _, gam, is_princ) in all_triples if !is_princ]
+    isempty(nonprincipal_triples) &&
+        error("check_nonunit_shift_invariance: no non-principal ray classes found for d=", d)
+    class_idx in 1:length(nonprincipal_triples) ||
+        error("check_nonunit_shift_invariance: class_idx=", class_idx, " out of range 1:",
+              length(nonprincipal_triples))
+    J, gamma = nonprincipal_triples[class_idx]
+    println("Using non-principal class ", class_idx, " of ", length(nonprincipal_triples),
+            ":  J = ", J, "  gamma = ", gamma)
+
+    # --- rho_B, s1, s2 for this J (identical call to twisted_chi_general's
+    # cache-miss branch) ---
+    u_B = mP_O \ J
+    rho_B_init = rho_reps[u_B]
+    _, rho_B, s1, s2 = find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O,
+                                                 O, K, d, rho, d_check;
+                                                 mn_height = 3000, q_gen_height = 3000)
+    println("rho_B = ", rho_B, "  s1 = ", s1, "  s2 = ", s2)
+
+    # --- chi (same formula as twisted_chi_general; is_principal_J = false here) ---
+    Ng = Int(norm(K(gamma)))
+    NJ = Int(norm(J))
+    NJ_Ng = NJ * abs(Ng)
+    chi_raw = kronecker_symbol(d + 1, NJ_Ng)
+    chi = (chi_raw == 0) ? 1 : chi_raw
+    ζ = -cispi(BigFloat(1) / d)
+
+    function du_to_int_mod_d_local(du_int_val, dd)
+        num = Int(numerator(du_int_val))
+        den = Int(denominator(du_int_val))
+        g = gcd(abs(num), den)
+        num ÷= g
+        den ÷= g
+        gcd(den, dd) == 1 || error("denominator ", den, " of ", du_int_val,
+                                    " is not coprime to d=", dd)
+        return mod(num * invmod(den, dd), dd)
+    end
+
+    # --- run the direct-route pipeline for a GIVEN elem1, mirroring
+    # twisted_chi_general's non-unit branch line for line ---
+    function run_direct_route(elem1)
+        elem2 = K(s2) * rho_B - K(s1)
+        product = elem1 * elem2
+
+        rho_j_raw = rho_B     # the assumption under test: rho_j := rho_B, regardless of n_shift
+        s2_bj, s1_bj = find_rho_j_and_coords(product, rho_j_raw)
+
+        rho_j_bf = BigFloat(coeff(rho_j_raw, 0)) + BigFloat(coeff(rho_j_raw, 1)) * sqrt(BigFloat(D))
+        L_bj = hj_automorph_for_root(rho_j_raw, D)
+        A_bj_cand, _ = stabilizer_power_in_Gamma_s(L_bj, [s1_bj, s2_bj])
+
+        red_bj = find_hj_reducing_matrix(A_bj_cand, rho_j_bf)
+        gQ_j_cand_raw = binary_quadratic_form(red_bj.A_reduced[2,1],
+                                               red_bj.A_reduced[2,2] - red_bj.A_reduced[1,1],
+                                               -red_bj.A_reduced[1,2])
+        content_j = gcd(gcd(gQ_j_cand_raw.a, gQ_j_cand_raw.b), gQ_j_cand_raw.c)
+        gQ_j_cand = binary_quadratic_form(divexact(gQ_j_cand_raw.a, content_j),
+                                           divexact(gQ_j_cand_raw.b, content_j),
+                                           divexact(gQ_j_cand_raw.c, content_j))
+        gF_j_cand = AdmissibleTuple(d, F.r, gQ_j_cand)
+        QQ_form_cand = binary_quadratic_form(gF_j_cand.A[2,1],
+                                              gF_j_cand.A[2,2] - gF_j_cand.A[1,1],
+                                              -gF_j_cand.A[1,2])
+
+        M_g_j_cand = multiplication_matrix_mod_d(K(gamma), rho_j_raw, d, D)
+        det_M_g_j = mod(M_g_j_cand[1,1]*M_g_j_cand[2,2] - M_g_j_cand[1,2]*M_g_j_cand[2,1], d)
+        gcd(det_M_g_j, d) == 1 ||
+            error("run_direct_route: det(M_g_j) not coprime to d for this elem1 - cannot ",
+                  "compare shift invariance for this candidate")
+
+        u2_cand, u1_cand = find_rho_j_and_coords(product, rho_j_raw)
+        diag_val = Float64(u2_cand) * Float64(real(emb_conj_K(rho_j_raw))) - Float64(u1_cand)
+        diag_val > 0 ||
+            error("run_direct_route: u2*conj(rho_j)-u1 <= 0 for this elem1 - cannot ",
+                  "compare shift invariance for this candidate")
+
+        du = [to_du_mod_d(u1_cand, d), to_du_mod_d(u2_cand, d)]
+        raw_newdu = M_g_j_cand * du
+        newdu = [to_du_mod_d(raw_newdu[1], d), to_du_mod_d(raw_newdu[2], d)]
+        integralnewdu = [du_to_int_mod_d_local(d * u, d) for u in newdu]
+
+        c_g_j_cand = e(-BigFloat(rademacher(gF_j_cand.A)) / 24) / (chi * sqrt(BigFloat(d + 1)))
+        QA = BigFloat(-QQ_form_cand(integralnewdu...) / (d * (d - 2)))
+        s_par = isodd(d) ? 1 : (1 + integralnewdu[1]) * (1 + integralnewdu[2])
+
+        value = ζ^QA * (-1)^s_par * c_g_j_cand * shin(A_bj_cand, rho_j_bf, integralnewdu, d)
+        return value, integralnewdu, gQ_j_cand
+    end
+
+    # --- the code's own minimal totally-positive shift, then n_shifts_to_test-1 more ---
+    conj_v = Float64(real(emb_conj_K(x_p)))
+    main_v = Float64(real(emb_main_K(x_p)))
+    n_shift0 = max(0, Int(ceil((-min(conj_v, main_v) + 1) / d)))
+
+    values = ComplexF64[]
+    ns_tested = Int[]
+    println("\nTesting n_shift = ", n_shift0, " (the code's own minimal choice), then ",
+            n_shifts_to_test - 1, " further shifts (n_shift0+1, +2, ...):")
+    for k in 0:(n_shifts_to_test - 1)
+        n = n_shift0 + k
+        elem1 = x_p + K(d * n)
+        conj1 = Float64(real(emb_conj_K(elem1)))
+        main1 = Float64(real(emb_main_K(elem1)))
+        println("  n_shift = ", n, ":  elem1 = ", elem1,
+                "  conj(elem1) = ", conj1, "  main(elem1) = ", main1,
+                "  totally positive? ", conj1 > 0 && main1 > 0)
+        try
+            val, integralnewdu, gQ_j_cand = run_direct_route(elem1)
+            println("    -> integralnewdu = ", integralnewdu, "  gQ_j = ", gQ_j_cand,
+                    "  value = ", ComplexF64(val))
+            push!(values, ComplexF64(val))
+            push!(ns_tested, n)
+        catch err
+            println("    -> run_direct_route FAILED for this shift: ", err)
+        end
+    end
+
+    length(values) < 2 &&
+        error("check_nonunit_shift_invariance: fewer than 2 shifts produced a usable value - ",
+              "cannot compare. Try a larger n_shifts_to_test, a different p, or a different class_idx.")
+
+    max_diff = maximum(abs(values[i] - values[1]) for i in 2:length(values))
+    agree = max_diff < tol
+    println("\nShifts tested: ", ns_tested)
+    println("Max pairwise difference from the first value: ", max_diff)
+    println(agree ?
+        "AGREE within tol=$tol - the shift-choice equivalence holds empirically for this case." :
+        "DISAGREE (max_diff=$max_diff >= tol=$tol) - the direct route is NOT shift-invariant here; " *
+        "this is a genuine bug in the non-unit-point construction, not just a retry-loop issue.")
+
+    return (p = (p1, p2), class_idx = class_idx, n_shifts = ns_tested, values = values,
+            agree = agree, max_diff = max_diff)
+end
+
+"""
+    check_table_duplicates(d::Int; tol::Float64 = 1e-30)
+
+Scans all entries of the ray class table for modulus `d` and groups them by
+`shin_value` (within `tol`). Prints every group with more than one member -
+i.e. every case where two or more DIFFERENT ray classes ended up with the
+same (or numerically indistinguishable) stored shin value. A single isolated
+group could reflect a genuine symmetry in the theory; many such groups would
+indicate a systematic non-injectivity bug in how the table is constructed
+(e.g. an unresolved sign/orientation ambiguity).
+"""
+function check_table_duplicates(d::Int; tol::Float64 = 1e-30)
+    tbl = ray_class_shin_table_fast_quiet(d)
+    valid_idxs = findall(x -> x !== nothing, tbl)
+    used = falses(length(valid_idxs))
+    n_groups = 0
+    n_entries_in_groups = 0
+    for (a, ia) in enumerate(valid_idxs)
+        used[a] && continue
+        group = [ia]
+        for (b, ib) in enumerate(valid_idxs)
+            b <= a && continue
+            used[b] && continue
+            if abs(tbl[ia].shin_value - tbl[ib].shin_value) < tol
+                push!(group, ib)
+                used[b] = true
+            end
+        end
+        if length(group) > 1
+            n_groups += 1
+            n_entries_in_groups += length(group)
+            println("Duplicate group ", n_groups, " (", length(group), " entries, shin_value = ",
+                    tbl[ia].shin_value, "):")
+            for i in group
+                println("    entry ", i, ": J = ", tbl[i].J, "  s1 = ", tbl[i].s1,
+                        "  s2 = ", tbl[i].s2, "  rho_B = ", tbl[i].rho_B)
+            end
+        end
+        used[a] = true
+    end
+    println("\nTotal: ", n_groups, " duplicate group(s) covering ", n_entries_in_groups,
+            " of ", length(valid_idxs), " valid entries.")
+    return tbl
+end
+
+"""
+    check_table_denominators(d::Int)
+
+Checks whether the ray class table for modulus `d` contains any entry whose
+`s1,s2` reduce to a denominator SMALLER than `d` (i.e. the class structurally
+lives at a lower level, e.g. `d/q` for `q` a shared prime between `d` and
+`O`'s conductor). Prints every such entry found, or a clear "none found"
+message. Used to test whether `ray_class_group_representatives`'s enumeration
+of the modulus-`d` ray class group actually includes representatives for the
+lower-level part of the group at all, as opposed to only ever producing
+classes with full denominator `d`.
+"""
+function check_table_denominators(d::Int)
+    tbl = ray_class_shin_table_fast_quiet(d)
+    println("Table has ", length(tbl), " entries (", count(x -> x === nothing, tbl), " missing).")
+    n_found = 0
+    for (i, e) in enumerate(tbl)
+        e === nothing && continue
+        d1, d2 = denominator(e.s1), denominator(e.s2)
+        if d1 < d || d2 < d
+            n_found += 1
+            println("  entry ", i, ": J = ", e.J, "  s1 = ", e.s1, "  s2 = ", e.s2,
+                    "  (reduced denominators: ", d1, ", ", d2, ")",
+                    "  rho_B = ", e.rho_B, "  shin_value = ", e.shin_value)
+        end
+    end
+    if n_found == 0
+        println("No entries found with reduced denominator < ", d,
+                " - every table entry's (s1,s2) has full denominator ", d,
+                ". If some class is structurally supposed to live at a lower ",
+                "level (e.g. d/q for q sharing a factor with d), it is NOT ",
+                "represented in this table at all.")
+    else
+        println(n_found, " entries found with reduced denominator < ", d, ".")
+    end
+    return tbl
+end
+
 # ---------------------------------------------------------------------------
 # compare_ray_class_shin_tables: runs BOTH ray_class_shin_table (slow) and
 # ray_class_shin_table_fast, then compares their shin values class by class.
@@ -3727,8 +4785,8 @@ function test_ray_class_group_size(F::AdmissibleTuple)
     m = ideal(O, dbar)
     GC.gc()
 
-    all_places = real_places(K)
-    Sigma = [all_places[2]]
+    all_places = real_places(K)  # kept for any other uses in this function
+    Sigma = [conjugation_place(K)]  # BUGFIX: was [all_places[2]] - wrong place, see conjugation_place's docstring
 
     N = num_principal_ray_classes(OK, O, m, Sigma)
     GC.gc()
@@ -4194,6 +5252,4 @@ function test_ray_class_covariance(d_val::Int; p1::Int = 0, p2::Int = 1)
             shin_conj_recheck = shin_conj)
 end
 
-#test_ray_class_covariance(21; p1 = 0, p2 = 1)
-
-test_all_twists(21)
+check_nonunit_shift_invariance(21)

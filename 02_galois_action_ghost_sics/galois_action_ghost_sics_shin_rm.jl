@@ -106,6 +106,42 @@ function express_in_basis(x, rho, D)
 end
 
 """
+    lattice_reduce_2d(v1, v2, K, places)
+
+2D Gauss/Lagrange lattice reduction of a rank-2 Z-basis {v1,v2} of a lattice
+in K, using the Euclidean norm on the real-embedding pair (embedding at
+places[1], embedding at places[2]) as the reduction quadratic form.
+
+This is the SAME reduction `find_alpha_rho_direct` already performs on its
+own (I*dO) search basis, extracted here as a standalone, reusable helper so
+`ray_class_monoid_lookup` can apply it too (see that function's docstring
+for why this is essential, not optional, for large-norm ideals). Left
+`find_alpha_rho_direct`'s own internal copy untouched to avoid any risk to
+already-working code.
+"""
+function lattice_reduce_2d(v1, v2, K, places)
+    embed_pair(x) = (Float64(embedding(places[1])(x)), Float64(embedding(places[2])(x)))
+    norm2(e) = e[1]^2 + e[2]^2
+    dotp(ea, eb) = ea[1]*eb[1] + ea[2]*eb[2]
+
+    e1 = embed_pair(v1)
+    e2 = embed_pair(v2)
+
+    for _ in 1:200
+        if norm2(e2) < norm2(e1)
+            v1, v2 = v2, v1
+            e1, e2 = e2, e1
+        end
+        mu = round(Int, dotp(e1, e2) / norm2(e1))
+        mu == 0 && break
+        v2 = v2 - K(mu) * v1
+        e2 = embed_pair(v2)
+    end
+
+    return v1, v2
+end
+
+"""
     conjugation_place(K)
 
 Returns the real place of `K` (a real quadratic field) corresponding to
@@ -1346,10 +1382,13 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
             return Float64(BigInt(numerator(q))) / Float64(BigInt(denominator(q)))
         end
 
-        Jb_O = J * b_O
-        Q = Jb_O * inv(alpha_ideal)
-        Q_norm = QQ(norm(Q))
-        verbose && println("  [fast-path] norm(Q) (target norm for s2*rho_B - s1) = ", Q_norm)
+        t_Q = @elapsed begin
+            Jb_O = J * b_O
+            Q = Jb_O * inv(alpha_ideal)
+            Q_norm = QQ(norm(Q))
+        end
+        verbose && println("  [fast-path] norm(Q) (target norm for s2*rho_B - s1) = ", Q_norm,
+                "   (Jb_O/Q construction: ", round(t_Q, sigdigits=3), " s)")
 
         Qbasis = basis(Q)
         qb1 = to_nf_elem_fp(Qbasis[1])
@@ -1369,13 +1408,39 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
         Nqb2 = QQ(norm(qb2))
         Ncross = QQ(norm(qb1 + qb2)) - Nqb1 - Nqb2
 
+        # PERFORMANCE FIX (confirmed, not a guess: diagnose_monoid_lookup_v2_timing's
+        # internal instrumentation showed this exact loop accounts for
+        # essentially 100% of the 8-40s-per-candidate cost - 13-18 million
+        # iterations taking ~10s, while Jb_O/Q construction and the final
+        # is_principal_O_verified check are both sub-millisecond). Nqb1,
+        # Ncross, Nqb2, Q_norm are QQFieldElem (arbitrary-precision rational),
+        # so EVERY one of up to (2*q_gen_height+1)^2 ~ 36 million iterations
+        # was doing multi-precision GMP arithmetic for what is, for any fixed
+        # number field, a comparison against small bounded-denominator
+        # rationals. Rescaling all four by their common denominator makes
+        # them INTEGERS, so the loop's hot inner comparison can run in native
+        # Int128 arithmetic instead - same accept/reject decision for every
+        # (i,j), just computed far more cheaply. den is a property of K/O and
+        # Q alone (not of i,j), so this is a one-time O(1) cost outside the
+        # loop, not a new per-iteration cost.
+        den_ij = lcm(lcm(denominator(Nqb1), denominator(Ncross)),
+                     lcm(denominator(Nqb2), denominator(Q_norm)))
+        Nqb1_i = Int128(numerator(Nqb1 * den_ij))
+        Ncross_i = Int128(numerator(Ncross * den_ij))
+        Nqb2_i = Int128(numerator(Nqb2 * den_ij))
+        Qnorm_i = Int128(numerator(Q_norm * den_ij))
+
         found_s = false
         s1 = QQ(0)
         s2 = QQ(0)
-        for i in -q_gen_height:q_gen_height, j in -q_gen_height:q_gen_height
+        n_ij_tried = 0
+        n_ij_norm_passed = 0
+        t_ijsearch = @elapsed for i in -q_gen_height:q_gen_height, j in -q_gen_height:q_gen_height
             (i == 0 && j == 0) && continue
-            nval = i^2*Nqb1 + i*j*Ncross + j^2*Nqb2
-            abs(nval) == Q_norm || continue
+            n_ij_tried += 1
+            nval_i = Int128(i)^2*Nqb1_i + Int128(i)*Int128(j)*Ncross_i + Int128(j)^2*Nqb2_i
+            abs(nval_i) == Qnorm_i || continue
+            n_ij_norm_passed += 1
 
             cand = K(i) * qb1 + K(j) * qb2
             iszero(cand) && continue
@@ -1419,6 +1484,9 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
             found_s = true
             break
         end
+        verbose && println("  [fast-path] (i,j) search: ", n_ij_tried, " tried, ",
+                n_ij_norm_passed, " passed the norm filter, found_s=", found_s,
+                "   (", round(t_ijsearch, sigdigits=3), " s)")
         found_s || error("Could not find s1, s2 within q_gen_height=", q_gen_height,
                           " using the hinted alpha, rho_B, b_O for this J = ", J)
 
@@ -1435,7 +1503,9 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
         Lconj_gens = [quad_conj(K, g) for g in L_gens]
         Jconj_gens = [quad_conj(K, _nf_elem_of(K, x)) for x in basis(J)]
         crit_gens = [elem2_exact * a for a in lattice_product_gens(Lconj_gens, Jconj_gens)]
-        ok_crit, lambda_gen = is_principal_O_verified(K, O, crit_gens)
+        t_verify = @elapsed (ok_crit, lambda_gen) = is_principal_O_verified(K, O, crit_gens)
+        verbose && println("  [fast-path] final is_principal_O_verified: ok=", ok_crit,
+                "   (", round(t_verify, sigdigits=3), " s)")
         ok_crit || error("FINAL VERIFICATION FAILED (fast path): (s2*rho_B-s1)*",
                           "(Z+Z*rho_B)^{-1} is NOT in the Picard class of J. ",
                           "rho_B=", rho_B, " s1=", s1, " s2=", s2)
@@ -1726,13 +1796,26 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
         Nqb2 = QQ(norm(qb2))
         Ncross = QQ(norm(qb1 + qb2)) - Nqb1 - Nqb2
 
+        # PERFORMANCE FIX (confirmed via diagnose_monoid_lookup_v2_timing's
+        # instrumentation of the fast-path branch - see the matching comment
+        # there for the full explanation): rescale to integers so the hot
+        # (i,j) loop runs in native Int128 arithmetic instead of
+        # arbitrary-precision QQFieldElem. Same accept/reject decision, just
+        # far cheaper per iteration across up to (2*q_gen_height+1)^2 tries.
+        den_ij = lcm(lcm(denominator(Nqb1), denominator(Ncross)),
+                     lcm(denominator(Nqb2), denominator(Q_norm)))
+        Nqb1_i = Int128(numerator(Nqb1 * den_ij))
+        Ncross_i = Int128(numerator(Ncross * den_ij))
+        Nqb2_i = Int128(numerator(Nqb2 * den_ij))
+        Qnorm_i = Int128(numerator(Q_norm * den_ij))
+
         found_s = false
         s1 = QQ(0)
         s2 = QQ(0)
         for i in -q_gen_height:q_gen_height, j in -q_gen_height:q_gen_height
             (i == 0 && j == 0) && continue
-            nval = i^2*Nqb1 + i*j*Ncross + j^2*Nqb2
-            abs(nval) == Q_norm || continue
+            nval_i = Int128(i)^2*Nqb1_i + Int128(i)*Int128(j)*Ncross_i + Int128(j)^2*Nqb2_i
+            abs(nval_i) == Qnorm_i || continue
 
             cand = K(i) * qb1 + K(j) * qb2
             iszero(cand) && continue
@@ -1906,7 +1989,10 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                               ray_class_lookup_table::Union{Nothing,Vector} = nothing,
                               ray_class_lookup_tol::Real = 1e-10,
                               elem1_max_power::Int = 10_000,
-                              elem1_max_u::Integer = 10_000_000)
+                              elem1_max_u::Integer = 10_000_000,
+                              monoid_table::Vector = NamedTuple[],
+                              candidate_cache::Dict = Dict{Tuple{Int,Int,Int}, Any}(),
+                              class_hints::Dict = Dict{Any, NamedTuple}())
     d = Int(F.d)
     D = Int(F.D)
     a = gen(K)
@@ -2236,126 +2322,41 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 match_idx = findfirst(
                     e -> e !== nothing && abs(e.shin_value - shin_val_lookup) < ray_class_lookup_tol,
                     ray_class_lookup_table_local)
+                local lookup_entry
                 if match_idx === nothing
-                    # DIAGNOSTIC: A_lookup was built from the REDUCED fraction
-                    # (QQ(p1,d), QQ(p2,d) auto-reduce), but shin() just above
-                    # was called with the RAW, possibly-unreduced integers
-                    # [p1,p2] and d. If shin's internal phase/multiplier
-                    # formula isn't reduction-invariant, [p1,p2]/d and the
-                    # reduced [p1÷g,p2÷g]/(d÷g) - the SAME rational point -
-                    # could give genuinely different answers. Check directly.
-                    g_common = gcd(gcd(p1, p2), d)
-                    if g_common > 1
-                        p1_red, p2_red, d_red = p1 ÷ g_common, p2 ÷ g_common, d ÷ g_common
-                        shin_val_reduced = shin(A_lookup, rho_bf_base, [p1_red, p2_red], d_red)
-                        println("  [reduction diagnostic] gcd(p1,p2,d) = ", g_common,
-                                "  reduced point = [", p1_red, ",", p2_red, "]/", d_red)
-                        println("  [reduction diagnostic] shin(unreduced [", p1, ",", p2, "]/", d, ") = ",
-                                shin_val_lookup)
-                        println("  [reduction diagnostic] shin(reduced   [", p1_red, ",", p2_red, "]/", d_red, ") = ",
-                                shin_val_reduced)
-                        println("  [reduction diagnostic] |diff| = ", abs(shin_val_lookup - shin_val_reduced))
-                        match_idx_red = findfirst(
-                            e -> e !== nothing && abs(e.shin_value - shin_val_reduced) < ray_class_lookup_tol,
-                            ray_class_lookup_table_local)
-                        println("  [reduction diagnostic] does the REDUCED value match the table? ",
-                                match_idx_red !== nothing)
-
-                        # Closest-match diagnostic: distinguishes "some table
-                        # entry has a wrong stored value near this one" (a
-                        # near-miss, small gap) from "no entry anywhere close"
-                        # (a genuine gap in what the table computed for this
-                        # class, despite no `nothing` slots).
-                        valid_idxs = findall(e -> e !== nothing, ray_class_lookup_table_local)
-                        gaps = [abs(ray_class_lookup_table_local[i].shin_value - shin_val_lookup) for i in valid_idxs]
-                        closest_pos = argmin(gaps)
-                        closest_i = valid_idxs[closest_pos]
-                        closest_entry = ray_class_lookup_table_local[closest_i]
-                        println("  [closest-match diagnostic] smallest gap to any table entry = ", gaps[closest_pos])
-                        println("  [closest-match diagnostic] closest entry: J = ", closest_entry.J,
-                                "  s1 = ", closest_entry.s1, "  s2 = ", closest_entry.s2,
-                                "  rho_B = ", closest_entry.rho_B,
-                                "  shin_value = ", closest_entry.shin_value)
-
-                        # Conjugate-symmetry diagnostic: the covariance
-                        # theorem's det(R)=-1 branch gives
-                        # shin^{...}_{...}(R.beta) = shin^r_A(conj(beta)),
-                        # not shin^r_A(beta) - so if [p1,p2]'s true matching
-                        # class is only reachable via such an R, its stored
-                        # table value would match conj(shin_val_lookup), not
-                        # shin_val_lookup itself. The table's own duplicate
-                        # pairs (found separately via check_table_duplicates)
-                        # are consistent with exactly this det=-1 symmetry
-                        # already being present INSIDE the table; this checks
-                        # whether the SAME symmetry, applied to the lookup
-                        # side, recovers a match.
-                        shin_val_conj = conj(shin_val_lookup)
-                        match_idx_conj = findfirst(
-                            e -> e !== nothing && abs(e.shin_value - shin_val_conj) < ray_class_lookup_tol,
-                            ray_class_lookup_table_local)
-                        println("  [conjugate diagnostic] conj(shin_val_lookup) = ", shin_val_conj)
-                        println("  [conjugate diagnostic] does conj(shin_val_lookup) match the table? ",
-                                match_idx_conj !== nothing)
-                        if match_idx_conj !== nothing
-                            e_conj = ray_class_lookup_table_local[match_idx_conj]
-                            println("  [conjugate diagnostic] matching entry: J = ", e_conj.J,
-                                    "  s1 = ", e_conj.s1, "  s2 = ", e_conj.s2,
-                                    "  rho_B = ", e_conj.rho_B)
-                        end
-                    else
-                        println("  [reduction diagnostic] gcd(p1,p2,d) = 1 - this point is already ",
-                                "primitive, reduction is not the explanation here")
-                    end
-
-                    # Unit-residue test: the point p corresponds to the
-                    # element x_p = p2*rho - p1 of the lattice I = Z+Z*rho. A
-                    # modulus-d ray class (group) exists for x_p ONLY if x_p is
-                    # a unit mod d in I/(d*I), i.e. gcd(N(x_p)/N(I), d) == 1.
-                    # Non-unit points have no GROUP class - they are the extra
-                    # classes of the ray class MONOID Cl^♭ (KFA (2.55)), which
-                    # the group-built lookup table does not contain. They are
-                    # handled below by the direct route (nonunit_point = true)
-                    # instead of via U_elem1/J_bj.
-                    x_p = K(p2) * rho - K(p1)
-                    I_rho_p = fractional_ideal(O, [K(1), rho])
-                    rel_p = QQ(abs(norm(x_p))) / QQ(norm(I_rho_p))
-                    is_unit_p = isone(denominator(rel_p)) && gcd(Int(numerator(rel_p)), d) == 1
-                    println("  [unit diagnostic] x_p = p2*rho - p1 = ", x_p,
-                            "  N(x_p)/N(I) = ", rel_p, "  -> x_p is a UNIT mod d? ", is_unit_p)
-                    if is_unit_p
-                        # A unit point DOES have a modulus-d ray class, so its
-                        # value should be in the group table. Its absence is
-                        # evidence the group enumeration is incomplete (e.g.
-                        # some of its N "distinct" classes are repeats). The
-                        # direct route below is valid for every point, so
-                        # record the evidence and continue rather than abort.
-                        println("  [WARNING] p=(", p1, ",", p2, ") is a UNIT point but its shin value ",
-                                "is NOT in the group table - the group enumeration is missing this ",
-                                "class. Proceeding via the direct route (valid for all points).")
-                    else
-                        println("  [non-unit point] p=(", p1, ",", p2, "): no modulus-", d,
-                                " ray class (monoid class only) - using the direct route: ",
-                                "elem1 := x_p + d*n (totally positive), rho_j := rho_B, ",
-                                "s_bj := coords of product.")
-                    end
-                end
-                nonunit_point = (match_idx === nothing)
-                if nonunit_point
-                    # Shift x_p by a multiple of d (same residue mod d*I, so the
-                    # same class) to make it TOTALLY POSITIVE (both real
-                    # places): the table's representatives are conj-positive
-                    # (elem1 = d*elem2 with conj(elem2) > 0) AND represent the
-                    # class (x_p mod m, +) at the Sigma place, so both signs
-                    # must be positive to land in the same class.
-                    conj_v = Float64(real(emb_conj_K(x_p)))
-                    main_v = Float64(real(emb_main_K(x_p)))
-                    n_shift = max(0, Int(ceil((-min(conj_v, main_v) + 1) / d)))
-                    elem1 = x_p + K(d * n_shift)
-                    lookup_entry = nothing
+                    # PROJECT OWNER ALGORITHM: a lookup miss against the
+                    # (verified-complete) 288-entry GROUP table means the
+                    # target shin value comes from the ray class MONOID
+                    # Jbar_m^flat(O), not the group. Dynamically enumerate
+                    # elements of Jbar_m^flat(O) (see ray_class_monoid_lookup's
+                    # own docstring for the exact algorithm and the verbatim
+                    # S_m / J_m^*(O) / Jbar_m^flat(O) definitions this is
+                    # built from), growing `monoid_table` in place so later
+                    # lookups (other points, other twists) reuse work already
+                    # done here instead of re-searching from scratch.
+                    println("  [monoid lookup] shin^{[$p1,$p2]}_A(rho) = ", shin_val_lookup,
+                            " not in the group table - searching Jbar_m^flat(O)...")
+                    mres = ray_class_monoid_lookup(F, shin_val_lookup;
+                                                    sd = (D = D, q = q_val, d = d, K = K, O = O,
+                                                          P_O = P_O, mP_O = mP_O, rho_reps = rho_reps,
+                                                          d_check = d_check),
+                                                    rho_base = rho,
+                                                    p_query = (p1, p2),
+                                                    group_table = ray_class_lookup_table_local,
+                                                    known_monoid_entries = monoid_table,
+                                                    candidate_cache = candidate_cache,
+                                                    class_hints = class_hints,
+                                                    tol = ray_class_lookup_tol)
+                    append!(monoid_table, mres.new_entries)
+                    mres.found ||
+                        error("elem1 lookup: shin^{[", p1, ",", p2, "]}_A(rho) = ", shin_val_lookup,
+                              " not found anywhere in Jbar_m^flat(O) within the search bound - ",
+                              "either the bound needs raising, or something upstream is wrong")
+                    lookup_entry = mres.entry
                 else
                     lookup_entry = ray_class_lookup_table_local[match_idx]
-                    elem1 = K(d) * (K(lookup_entry.s2) * lookup_entry.rho_B - K(lookup_entry.s1))
                 end
+                elem1 = K(d) * (K(lookup_entry.s2) * lookup_entry.rho_B - K(lookup_entry.s1))
 
                 # Per project owner: if the per-rho_j search below is fully
                 # exhausted for a given rho_B/s1/s2, that doesn't necessarily
@@ -2416,32 +2417,31 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     # determined here (no candidate search/exclusion at
                     # this level) - the only remaining retry axis is the
                     # outer rho_B_attempt loop above.
+                    # rho_j construction (per project owner): lookup_entry
+                    # is now ALWAYS populated - either from the static
+                    # 288-entry group table, or (on a miss) from the
+                    # dynamically-grown Jbar_m^flat(O) monoid search above -
+                    # so this single construction is correct for every
+                    # point, unit or non-unit. Let U_elem1 be the ray class
+                    # ideal used to build THIS point's elem1, b_j :=
+                    # [J*U_elem1] in Pic(O), and find alpha_bj, rho_j,
+                    # s1_bj, s2_bj via find_alpha_rhoB_s1_s2_O so that
+                    # b_j^{-1}*d*O = alpha_bj*(Z*rho_j+Z) (passing J*U_elem1
+                    # itself as the "J" argument gives exactly this, since
+                    # find_alpha_rhoB_s1_s2_O's own internal b_O is always
+                    # [input]^{-1}). rho_j is UNIQUELY determined here (no
+                    # candidate search/exclusion at this level) - the only
+                    # remaining retry axis is the outer rho_B_attempt loop.
                     local alpha_bj, rho_j_raw, s1_bj, s2_bj
-                    if nonunit_point
-                        # Direct (monoid) route: (x_p) is principal, so the
-                        # twisted class J*(x_p) is in J's own Picard fiber:
-                        # rho_j = rho_B_cur (J's fiber root). Its s-vector is
-                        # the coordinates of product = elem1*elem2 in the
-                        # (rho_j, 1) basis (product = s2_bj*rho_j - s1_bj) -
-                        # for unit points this coincides, up to the <eps>
-                        # orbit, with what find_alpha_rhoB_s1_s2_O(J*U_elem1)
-                        # returns.
-                        rho_j_raw = rho_B_cur
-                        alpha_bj = nothing
-                        s2_bj, s1_bj = find_rho_j_and_coords(product, rho_j_raw)
-                        println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt] [non-unit]: rho_j = ", rho_j_raw,
-                                "  s1_bj = ", s1_bj, "  s2_bj = ", s2_bj)
-                    else
-                        U_elem1 = lookup_entry.J
-                        J_bj = J * U_elem1
-                        u_Bj = mP_O \ J_bj
-                        rho_Bj_init = rho_reps[u_Bj]
-                        alpha_bj, rho_j_raw, s1_bj, s2_bj = find_alpha_rhoB_s1_s2_O(
-                            J_bj, rho_Bj_init, rho_Bj_init, u_Bj, P_O, mP_O, O, K,
-                            d, rho_Bj_init, d_check; mn_height = 3000, q_gen_height = 3000)
-                        println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: rho_j = ", rho_j_raw,
-                                "  alpha_bj = ", alpha_bj, "  s1_bj = ", s1_bj, "  s2_bj = ", s2_bj)
-                    end
+                    U_elem1 = lookup_entry.J
+                    J_bj = J * U_elem1
+                    u_Bj = mP_O \ J_bj
+                    rho_Bj_init = rho_reps[u_Bj]
+                    alpha_bj, rho_j_raw, s1_bj, s2_bj = find_alpha_rhoB_s1_s2_O(
+                        J_bj, rho_Bj_init, rho_Bj_init, u_Bj, P_O, mP_O, O, K,
+                        d, rho_Bj_init, d_check; mn_height = 3000, q_gen_height = 3000)
+                    println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: rho_j = ", rho_j_raw,
+                            "  alpha_bj = ", alpha_bj, "  s1_bj = ", s1_bj, "  s2_bj = ", s2_bj)
 
                     rho_j_bf_raw = BigFloat(coeff(rho_j_raw, 0)) + BigFloat(coeff(rho_j_raw, 1)) * sqrt(BigFloat(D))
                     L_bj = hj_automorph_for_root(rho_j_raw, D; max_u = elem1_max_u)
@@ -4511,6 +4511,1272 @@ function check_nonunit_shift_invariance(d::Int; p1::Union{Int,Nothing} = nothing
 end
 
 """
+    PROJECT OWNER DEFINITIONS (verbatim - load-bearing, do not paraphrase):
+
+    For an ideal m of O:
+        S_m := {alpha in O : alpha*O + m = O}
+        J_m^*(O) := {invertible fractional ideals of O coprime to m}
+        Jbar_m^flat(O) := {a in J^*_O(O) : a*O[S_m^{-1}] subseteq O[S_m^{-1}]}
+
+    (Note: J^*_O(O) in the last line, as given, is its own object - the
+    invertible fractional ideals of O - distinct from J_m^*(O) above; this
+    is deliberate notation from the project owner, not a typo.)
+
+    CORRECTION (project owner, after an earlier version of this code only
+    ever enumerated INTEGRAL a): the enumeration below must exhaust ALL of
+    J^*_O(O) by height, fractional ideals included, not just integral ones.
+
+    Construction used here, and why it is both correct and fully general
+    (derived jointly with the project owner):
+      a in Jbar_m^flat(O) iff EXISTS s in S_m with s*a subseteq O (unwinding
+      the S_m^{-1}-localization definition directly). So:
+        - NECESSARY: every a in Jbar_m^flat(O) can be written as
+          a = a_int/(beta) with a_int := s*a integral and beta := s in S_m,
+          for SOME such s.
+        - SUFFICIENT: conversely, for ANY integral a_int and ANY beta in
+          S_m, a := a_int/(beta) satisfies beta*a = a_int subseteq O, so
+          a in Jbar_m^flat(O) automatically - no further check needed.
+      Hence enumerating a := P_i*(alpha)*(beta)^{-1} for alpha in O
+      (arbitrary) and beta in S_m (tested via the SAME reliable ideal-sum
+      method already used elsewhere in this file for integral-ideal
+      coprimality, isone(ideal(O,beta)+m) - NOT via valuation/factorization,
+      which is delicate exactly at primes dividing O's own conductor, e.g.
+      q=3 here) is BOTH guaranteed to stay inside Jbar_m^flat(O) AND
+      exhausts all of it as alpha, beta range over growing height bounds.
+"""
+function is_beta_in_S_m(beta, O, m_ideal)
+    return isone(ideal(O, beta) + m_ideal)
+end
+# NOTE: no longer called by ray_class_monoid_lookup (see that function's
+# docstring, section "WHY THE beta/FRACTIONAL DIMENSION WAS DROPPED"). Left
+# defined since it documents part of the Section-1 criterion derivation and
+# may still be useful for independent verification.
+
+"""
+    ray_class_monoid_lookup(F, target_shin_val; sd, rho_base, p_query,
+                             group_table, known_monoid_entries,
+                             candidate_cache, tol, initial_norm_bound,
+                             max_norm_bound, verbose)
+
+Implements the project owner's algorithm for extending the ray class table
+into the monoid Jbar_m^flat(O) on a lookup miss. Matching is by shin VALUE,
+per the project owner's original specification - see the retraction note
+below for why an exact-grid-point shortcut that was here for one revision
+has been removed again. `rho_base` (= rho_reps[F_class] for the caller's
+AdmissibleTuple) is REQUIRED, either passed explicitly or derivable from a
+full `sd` - see the BUGFIX note below for why. `p_query = (p1,p2)` is
+optional and enables the "direct candidate" pre-check described further
+down (also new, requested separately from the rho_base fix).
+
+THE ALGORITHM (unchanged in spirit from the project owner's specification):
+  1. A lookup miss means the target shin value comes from the monoid part,
+     not the (already-verified, 288-entry) group part.
+  2. Enumerate elements of Jbar_m^flat(O), ordered by height (norm) of the
+     generators.
+  3. For each candidate `a` (skipping ones already tried), compute its shin
+     value via the SAME Theorem 2.19 machinery used to build the 288-entry
+     group table (find_alpha_rhoB_s1_s2_O + shin).
+  4. If that value already appears in the table (group entries, or monoid
+     entries already found this call or a PRIOR call), discard `a` for good.
+     Otherwise, record it as a new table entry (even if it doesn't match the
+     target).
+  5. Stop as soon as a computed value matches the target, or the norm bound
+     is exhausted (error / return not-found).
+
+WHY THE beta / FRACTIONAL DIMENSION WAS DROPPED
+  The first implementation (this session) enumerated
+      a := P_i * (alpha) * (beta)^{-1},   alpha in O arbitrary, beta in S_m,
+  per the project owner's mid-session correction that fractional candidates
+  are needed. The timing probe (diagnose_monoid_timing) showed EVERY
+  candidate with non-unit beta (i.e. every candidate where `a` was genuinely
+  fractional) exhausted the entire inner search bound of
+  find_alpha_rhoB_s1_s2_O and threw, at ~2-2.6s each - this is the actual
+  mechanism behind the multi-hour hang, not raw candidate volume. The
+  reason is structural, not a bug to patch: Theorem 2.19 requires
+  alpha(r2*rho-r1) IN b, and since b*m = alpha(rho*Z+Z) with m = d*O
+  principal, that condition is EXACTLY r in (1/d)Z^2, which forces
+      a_r = alpha(r2*rho-r1)*b^{-1}   to be INTEGRAL, always.
+  A genuinely fractional `a` is simply outside the image of 2.19's own
+  parametrization, so no amount of raising mn_height/q_gen_height can ever
+  make find_alpha_rhoB_s1_s2_O succeed on one - the failures are permanent,
+  not merely slow.
+  Separately, fractional candidates are also unnecessary: writing the
+  Section-1 criterion as "den(a) + m = O", choose (by CRT) s congruent to 1
+  mod m with s in den(a); then s in S_m and s*a is INTEGRAL. Applying the
+  ~_{m,Sigma} definition with c = a, alpha_e = s, beta_e = 1 gives
+  alpha_e - beta_e = s-1 in m*O[S_m^{-1}] automatically, and the Sigma sign
+  is fixable by shifting s within m*den(a) (a full-rank lattice, so this
+  never runs out of room) - so a ~ s*a, an INTEGRAL representative. Every
+  monoid class has one.
+  CONSEQUENCE: dropping beta does not just fix the hang, it is also
+  necessary - the beta-bearing candidates could never have contributed a
+  match in the first place.
+
+  This does NOT mean the earlier "integral-only, a = P_i*(alpha)" attempt
+  (which the project owner corrected mid-session) was right as originally
+  written - it was incomplete for a DIFFERENT reason: for a fixed integral
+  P_i representing class [P_i], "P_i*(alpha), alpha in O" only reaches
+  integral ideals b in that class for which b*P_i^{-1} happens to be
+  generated by an ALGEBRAIC INTEGER alpha - it silently misses integral b
+  for which the connecting element is a genuinely fractional field element
+  (P_i^{-1} is a fractional ideal in general, so this is a real gap, not a
+  hypothetical one). The fix here is not to reintroduce a fractional `a`,
+  but to reparametrize INTEGRAL ideals correctly:
+      Q_i  :=  an INTEGRAL ideal representing class [P_i]^{-1},
+      a    :=  (alpha) * Q_i^{-1},   alpha ranging over Q_i itself (not O).
+  This is exhaustive: for ANY integral b in class [P_i], b*Q_i is principal
+  (product of inverse classes) AND integral (product of two integral
+  ideals), so b*Q_i = (alpha) for some alpha in O - and since (alpha)
+  subseteq Q_i (as b subseteq O), alpha automatically lies in Q_i. So
+  restricting the alpha-search to Q_i's own lattice (rather than all of O)
+  is exactly the right restriction, not merely an efficiency trick: it is
+  what makes the enumeration correct, complete, AND (as a bonus) always
+  integral by construction - N(a) = N(alpha)/N(Q_i) is an integer for every
+  alpha in Q_i, with no separate coprimality or integrality check needed.
+  Q_i^{-1} is computed via the conj(Q_i)/N(Q_i) identity (the same
+  avoid-Hecke's-inv() trick already used elsewhere in this file for J_inv),
+  not via Hecke's inv(), per this project's standing caution about inv()
+  on ideals of a non-maximal order.
+
+TWO BUGS FOUND AFTER Q_i WAS INTRODUCED, BOTH FIXED
+  Bug 1 - Q_i via the wrong lookup. The first version of this fix fetched
+  Q_i via mP_O(-g), i.e. whatever ideal Hecke happens to store as ITS OWN
+  representative of the negated class - with no reason to expect that
+  ideal's norm relates to class_ideals[i]'s norm at all. For this project's
+  own d=21 example the four class norms are 1, 175, 30625, 5359375; if a
+  CHEAP class's inverse happened to be the ~5.36 MILLION-norm one, the
+  (then N(Q_i)-scaled) search blew up for that class every round, forever.
+  FIXED by building Q_i directly as conj(class_ideals[i]) (the same
+  P*conj(P)=N(P)*O identity already used for J_inv), which guarantees
+  N(Q_i) = N(class_ideals[i]) exactly - no separate, uncorrelated lookup.
+  Bug 2 - searching Q_i's RAW (unreduced) basis. Even after bug 1, the
+  search still hung on p=(0,3). Cause: Hecke's own basis(Q_i) is typically
+  an HNF-style <N, b+w> pair, where the plain-integer generator N has norm
+  N^2 - astronomically larger than Q_i's own minimal elements for a
+  several-million-norm ideal, and it dominates any c1*w1+c2*w2 combination
+  with c1 != 0. Almost the entire (c1,c2) grid produced useless,
+  astronomically-large-normed alpha, and only the 1-dimensional c1=0 slice
+  ever reached small N(a). FIXED by Gauss/Lagrange-reducing Q_i's basis
+  first (`lattice_reduce_2d`, extracted as a standalone helper from the
+  SAME reduction find_alpha_rho_direct already performs on its own search
+  basis - which is exactly why THAT search can use a small, fixed
+  coordinate bound regardless of the ideal's norm). After reduction, no
+  N(Q_i)-dependent scaling of the search bound is needed at all - a fixed
+  bound (scaled by norm_bound alone, matching find_alpha_rho_direct's own
+  mn_height pattern) suffices for every class.
+
+RETRACTED: EXACT GRID-POINT MATCHING
+  A previous revision of this function accepted an optional `target_p`
+  argument and matched candidates against the query's own (p1,p2) as exact
+  integers, on the reasoning that a matching candidate's native grid
+  coordinates should equal the query's. On reflection this was not
+  established - there is a separate `gp = [p1, mod(NJ*Ng*p2,d)]` transform
+  at the call site suggesting the true correspondence involves more than
+  the identity map, and shipping an unverified shortcut risked either a
+  false match or silent extra overhead for no benefit. Reverted to pure
+  shin-value matching, which is both what the project owner's algorithm
+  specifies and what the covariance theorem actually justifies.
+
+CROSS-CALL CANDIDATE CACHE
+  Every call used to restart its enumeration from norm 0, recomputing
+  find_alpha_rhoB_s1_s2_O + shin for the same cheap, low-norm candidates on
+  EVERY lookup miss across a whole run (e.g. test_all_twists makes hundreds
+  of calls). `candidate_cache` (keyed by (class_idx, c1, c2), the alpha
+  coordinates relative to Q_i's own basis) persists the full computed result
+  for a candidate across calls, so only genuinely new candidates ever pay
+  the find_alpha_rhoB_s1_s2_O cost. Pass the SAME Dict on every call (e.g.
+  built once in test_all_twists alongside monoid_table) to get the reuse;
+  defaults to a fresh, call-local Dict if omitted.
+
+DIRECT CANDIDATE PRE-CHECK (new, `p_query`)
+  Requested separately from the rho_base fix. Before paying for the full
+  enumeration, tests the ONE natural candidate directly implied by the
+  query point itself:
+      J_direct = (p2*rho_base - p1) * (Z*rho_base + Z)^{-1}.
+  This CANNOT be assumed to be where the target value actually comes from -
+  that is exactly why the enumeration exists at all - so it is constructed
+  and run through the SAME find_alpha_rhoB_s1_s2_O search as every other
+  candidate, not special-cased. If it DOES reproduce the target value, a
+  "GOT LUCKY" message is printed (this point needed no enumeration at all -
+  worth knowing explicitly, not silently accepting), and it is returned as
+  the match. If it succeeds but does NOT match, it is still recorded into
+  `new_entries` like any other examined candidate. If it fails outright
+  (find_alpha_rhoB_s1_s2_O throws, or the resulting s1/s2 don't have
+  denominator exactly d), it is silently skipped and the normal enumeration
+  proceeds - failure here says nothing about whether the target is
+  reachable at all, only that THIS ONE candidate wasn't it.
+  Only run when `p_query = (p1,p2)` is supplied; omitted by default.
+
+PERFORMANCE FIX: PER-CLASS find_alpha_rhoB_s1_s2_O CACHING (`class_hints`)
+  Three prior A/B timing probes (generator size, Hecke type, rho argument)
+  each disproved a hypothesis about find_alpha_rhoB_s1_s2_O's INPUTS, while
+  showing a clean PER-CLASS (not per-candidate) timing signature every time:
+  9-40s per candidate, identical across different candidates in the same
+  class, different across classes. Reading find_alpha_rhoB_s1_s2_O's own
+  internals (rather than guessing about its arguments further) found the
+  actual cause: its main path calls find_b_with_verified_principal_product,
+  an O(height^5)-cost quadruple-nested search whose result depends ONLY on
+  J's Picard class (per that function's own docstring comment) - exactly
+  matching the observed signature. find_alpha_rhoB_s1_s2_O already has a
+  fast path built for precisely this (alpha_hint/rho_B_hint/b_O_hint,
+  documented as existing so per-ray-class table builders pay this search
+  ONCE per Picard class), which this function was never using - every
+  candidate re-ran the full search from scratch even when several shared a
+  class. `class_hints` (via the local `find_with_class_cache` helper) now
+  caches (alpha, rho_B, b_O) per class: the FIRST candidate in a class pays
+  the full cost (plus one extra, deliberately redundant
+  find_b_with_verified_principal_product call to expose b_O, which
+  find_alpha_rhoB_s1_s2_O computes internally but does not return - this
+  mirrors the EXACT pattern already used elsewhere in this file,
+  ray_class_shin_table's `fiber_cache`, rather than risking a new subtle
+  mismatch by re-deriving alpha/rho_B independently), and every SUBSEQUENT
+  candidate in the same class uses the hint fast path.
+  find_alpha_rhoB_s1_s2_O's own signature is NOT modified by this fix.
+
+Returns (found::Bool, entry, new_entries) where entry is the NamedTuple
+(J, rho_B, s1, s2, shin_value) for the match (or `nothing`), and
+new_entries is every non-duplicate monoid entry discovered along the way
+(for the caller to persist and reuse across future lookups/calls).
+"""
+function ray_class_monoid_lookup(F::AdmissibleTuple, target_shin_val;
+                                  sd = nothing,
+                                  rho_base = nothing,
+                                  p_query::Union{Nothing, Tuple{Int,Int}} = nothing,
+                                  group_table = nothing,
+                                  known_monoid_entries::Vector = NamedTuple[],
+                                  candidate_cache::Dict = Dict{Tuple{Int,Int,Int}, Any}(),
+                                  class_hints::Dict = Dict{Any, NamedTuple}(),
+                                  tol::Float64 = 1e-10,
+                                  initial_norm_bound::Int = 50,
+                                  max_norm_bound::Int = 10^6,
+                                  verbose::Bool = true)
+    sdv = sd === nothing ? _ray_class_shin_setup(F) : sd
+    D, K, O, d, d_check = sdv.D, sdv.K, sdv.O, sdv.d, sdv.d_check
+    P_O, mP_O, rho_reps = sdv.P_O, sdv.mP_O, sdv.rho_reps
+    # NOTE ON THE FOLLOWING FIX: kept because it is still the argument-by-
+    # argument CORRECT call (matching the real call site exactly), but an
+    # A/B timing probe subsequently showed it does NOT explain the observed
+    # 9-40s-per-candidate slowness - WRONG (rho_a_init for all 3 roles) and
+    # RIGHT (rho_base for the 3rd/10th) timed identically. The actual cause,
+    # found by reading find_alpha_rhoB_s1_s2_O's own internals rather than
+    # guessing further about its arguments, is documented at the class_hints
+    # cache below.
+    #
+    # find_alpha_rhoB_s1_s2_O's 3rd and 10th positional arguments
+    # (both named `rho`/`rho_j` in its own signature) are NOT the per-class
+    # rho_B_init - they are `rho_reps[F_class]`, a SINGLE value fixed for
+    # the entire twisted_chi_general call, used identically regardless of
+    # which Picard class the ideal being processed belongs to (see the real
+    # call site: `find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, ...,
+    # d, rho, d_check)` - rho_B_init varies with J's class, `rho` does not).
+    # `rho_base` must be `rho_reps[F_class]` for the CURRENT AdmissibleTuple
+    # being twisted, i.e. the SAME value the caller (twisted_chi_general)
+    # already has in its own local `rho` variable - pass it through
+    # explicitly rather than trying to reconstruct F_class from `sd`, since
+    # the ad hoc NamedTuple twisted_chi_general builds for `sd` does not
+    # carry F_class.
+    rho_base === nothing && (rho_base = try rho_reps[sdv.F_class] catch; nothing end)
+    rho_base === nothing &&
+        error("ray_class_monoid_lookup: rho_base was not given and could not be derived from `sd` ",
+              "(pass rho_base = rho_reps[F_class] explicitly - see this function's BUGFIX note)")
+    tblv = group_table === nothing ? ray_class_shin_table_fast_quiet(F; shared_data = sdv) : group_table
+
+    seen_shin = Complex{BigFloat}[Complex{BigFloat}(e.shin_value) for e in tblv if e !== nothing]
+    for e in known_monoid_entries
+        push!(seen_shin, Complex{BigFloat}(e.shin_value))
+    end
+    is_dup(val) = any(v -> abs(v - val) < tol, seen_shin)
+
+    new_entries = NamedTuple[]
+
+    # ACTUAL FIX for the 9-40s-per-candidate slowness (found by reading
+    # find_alpha_rhoB_s1_s2_O's internals, after the rho-argument hypothesis
+    # above was disproven by direct A/B measurement):
+    # find_alpha_rhoB_s1_s2_O's main (non-hinted) path calls
+    # find_b_with_verified_principal_product, which runs a QUADRUPLE-NESTED
+    # coordinate search (O(height^5) cumulative cost) to find a coprime
+    # ideal I with J*I verifiably principal. Per that function's own
+    # docstring comment, its cost and result depend ONLY on J's Picard
+    # class, not on J itself - which exactly matches the observed timing
+    # signature (identical cost across different candidates IN the same
+    # class, different cost ACROSS classes). find_alpha_rhoB_s1_s2_O
+    # already has a fast path for exactly this situation - alpha_hint,
+    # rho_B_hint, b_O_hint - built so callers processing many ideals of the
+    # same class (e.g. a per-ray-class table) pay this search ONCE per
+    # class, then reuse the result. This function was never using that fast
+    # path at all - every single candidate re-ran the full O(height^5)
+    # search from scratch, even other candidates already known to share the
+    # same class. This is the SAME per-class caching pattern already
+    # established elsewhere in this file (ray_class_shin_table's
+    # `fiber_cache`), applied here via the generic hint mechanism instead of
+    # that function's own more specialized (gamma-based) shortcut, since
+    # this function's candidates don't share that specific J*(gamma)
+    # structure.
+    # class_hints is now a PARAMETER (see signature), not created fresh here,
+    # so it persists across calls when the caller threads the same Dict
+    # through repeatedly (test_all_twists does this alongside monoid_table
+    # and candidate_cache) - otherwise each new lookup call would re-pay the
+    # full per-class search cost the first time it happens to hit that class,
+    # even if an EARLIER call already paid it.
+
+    # Wraps find_alpha_rhoB_s1_s2_O with the class_hints cache above. For
+    # the FIRST candidate seen in a given class, runs the full (expensive)
+    # search and ALSO separately calls find_b_with_verified_principal_product
+    # to fish out b_O (which find_alpha_rhoB_s1_s2_O computes internally but
+    # does not expose) - this redundant second call for the anchor candidate
+    # ONLY mirrors the exact pattern already used at ray_class_shin_table's
+    # `fiber_cache` (see the FIXED comment near line 1520-1530: "find_b_with_
+    # verified_principal_product's search succeeds or fails identically for
+    # any two ideals differing by a principal factor"), rather than trying to
+    # be cleverer and risk a new subtle mismatch. Every SUBSEQUENT candidate
+    # in the same class uses the alpha_hint/rho_B_hint/b_O_hint fast path,
+    # skipping the expensive search entirely.
+    function find_with_class_cache(Jcand, u_cand)
+        if haskey(class_hints, u_cand)
+            hint = class_hints[u_cand]
+            return find_alpha_rhoB_s1_s2_O(
+                Jcand, rho_reps[u_cand], rho_base, u_cand, P_O, mP_O, O, K,
+                d, rho_base, d_check;
+                alpha_hint = hint.alpha, rho_B_hint = hint.rho_B, b_O_hint = hint.b_O)
+        else
+            result = find_alpha_rhoB_s1_s2_O(
+                Jcand, rho_reps[u_cand], rho_base, u_cand, P_O, mP_O, O, K,
+                d, rho_base, d_check)
+            b_O_found, _ = find_b_with_verified_principal_product(
+                O, K, Jcand, [ideal(O, d), ideal(O, d + 1)])
+            class_hints[u_cand] = (alpha = result[1], rho_B = result[2], b_O = b_O_found)
+            return result
+        end
+    end
+
+    # BUGFIX: entries returned by this function used to store `a`/`J_direct`
+    # directly - both built via `fractional_ideal(O, ...)`, so Hecke types
+    # them as AbsSimpleNumFieldOrderFractionalIdeal REGARDLESS of whether
+    # their denominator is 1, even though every candidate here IS
+    # mathematically integral by construction. twisted_chi_general takes the
+    # matched `lookup_entry.J` and later does `mP_O \ (J * U_elem1)` - and
+    # Hecke's disc_log_picard_group has NO method for fractional ideals, only
+    # genuine integral AbsSimpleNumFieldOrderIdeal objects (confirmed by a
+    # real MethodError from a live test_all_twists run, at exactly that
+    # call). The group table's own entries never hit this because they are
+    # built from genuine integral ideal objects throughout. Convert every
+    # `J` stored into an entry via `numerator()` so BOTH sources
+    # (group table and this monoid search) are type-consistent for whatever
+    # downstream code does with `lookup_entry.J`, rather than requiring every
+    # caller to defensively handle both possible types.
+    function to_integral_ideal(Jc)
+        isone(denominator(Jc)) || error("to_integral_ideal: candidate is not actually integral ",
+                                         "(denominator != 1) - this should be impossible by ",
+                                         "construction for every ideal this function produces")
+        return numerator(Jc)
+    end
+
+    picard_classes = collect(P_O)
+    n_classes = length(picard_classes)
+
+    # Q[i] represents the INVERSE of picard_classes[i], so that
+    # a := (alpha)*Q[i]^{-1}, alpha ranging over Q[i] itself, lands in class
+    # picard_classes[i] and is automatically integral - see the docstring
+    # section above for why this parametrization (as opposed to alpha
+    # ranging over all of O, or a beta denominator) is both correct and
+    # complete.
+    #
+    # BUGFIX: this used to fetch Q[i] via mP_O(-g), i.e. whatever ideal Hecke
+    # happens to store as ITS OWN chosen representative of the negated class.
+    # There is no reason that ideal's norm has anything to do with class_ideals[i]
+    # (= mP_O(g))'s norm - for this project's own d=21 example the four class
+    # norms are 1, 175, 30625, 5359375, and if a CHEAP class's inverse happens
+    # to be the ~5.36 MILLION-norm one, the coord_bound scaling below (which is
+    # keyed to N(Q[i])) blows up for that class on every single round of the
+    # norm_bound loop, forever - this is almost certainly what caused the
+    # observed multi-minute hang on p=(0,3).
+    # FIX: build Q[i] directly from class_ideals[i] itself via the conjugate-
+    # ideal identity P*conj(P) = N(P)*O (already used elsewhere in this file
+    # for J_inv), which GUARANTEES N(Q[i]) = N(class_ideals[i]) exactly - the
+    # same small/large norm the project owner's own timing data already
+    # characterizes, with no separate, uncorrelated lookup that can go wrong.
+    class_ideals = [mP_O(g) for g in picard_classes]
+    Pgens = [[_nf_elem_of(K, x) for x in basis(Pi)] for Pi in class_ideals]
+    NQ = [QQ(norm(Pi)) for Pi in class_ideals]                            # = N(Q[i]) = N(P[i])
+    Qgens_raw = [[quad_conj(K, g) for g in Pgens[i]] for i in 1:n_classes]  # RAW basis of Q[i] = conj(P[i])
+    # Q[i]^{-1} = conj(Q[i])/N(Q[i]) = conj(conj(P[i]))/N(P[i]) = P[i]/N(P[i]),
+    # so its generators are just P[i]'s OWN generators divided by N(P[i]) -
+    # no double conjugation, and (as before) no Hecke inv() call.
+    Qinv_gens = [[g // NQ[i] for g in Pgens[i]] for i in 1:n_classes]
+
+    # BUGFIX (second one, after the N(Q[i]) fix above still hung): Qgens_raw
+    # is Hecke's own, UNREDUCED basis for Q[i]. Ideal bases from Hecke are
+    # typically HNF-style <N, b+w> pairs, where the plain-integer generator N
+    # has norm N^2 - for a several-million norm ideal that is a many-orders-
+    # of-magnitude-larger vector than the ideal's own minimal elements, and it
+    # dominates any small-coefficient combination c1*w1+c2*w2 with c1 != 0.
+    # The result: almost the entire (c1,c2) coordinate grid produces
+    # astronomically large, useless alpha, and only the c1=0 axis (a
+    # 1-dimensional slice) ever reaches a small N(a) - which is exactly why
+    # the earlier N(Q[i])-scaled coord_bound (compensating for the WRONG
+    # problem) still hung on p=(0,3): it was scanning billions of doomed
+    # candidates for the expensive class(es).
+    # FIX: reduce Qgens_raw with lattice_reduce_2d BEFORE searching - the
+    # exact same reduction find_alpha_rho_direct already performs on its own
+    # search basis, and which is precisely why THAT search can use a small,
+    # FIXED coordinate bound regardless of the ideal's norm. After reduction,
+    # small integer coefficients correctly correspond to small-norm elements
+    # of Q[i], so no N(Q[i])-dependent scaling of the search bound is needed
+    # at all.
+    places = real_places(K)
+    Qgens = [collect(lattice_reduce_2d(Qgens_raw[i][1], Qgens_raw[i][2], K, places))
+             for i in 1:n_classes]
+
+    tried = [Set{Tuple{Int,Int}}() for _ in 1:n_classes]
+
+    # ---- EXTRA CHECK, requested by the project owner: before paying for the
+    # full enumeration, test the one NATURAL candidate directly implied by
+    # the query point itself: J_direct = (p2*rho_base - p1)*(Z*rho_base+Z)^{-1}.
+    # This CANNOT be assumed to be where the target value actually comes from
+    # (that's exactly why the enumeration search exists at all) - it has to
+    # be constructed and run through the SAME find_alpha_rhoB_s1_s2_O search
+    # as every other candidate to check. If it DOES hit, that is worth
+    # flagging explicitly ("got lucky") rather than silently accepting it,
+    # since it means this specific point didn't need the expensive search at
+    # all - if this turns out to hit often across many points, it would be
+    # a large, well-justified performance win (one find_alpha_rhoB_s1_s2_O
+    # call instead of dozens), but it is NOT something to rely on without
+    # this kind of explicit, per-point verification.
+    if p_query !== nothing
+        p1q, p2q = p_query
+        x_direct = K(p2q) * rho_base - K(p1q)
+        if !iszero(x_direct)
+            I_rho = fractional_ideal(O, [K(1), rho_base])
+            NI_rho = QQ(norm(I_rho))
+            # I_rho^{-1} = conj(I_rho)/N(I_rho) - same avoid-Hecke's-inv()
+            # identity used throughout this function for Q[i]^{-1}.
+            I_rho_inv_gens = [K(1) // NI_rho, quad_conj(K, rho_base) // NI_rho]
+            J_direct_gens = [x_direct * g for g in I_rho_inv_gens]
+            J_direct = fractional_ideal(O, J_direct_gens)
+
+            ok_direct = true
+            local rho_d, s1_d, s2_d, u_direct, J_direct_int
+            try
+                # J_direct's class: numerator(J_direct) has the SAME class as
+                # J_direct itself (they differ only by the principal ideal
+                # generated by the plain rational integer denominator(J_direct),
+                # which is trivial in the class group) - so this is a safe way
+                # to reach an INTEGRAL ideal for the discrete log, without
+                # assuming J_direct itself is integral.
+                den_direct = denominator(J_direct)
+                J_direct_int = isone(den_direct) ? J_direct : numerator(J_direct)
+                u_direct = mP_O \ J_direct_int
+                _, rho_d, s1_d, s2_d = find_with_class_cache(J_direct, u_direct)
+            catch
+                ok_direct = false
+            end
+
+            if ok_direct
+                rho_d_bf = BigFloat(coeff(rho_d, 0)) + BigFloat(coeff(rho_d, 1)) * sqrt(BigFloat(D))
+                L_d = hj_automorph_for_root(rho_d, D)
+                A_d, _ = stabilizer_power_in_Gamma_s(L_d, [s1_d, s2_d])
+                p1d, p2d = s1_d * d, s2_d * d
+                if isone(denominator(p1d)) && isone(denominator(p2d))
+                    val_direct = Complex{BigFloat}(
+                        shin(A_d, rho_d_bf, [Int(numerator(p1d)), Int(numerator(p2d))], d))
+                    if abs(val_direct - target_shin_val) < tol
+                        verbose && println("  [monoid lookup] GOT LUCKY: the direct candidate ",
+                                            "(p2*rho-p1)(Z*rho+Z)^{-1} for p=", p_query,
+                                            " matched the target on the FIRST try (class ",
+                                            u_direct, ", s1=", s1_d, ", s2=", s2_d, ") - no ",
+                                            "enumeration was needed for this point.")
+                        entry = (J = J_direct_int, rho_B = rho_d, s1 = s1_d, s2 = s2_d,
+                                shin_value = val_direct)
+                        if !is_dup(val_direct)
+                            push!(new_entries, entry)
+                            push!(seen_shin, val_direct)
+                        end
+                        return (found = true, entry = entry, new_entries = new_entries)
+                    elseif !is_dup(val_direct)
+                        # Not a match for THIS query, but it's a genuine,
+                        # newly-computed monoid value - record it the same
+                        # way any other examined-but-non-matching candidate
+                        # is recorded, so a later lookup can benefit from it.
+                        push!(new_entries, (J = J_direct_int, rho_B = rho_d, s1 = s1_d, s2 = s2_d,
+                                            shin_value = val_direct))
+                        push!(seen_shin, val_direct)
+                    end
+                end
+            end
+        end
+    end
+
+    norm_bound = initial_norm_bound
+    while norm_bound <= max_norm_bound
+        verbose && println("  [monoid lookup] trying norm bound (on N(a)): ", norm_bound)
+
+        candidates = Tuple{Int,Int,Int,Any}[]   # (class_idx, c1, c2, Na); Na is
+                                                  # whatever Hecke rational type
+                                                  # norm(alpha)//NQ[i] returns -
+                                                  # NOT Julia's Rational{BigInt}.
+        # FIXED coordinate bound, NOT scaled by N(Q[i]) - see the BUGFIX note
+        # above. After lattice_reduce_2d, this plays exactly the role
+        # find_alpha_rho_direct's mn_height plays for its own search.
+        coord_bound = max(5, Int(ceil(sqrt(Float64(norm_bound)))) * 3)
+        for i in 1:n_classes
+            w1, w2 = Qgens[i][1], Qgens[i][2]
+            for c1 in 0:coord_bound, c2 in (c1 == 0 ? 1 : -coord_bound):coord_bound
+                # c1 > 0, or (c1==0 and c2>0): (c1,c2) and (-c1,-c2) generate
+                # the same principal ideal (alpha) = (-alpha), hence the same
+                # `a` - skip the redundant mirror instead of computing it twice.
+                (c1, c2) in tried[i] && continue
+                alpha = K(c1) * w1 + K(c2) * w2
+                Nalpha = abs(norm(alpha))
+                iszero(Nalpha) && continue
+                Na = Nalpha // NQ[i]
+                Na > norm_bound && continue
+                push!(candidates, (i, c1, c2, Na))
+            end
+        end
+        sort!(candidates, by = x -> x[4])
+        verbose && println("    candidates to check: ", length(candidates))
+
+        for (i, c1, c2, Na) in candidates
+            push!(tried[i], (c1, c2))
+
+            cached = get(candidate_cache, (i, c1, c2), nothing)
+            local a, rho_a, s1_a, s2_a, val
+            if cached !== nothing
+                a, rho_a, s1_a, s2_a, val = cached
+            else
+                w1, w2 = Qgens[i][1], Qgens[i][2]
+                alpha = K(c1) * w1 + K(c2) * w2
+                a_gens = [alpha * g for g in Qinv_gens[i]]
+                # RETRACTED (confirmed wrong by an A/B timing probe): reducing
+                # a's own generators via lattice_reduce_2d before construction
+                # was tried here on the hypothesis that unreduced coefficients
+                # in `a`'s representation (not its norm) were behind the
+                # observed 9-21s-per-candidate find_alpha_rhoB_s1_s2_O timings.
+                # diagnose_monoid_lookup_v2_timing's RAW-vs-RED comparison
+                # showed IDENTICAL timing either way across every candidate in
+                # every class - the hypothesis was wrong, so the reduction was
+                # removed again rather than left as dead-weight "fix" that
+                # doesn't do anything. See diagnose_monoid_lookup_v2_timing's
+                # current docstring for the hypothesis now being tested
+                # instead (FractionalIdeal-typed `a` vs a genuine integral
+                # ideal object via numerator(a)).
+                a = fractional_ideal(O, a_gens)
+
+                # u_a is known for free: multiplying/dividing by the
+                # PRINCIPAL ideal (alpha) never changes ideal class, so a's
+                # class is exactly picard_classes[i] - no discrete log
+                # needed (mP_O \ a would fail here anyway: Hecke's
+                # disc_log_picard_group has no method for fractional ideals,
+                # and this construction guarantees `a` is integral, but
+                # `a*Q[i]` being the actual verifying step is not repeated
+                # per-candidate here since it follows from the construction).
+                u_a = picard_classes[i]
+                ok = true
+                try
+                    _, rho_a, s1_a, s2_a = find_with_class_cache(a, u_a)
+                catch
+                    ok = false
+                end
+                ok || continue
+
+                rho_a_bf = BigFloat(coeff(rho_a, 0)) + BigFloat(coeff(rho_a, 1)) * sqrt(BigFloat(D))
+                L_a = hj_automorph_for_root(rho_a, D)
+                A_a, _ = stabilizer_power_in_Gamma_s(L_a, [s1_a, s2_a])
+                p1_exact, p2_exact = s1_a * d, s2_a * d
+                (isone(denominator(p1_exact)) && isone(denominator(p2_exact))) || continue
+                p_vec_a = [Int(numerator(p1_exact)), Int(numerator(p2_exact))]
+                val = Complex{BigFloat}(shin(A_a, rho_a_bf, p_vec_a, d))
+
+                candidate_cache[(i, c1, c2)] = (a, rho_a, s1_a, s2_a, val)
+            end
+
+            # NOTE: the exact-grid-point-match shortcut (target_p) from the
+            # previous revision has been REMOVED. It assumed a matching
+            # candidate's own native grid coordinates would equal the query's
+            # (p1,p2) directly - on reflection this isn't justified (there is
+            # a separate gp = [p1, mod(NJ*Ng*p2,d)] transform nearby at the
+            # call site suggesting the real correspondence isn't the
+            # identity), and I'd rather match purely on the shin VALUE, which
+            # is what the project owner's algorithm actually specifies and
+            # what the covariance theorem actually guarantees, than risk a
+            # confidently-wrong shortcut.
+            is_dup(val) && continue
+
+            entry = (J = to_integral_ideal(a), rho_B = rho_a, s1 = s1_a, s2 = s2_a, shin_value = val)
+            push!(new_entries, entry)
+            push!(seen_shin, val)
+
+            if abs(val - target_shin_val) < tol
+                verbose && println("  [monoid lookup] MATCH found (shin value): J = ", a,
+                                    "  class ", i, "  s1 = ", s1_a, "  s2 = ", s2_a)
+                return (found = true, entry = entry, new_entries = new_entries)
+            end
+        end
+
+        norm_bound *= 4
+    end
+
+    verbose && println("  [monoid lookup] exhausted max_norm_bound = ", max_norm_bound,
+                        " without a match")
+    return (found = false, entry = nothing, new_entries = new_entries)
+end
+
+
+"""
+    diagnose_monoid_enumeration(d::Int; norm_bound = 6, p1 = 0, p2 = 3,
+                                 max_candidates = 400, mn_height = 400,
+                                 q_gen_height = 400)
+
+CHEAP PROBE (minutes, not hours) answering one question: does the
+`a = P_i*(alpha)*(beta)^{-1}` enumeration inside `ray_class_monoid_lookup`
+actually produce genuinely NEW shin values, or does it just re-derive the
+same handful of values over and over?
+
+Motivation / the concern being tested: `find_alpha_rhoB_s1_s2_O`'s output
+`(alpha, rho_B, s1, s2)` is believed to depend only on the IDEAL CLASS of
+its input (this is exactly why the group-table builder caches it per Picard
+class in `alpha_rhoB_bO_cache`). But `a = P_i*(alpha)*(beta)^{-1}` always
+lies in the SAME class as `P_i`, because (alpha) and (beta) are principal.
+If that belief is right, then every candidate in a given class collapses to
+ONE shin value, the whole enumeration only ever yields ~4 distinct values
+(one per Picard class), all of which are already in the group table - and
+`ray_class_monoid_lookup` can never terminate with a match no matter how
+long it runs. This probe measures that directly.
+
+Prints, for a small norm bound:
+  - how many (alpha,beta,class) candidates were built,
+  - how many were actually evaluated (capped by `max_candidates`),
+  - the number of DISTINCT (rho_B, s1, s2) triples seen,
+  - the number of DISTINCT shin values seen, grouped, with how many
+    candidates produced each,
+  - for each distinct shin value, whether it is ALREADY in the 288-entry
+    group table,
+  - and whether the target value (the one p=(p1,p2) actually needs) appeared.
+
+Interpretation:
+  * "distinct shin values" ~= number of Picard classes (~4), all already in
+    the group table  =>  CONFIRMS the construction is wrong (not merely
+    slow): it cannot produce the missing monoid values, so no amount of
+    optimization or a bigger bound will help. The Theorem-2.19 entry point
+    for the monoid case needs to be something other than a class-only
+    `find_alpha_rhoB_s1_s2_O(a, ...)` call.
+  * many distinct values, some NOT in the group table  =>  the construction
+    is sound and the problem really is just performance/bounds.
+"""
+function diagnose_monoid_enumeration(d::Int; norm_bound::Int = 6,
+                                      p1::Int = 0, p2::Int = 3,
+                                      max_candidates::Int = 400,
+                                      mn_height::Int = 400,
+                                      q_gen_height::Int = 400,
+                                      tol::Float64 = 1e-10)
+    F = AdmissibleTuple(d)
+    sd = _ray_class_shin_setup(F)
+    D, K, O, d_check = sd.D, sd.K, sd.O, sd.d_check
+    P_O, mP_O, rho_reps, F_class = sd.P_O, sd.mP_O, sd.rho_reps, sd.F_class
+    tbl = ray_class_shin_table_fast_quiet(F; shared_data = sd)
+    group_vals = Complex{BigFloat}[Complex{BigFloat}(e.shin_value) for e in tbl if e !== nothing]
+    in_group(v) = any(g -> abs(g - v) < tol, group_vals)
+
+    # The value p=(p1,p2) actually needs (same construction twisted_chi_general uses).
+    rho = rho_reps[F_class]
+    rho_bf = BigFloat(coeff(rho, 0)) + BigFloat(coeff(rho, 1)) * sqrt(BigFloat(D))
+    L_rho = hj_automorph_for_root(rho, D)
+    A_lookup, _ = stabilizer_power_in_Gamma_s(L_rho, [QQ(p1, d), QQ(p2, d)])
+    target = Complex{BigFloat}(shin(A_lookup, rho_bf, [p1, p2], d))
+    println("target shin^{[", p1, ",", p2, "]}_A(rho) = ", target)
+    println("  already in the 288-entry group table? ", in_group(target))
+    println("  (if true, there is no monoid problem for this point at all)")
+
+    dbar = mod(d, 2) == 1 ? d : 2 * d
+    m_ideal = ideal(O, dbar)
+    b1 = _nf_elem_of(K, basis(O)[1])
+    b2 = _nf_elem_of(K, basis(O)[2])
+    picard_classes = collect(P_O)
+    class_ideals = [mP_O(g) for g in picard_classes]
+    coord_bound = max(3, Int(ceil(sqrt(Float64(norm_bound)))) * 3)
+
+    betas = Tuple{Int,Int,Int}[]
+    for bi in -coord_bound:coord_bound, bj in -coord_bound:coord_bound
+        (bi == 0 && bj == 0) && continue
+        beta = K(bi) * b1 + K(bj) * b2
+        nb = abs(Int(norm(beta)))
+        (nb == 0 || nb > norm_bound) && continue
+        is_beta_in_S_m(beta, O, m_ideal) || continue
+        push!(betas, (bi, bj, nb))
+    end
+    alphas = Tuple{Int,Int,Int}[]
+    for ai in -coord_bound:coord_bound, aj in -coord_bound:coord_bound
+        (ai == 0 && aj == 0) && continue
+        alpha = K(ai) * b1 + K(aj) * b2
+        na = abs(Int(norm(alpha)))
+        (na == 0 || na > norm_bound) && continue
+        push!(alphas, (ai, aj, na))
+    end
+    println("\nnorm_bound = ", norm_bound, ": ", length(alphas), " alphas, ",
+            length(betas), " betas (in S_m), ", length(class_ideals), " classes",
+            "  => ", length(alphas) * length(betas) * length(class_ideals), " candidates")
+
+    triples = Dict{Any,Int}()          # (rho_B, s1, s2) -> count
+    valgroups = Tuple{Complex{BigFloat},Int,Any}[]   # (value, count, sample triple)
+    n_eval = 0; n_fail = 0
+    for ci in 1:length(class_ideals), (ai, aj, na) in alphas, (bi, bj, nb) in betas
+        n_eval >= max_candidates && break
+        alpha = K(ai) * b1 + K(aj) * b2
+        beta  = K(bi) * b1 + K(bj) * b2
+        a = class_ideals[ci] * ideal(O, alpha) * inv(ideal(O, beta))
+        u_a = picard_classes[ci]
+        rho_a_init = rho_reps[u_a]
+        local rho_a, s1_a, s2_a
+        try
+            _, rho_a, s1_a, s2_a = find_alpha_rhoB_s1_s2_O(
+                a, rho_a_init, rho_a_init, u_a, P_O, mP_O, O, K,
+                d, rho_a_init, d_check; mn_height = mn_height,
+                q_gen_height = q_gen_height)
+        catch
+            n_fail += 1; n_eval += 1; continue
+        end
+        n_eval += 1
+        key = (string(rho_a), string(s1_a), string(s2_a))
+        triples[key] = get(triples, key, 0) + 1
+
+        p1e, p2e = s1_a * d, s2_a * d
+        (isone(denominator(p1e)) && isone(denominator(p2e))) || continue
+        rho_a_bf = BigFloat(coeff(rho_a, 0)) + BigFloat(coeff(rho_a, 1)) * sqrt(BigFloat(D))
+        A_a, _ = stabilizer_power_in_Gamma_s(hj_automorph_for_root(rho_a, D), [s1_a, s2_a])
+        val = Complex{BigFloat}(shin(A_a, rho_a_bf,
+                                     [Int(numerator(p1e)), Int(numerator(p2e))], d))
+        hit = findfirst(g -> abs(g[1] - val) < tol, valgroups)
+        if hit === nothing
+            push!(valgroups, (val, 1, key))
+        else
+            v, c, k = valgroups[hit]
+            valgroups[hit] = (v, c + 1, k)
+        end
+    end
+
+    println("\ncandidates evaluated: ", n_eval, "  (find_alpha_rhoB_s1_s2_O failures: ", n_fail, ")")
+    println("DISTINCT (rho_B,s1,s2) triples seen: ", length(triples))
+    println("DISTINCT shin values seen:           ", length(valgroups))
+    println("\nper distinct shin value:")
+    for (v, c, k) in valgroups
+        println("  count=", c, "  in group table? ", in_group(v),
+                "  matches target? ", abs(v - target) < tol)
+        println("      (rho_B,s1,s2) = ", k)
+        println("      value = ", v)
+    end
+    n_new = count(g -> !in_group(g[1]), valgroups)
+    println("\n=== VERDICT ===")
+    println("distinct shin values NOT already in the group table: ", n_new)
+    if n_new == 0
+        println("  => the enumeration produced NO new values. This CONFIRMS the")
+        println("     a = P_i*(alpha)*(beta)^{-1} construction cannot reach the")
+        println("     missing monoid classes (it only ever varies the ideal")
+        println("     CLASS, which find_alpha_rhoB_s1_s2_O already collapses).")
+        println("     Optimizing / raising the bound will NOT help; the")
+        println("     Theorem-2.19 entry point for the monoid case needs to")
+        println("     change so the s-vector depends on `a` itself, not just [a].")
+    else
+        println("  => the enumeration DOES produce new values, so the construction")
+        println("     is sound and the issue is genuinely performance/bounds.")
+    end
+    return (target = target, valgroups = valgroups, triples = triples)
+end
+
+
+"""
+    diagnose_stuck_monoid_lookup(d::Int, p1::Int, p2::Int;
+                                  count_rounds::Int = 12,
+                                  per_candidate_seconds::Float64 = 0.4,
+                                  tol::Float64 = 1e-9)
+
+Written for a lookup that has been running for a long time without a match
+(observed: p=(0,18), d=21 - stuck past round 4 (norm bound 3200, 5905
+candidates) with no match yet). Answers two separate questions WITHOUT
+running the actual (expensive) search further:
+
+  1. Is there a CHEAP, direct match we're simply not trying? The brute-force
+     enumeration in `ray_class_monoid_lookup` only ever tries ONE
+     "natural" direct candidate up front (`p_query`, using the BASE fiber's
+     own root) before falling back to search - it never tries the analogous
+     natural candidate at the OTHER 3 Picard classes' own fibers. Per
+     Theorem 2.19, evaluating shin at EACH fiber's own root with THIS SAME
+     grid point r = (p1,p2)/d is exactly the value that fiber's own
+     (alpha, rho_B, b) triple would assign to the monoid class it defines at
+     r - a genuine, meaningful candidate for that fiber, not a coincidence.
+     This is precisely how EVERY unit-point group-table entry already
+     arises (some fiber's own natural point); this checks whether p=(0,18)
+     happens to be one of the (rarer, unit-point-style) cases where the SAME
+     coincidence holds for a non-unit point too. This is an O(4) check
+     (one per Picard class), taking on the order of a few seconds, not
+     minutes.
+
+  2. If no direct hit, HOW LONG would the current brute-force search
+     actually take? Reproduces `ray_class_monoid_lookup`'s exact candidate-
+     COUNTING logic (same Q_i/reduced-basis construction, same coord_bound
+     formula) for `count_rounds` successive norm-bound-quadrupling rounds,
+     WITHOUT calling the expensive find_alpha_rhoB_s1_s2_O on any of them -
+     this reproduces the "candidates to check: N" numbers already visible
+     in the stuck run's own log, then projects several rounds further,
+     reporting cumulative candidate counts and an estimated wall-clock time
+     at `per_candidate_seconds` (default 0.4s, the measured WARM-candidate
+     cost after the class_hints and Int128 fixes). This turns "it might
+     finish eventually" into a concrete number to decide by.
+
+Does NOT modify or interact with `ray_class_monoid_lookup`'s own state
+(candidate_cache, class_hints, monoid_table) - entirely read-only relative
+to a run in progress, safe to run in a separate process while the original
+search is (or was) still going.
+"""
+function diagnose_stuck_monoid_lookup(d::Int, p1::Int, p2::Int;
+                                       count_rounds::Int = 12,
+                                       per_candidate_seconds::Float64 = 0.4,
+                                       tol::Float64 = 1e-9)
+    F = AdmissibleTuple(d)
+    sd = _ray_class_shin_setup(F)
+    D, K, O, d_check = sd.D, sd.K, sd.O, sd.d_check
+    P_O, mP_O, rho_reps, F_class = sd.P_O, sd.mP_O, sd.rho_reps, sd.F_class
+    rho_base = rho_reps[F_class]
+
+    g = gcd(gcd(p1, p2), d)
+    println("p = ($p1,$p2)   gcd(p1,p2,d) = ", g,
+            g > 1 ? "  -> NON-UNIT point (genuine monoid-only class, no group-table entry can exist)" :
+                    "  -> unit point (should already be in the group table - if this is being ",
+                    "searched at all, something upstream is wrong)")
+
+    # Target value, computed EXACTLY as twisted_chi_general's own
+    # shin_val_lookup - same A_lookup/rho_bf_base construction, same inputs.
+    L_rho_base = hj_automorph_for_root(rho_base, D)
+    A_lookup, _ = stabilizer_power_in_Gamma_s(L_rho_base, [QQ(p1, d), QQ(p2, d)])
+    rho_bf_base = BigFloat(coeff(rho_base, 0)) + BigFloat(coeff(rho_base, 1)) * sqrt(BigFloat(D))
+    target_val = Complex{BigFloat}(shin(A_lookup, rho_bf_base, [p1, p2], d))
+    println("target shin value = ", target_val)
+
+    # ---- PART 1: the O(4) direct check across ALL Picard classes ----
+    println("\n--- PART 1: direct candidate at each Picard class's own fiber ---")
+    picard_classes = collect(P_O)
+    class_ideals = [mP_O(u) for u in picard_classes]
+    any_hit = false
+    for (idx, u_i) in enumerate(picard_classes)
+        Ji = class_ideals[idx]
+        rho_i_init = rho_reps[u_i]
+        local alpha_i, rho_i
+        ok = true
+        try
+            alpha_i, rho_i, _, _ = find_alpha_rhoB_s1_s2_O(
+                Ji, rho_i_init, rho_base, u_i, P_O, mP_O, O, K, d, rho_base, d_check)
+        catch e
+            ok = false
+        end
+        if !ok
+            println("  class $idx: could not determine this fiber's own (alpha, rho_B) - skipped")
+            continue
+        end
+        rho_i_bf = BigFloat(coeff(rho_i, 0)) + BigFloat(coeff(rho_i, 1)) * sqrt(BigFloat(D))
+        L_i = hj_automorph_for_root(rho_i, D)
+        local A_i
+        try
+            A_i, _ = stabilizer_power_in_Gamma_s(L_i, [QQ(p1, d), QQ(p2, d)])
+        catch e
+            println("  class $idx: could not build the stabilizer matrix for this point at this ",
+                    "fiber - skipped")
+            continue
+        end
+        val_i = Complex{BigFloat}(shin(A_i, rho_i_bf, [p1, p2], d))
+        is_match = abs(val_i - target_val) < tol
+        any_hit |= is_match
+        println("  class $idx (rho_B=", rho_i, "):  shin = ", val_i,
+                is_match ? "   <<< MATCH - this is the answer, no brute-force search needed" : "")
+    end
+    if any_hit
+        println("\n=> A direct match was found above. This point does NOT need the brute-force ",
+                "search at all - if `ray_class_monoid_lookup` is still running for this point, ",
+                "it can be stopped once this diagnostic confirms the value.")
+        return (found_direct = true,)
+    end
+    println("\n=> No direct match at any of the ", length(picard_classes),
+            " fibers' own natural point. This is expected/common, not evidence of a bug on its ",
+            "own - most monoid classes are not this simple. Proceeding to PART 2.")
+
+    # ---- PART 2: candidate-count projection, WITHOUT the expensive search ----
+    println("\n--- PART 2: candidate-count growth projection (counting only, no ",
+            "find_alpha_rhoB_s1_s2_O calls) ---")
+    places = real_places(K)
+    n_classes = length(picard_classes)
+    Pgens = [[_nf_elem_of(K, x) for x in basis(Ji)] for Ji in class_ideals]
+    NQ = [QQ(norm(Ji)) for Ji in class_ideals]
+    Qgens_raw = [[quad_conj(K, gg) for gg in Pgens[i]] for i in 1:n_classes]
+    Qgens = [collect(lattice_reduce_2d(Qgens_raw[i][1], Qgens_raw[i][2], K, places))
+             for i in 1:n_classes]
+
+    tried = [Set{Tuple{Int,Int}}() for _ in 1:n_classes]
+    norm_bound = 50
+    cumulative = 0
+    println("  (norm bound, this round's candidates, cumulative, est. cumulative time",
+            " at ", per_candidate_seconds, "s/candidate)")
+    for round_num in 1:count_rounds
+        n_this_round = 0
+        for i in 1:n_classes
+            w1, w2 = Qgens[i][1], Qgens[i][2]
+            coord_bound = max(5, Int(ceil(sqrt(Float64(norm_bound)))) * 3)
+            for c1 in 0:coord_bound, c2 in (c1 == 0 ? 1 : -coord_bound):coord_bound
+                (c1, c2) in tried[i] && continue
+                alpha = K(c1) * w1 + K(c2) * w2
+                Nalpha = abs(norm(alpha))
+                iszero(Nalpha) && continue
+                Na = Nalpha // NQ[i]
+                Na > norm_bound && continue
+                push!(tried[i], (c1, c2))
+                n_this_round += 1
+            end
+        end
+        cumulative += n_this_round
+        est_hours = cumulative * per_candidate_seconds / 3600
+        println("  round $round_num: norm_bound=$norm_bound  this_round=$n_this_round",
+                "  cumulative=$cumulative  est_time=", round(est_hours, digits=2), " hours")
+        norm_bound *= 4
+    end
+    println("\nCompare the early rounds above (norm_bound 50, 200, 800, 3200) against the ",
+            "candidates-to-check numbers already printed by the actual stuck run - they should ",
+            "match exactly (same counting logic); if they don't, that itself is a red flag worth ",
+            "reporting back before trusting anything else here.")
+    println("Use the projected cumulative/est_time numbers at later rounds to decide whether to ",
+            "keep waiting, raise per_candidate_seconds if the real run has been running slower ",
+            "than the WARM-candidate benchmark, or abort and treat this point as needing a ",
+            "different approach entirely.")
+    return (found_direct = false, target_val = target_val)
+end
+
+
+"""
+    diagnose_monoid_lookup_v2_timing(d::Int; n_candidates_per_class = 3,
+                                      coord_bound = 5)
+
+Cheap, timed probe for the CURRENT `ray_class_monoid_lookup` enumerator
+(Q_i = conj(class_ideal), reduced via `lattice_reduce_2d`, alpha ranging
+over Q_i's REDUCED basis). Written after repeated bugs in that function
+each cost multiple minutes of a real run to discover. Copies the exact
+same construction steps `ray_class_monoid_lookup` uses, capped to a
+HANDFUL of small-coordinate candidates per class with timing at every
+step, so a further mistake costs seconds, not minutes.
+
+For each Picard class, prints:
+  - N(P_i) (the class's own norm) and N(Q_i) (MUST be identical - if not,
+    the conj(P_i) construction itself is broken);
+  - the RAW and REDUCED Q_i basis' embedded-norm^2 (reduction should bring
+    these down close to N(Q_i)'s own scale - a small residual factor, e.g.
+    single digits to a few dozen, is normal for 2D lattice reduction on an
+    indefinite form and not itself a problem; orders of magnitude off is).
+
+TWO RETRACTED HYPOTHESES (both disproven by earlier versions of this probe):
+  1. That the SIZE of `a`'s own generator coefficients (as opposed to
+     Q_i's) was driving the observed 9-21s-per-candidate
+     find_alpha_rhoB_s1_s2_O timings (vs ~2ms for successful calls during
+     the original group-table build). Reduced-vs-unreduced `a` generators,
+     same candidate: IDENTICAL timing.
+  2. That `a`'s Hecke TYPE (a genuine FractionalIdeal object, even though
+     N(a) is always a plain positive integer) was the cause.
+     FractionalIdeal-typed `a` vs `numerator(a)`: IDENTICAL timing.
+  3. That find_alpha_rhoB_s1_s2_O's 3rd/10th positional arguments
+     (`rho`/`rho_j`) needed to be `rho_reps[F_class]` rather than the
+     per-class `rho_reps[u_a]` this function was substituting for all three
+     roles. This IS the argument-by-argument correct call (matching the
+     real call site exactly) and was kept for that reason, but WRONG vs
+     RIGHT timed identically - it does not explain the slowness either.
+  All three A/B tests showed a clean PER-CLASS timing signature instead -
+  different candidates in the same class all took essentially the same
+  time, regardless of their own norm, representation, or which call
+  arguments were used - pointing at something keyed to the CLASS being
+  processed, not to `a` or the call itself.
+
+CONFIRMED CAUSE, found by reading find_alpha_rhoB_s1_s2_O's own internals
+rather than continuing to guess about its inputs:
+its main (non-hinted) path calls find_b_with_verified_principal_product, an
+O(height^5)-cost quadruple-nested coordinate search whose result depends
+ONLY on the ideal's Picard class (per that function's own docstring
+comment) - exactly matching the observed per-class signature.
+find_alpha_rhoB_s1_s2_O already has a fast path built for precisely this
+situation (`alpha_hint`/`rho_B_hint`/`b_O_hint`, documented as existing so
+per-ray-class table builders pay this search ONCE per Picard class, not
+once per ray class) - this probe (and `ray_class_monoid_lookup`, until just
+fixed) was simply never using it, so every candidate re-ran the full search
+from scratch even when several shared a class.
+
+THIS TEST: mirrors `ray_class_monoid_lookup`'s `class_hints` cache /
+`find_with_class_cache` helper exactly. For each class, the FIRST candidate
+is COLD (a cache miss - pays the full find_b_with_verified_principal_product
+search, plus one extra, deliberately redundant call to expose b_O, which
+find_alpha_rhoB_s1_s2_O computes internally but does not return - mirrors
+the SAME pattern already used elsewhere in this file, ray_class_shin_table's
+`fiber_cache`). Every subsequent candidate in the same class is WARM (a
+cache hit - uses the hint fast path).
+
+READ THE OUTPUT AS:
+  - If WARM candidates are dramatically faster than COLD (ideally close to
+    the ~2ms scale from the very first diagnose_monoid_timing run at the
+    start of this whole investigation), the cause is confirmed and the fix
+    already applied to `ray_class_monoid_lookup` should carry over to a
+    real run - candidates sharing a class (which most will, since there
+    are only 4 Picard classes total here) should now be fast after the
+    first one per class.
+  - If COLD and WARM are similarly slow, this cache-based cause does not
+    fully explain the slowness either. WARM calls run with
+    find_alpha_rhoB_s1_s2_O's OWN `verbose=true` (a real, non-invasive
+    fix added directly to that function, purely additive and gated behind
+    the flag it already had - existing callers see no change), so their
+    printed output now breaks down the fast path's own three internal
+    steps with individual timings: `Jb_O/Q construction` (a single
+    ideal multiply plus one Hecke inv() call), the `(i,j) search`
+    (bounded by q_gen_height, default 3000 - a (2*3000+1)^2 ~ 36 million
+    point grid, with tried/passed counts printed), and the final
+    `is_principal_O_verified` check. Whichever of these three is large is
+    the next thing to dig into - the (i,j) search or the inv() call being
+    slow would point at a genuinely expensive Hecke operation regardless of
+    caching; is_principal_O_verified being slow would point back at
+    lattice_canonical's HNF cost (flagged as a possibility from the very
+    first hypothesis in this investigation, on a candidate `a` had never
+    actually been shown to be the cause of - this would finally confirm or
+    rule that out directly).
+"""
+function diagnose_monoid_lookup_v2_timing(d::Int; n_candidates_per_class::Int = 3,
+                                            coord_bound::Int = 5)
+    F = AdmissibleTuple(d)
+    sd = _ray_class_shin_setup(F)
+    D, K, O, d_check = sd.D, sd.K, sd.O, sd.d_check
+    P_O, mP_O, rho_reps, F_class = sd.P_O, sd.mP_O, sd.rho_reps, sd.F_class
+    rho_base = rho_reps[F_class]
+
+    picard_classes = collect(P_O)
+    n_classes = length(picard_classes)
+    println("Number of Picard classes: ", n_classes)
+
+    # ---- EXACT SAME construction as ray_class_monoid_lookup, steps 1-2 ----
+    class_ideals = [mP_O(g) for g in picard_classes]
+    Pgens = [[_nf_elem_of(K, x) for x in basis(Pi)] for Pi in class_ideals]
+    NQ = [QQ(norm(Pi)) for Pi in class_ideals]
+    Qgens_raw = [[quad_conj(K, g) for g in Pgens[i]] for i in 1:n_classes]
+    Qinv_gens = [[g // NQ[i] for g in Pgens[i]] for i in 1:n_classes]
+    places = real_places(K)
+
+    embnorm2(x) = Float64(embedding(places[1])(x))^2 + Float64(embedding(places[2])(x))^2
+
+    # ---- class_hints cache, mirroring ray_class_monoid_lookup's fix exactly ----
+    class_hints = Dict{Any, NamedTuple}()
+    function find_with_class_cache(Jcand, u_cand)
+        if haskey(class_hints, u_cand)
+            hint = class_hints[u_cand]
+            # verbose=true here specifically: this call is the hint-based
+            # ("WARM") fast path, and the whole point of this probe is to see
+            # the NEW internal timing breakdown (Jb_O/Q construction, the
+            # (i,j) search, the final is_principal_O_verified) it now prints,
+            # to find out which of those three is behind WARM still taking
+            # 8-11s instead of dropping to the ~2ms scale.
+            return find_alpha_rhoB_s1_s2_O(
+                Jcand, rho_reps[u_cand], rho_base, u_cand, P_O, mP_O, O, K,
+                d, rho_base, d_check;
+                alpha_hint = hint.alpha, rho_B_hint = hint.rho_B, b_O_hint = hint.b_O,
+                verbose = true)
+        else
+            result = find_alpha_rhoB_s1_s2_O(
+                Jcand, rho_reps[u_cand], rho_base, u_cand, P_O, mP_O, O, K,
+                d, rho_base, d_check)
+            b_O_found, _ = find_b_with_verified_principal_product(
+                O, K, Jcand, [ideal(O, d), ideal(O, d + 1)])
+            class_hints[u_cand] = (alpha = result[1], rho_B = result[2], b_O = b_O_found)
+            return result
+        end
+    end
+
+    for i in 1:n_classes
+        println("\n=== class $i of $n_classes ===")
+        println("  N(P_i) = ", NQ[i], "   (this should equal N(Q_i) printed below, by construction)")
+        println("  RAW Q_i basis, embedded-norm^2: ",
+                embnorm2(Qgens_raw[i][1]), ", ", embnorm2(Qgens_raw[i][2]))
+
+        t_reduce = @elapsed reduced = lattice_reduce_2d(Qgens_raw[i][1], Qgens_raw[i][2], K, places)
+        w1, w2 = reduced
+        println("  REDUCED Q_i basis, embedded-norm^2: ", embnorm2(w1), ", ", embnorm2(w2),
+                "   (time: ", t_reduce, " s)")
+        println("  |N(w1)| = ", abs(norm(w1)), "   |N(w2)| = ", abs(norm(w2)),
+                "   <-- compare these to N(Q_i) = ", NQ[i],
+                " above; should be the SAME rough size, not orders of magnitude larger")
+
+        u_a = picard_classes[i]
+
+        tested = 0
+        for c1 in 0:coord_bound, c2 in (c1 == 0 ? 1 : -coord_bound):coord_bound
+            tested >= n_candidates_per_class && break
+            alpha = K(c1) * w1 + K(c2) * w2
+            Nalpha = abs(norm(alpha))
+            iszero(Nalpha) && continue
+            tested += 1
+            Na = Nalpha // NQ[i]
+
+            a_gens = [alpha * g for g in Qinv_gens[i]]
+            a = fractional_ideal(O, a_gens)
+
+            # RETRACTED HYPOTHESES (all three disproven by earlier probe runs):
+            #  1. a's own generator coefficient SIZE - reducing them via
+            #     lattice_reduce_2d gave IDENTICAL timing to unreduced.
+            #  2. a's Hecke TYPE (FractionalIdeal vs numerator(a)) -
+            #     IDENTICAL timing either way.
+            #  3. find_alpha_rhoB_s1_s2_O's rho argument (rho_a_init for all
+            #     3 roles vs rho_base for the 3rd/10th) - IDENTICAL timing
+            #     either way.
+            # All three showed the SAME clean PER-CLASS timing signature -
+            # same class, different candidates -> same ~10-40s cost -
+            # pointing at something keyed to the CLASS itself, not to `a`
+            # or to which arguments are passed.
+            #
+            # CONFIRMED CAUSE, found by reading find_alpha_rhoB_s1_s2_O's own
+            # internals rather than guessing about its inputs further: its
+            # main path calls find_b_with_verified_principal_product, an
+            # O(height^5) search whose cost depends ONLY on the ideal's
+            # Picard class (per that function's own docstring comment) -
+            # exactly the observed signature. find_alpha_rhoB_s1_s2_O
+            # already has a fast path for this (alpha_hint/rho_B_hint/
+            # b_O_hint) which was simply never being used. This tests it
+            # directly: is candidate #1 in each class (COLD - cache miss,
+            # pays full search) dramatically slower than candidates #2, #3
+            # (WARM - cache hit, reuses class_hints)?
+            is_cold = !haskey(class_hints, u_a)
+            local rho_a, s1_a, s2_a
+            ok = true
+            t_frho = @elapsed begin
+                try
+                    _, rho_a, s1_a, s2_a = find_with_class_cache(a, u_a)
+                catch e
+                    ok = false
+                end
+            end
+            label = is_cold ? "COLD (1st in class - full search)" : "WARM (cached - hint fast path)"
+            if !ok
+                println("  candidate ($c1,$c2): N(alpha)=$Nalpha  N(a)=$Na  $label: FAILED  (",
+                        round(t_frho, sigdigits=3), " s)")
+                continue
+            end
+            println("  candidate ($c1,$c2): N(alpha)=$Nalpha  N(a)=$Na  $label: ",
+                    round(t_frho, sigdigits=3), "s  s1=$s1_a s2=$s2_a")
+        end
+    end
+    println("\n=== probe done ===")
+end
+
+"""
+    diagnose_monoid_timing(d::Int; n_candidates = 5, norm_bound = 3,
+                            mn_height = 50, q_gen_height = 50)
+
+MINIMAL, TIMED probe: evaluates only `n_candidates` monoid candidates
+(default 5), printing elapsed wall-clock time for EACH sub-step of EACH
+candidate as it happens (not just at the end), so we get hard data even if
+it never finishes. Specifically times, per candidate:
+  - constructing a = P_i*(alpha)*(beta)^{-1} (the chained multiply/invert),
+  - printing the size of a's resulting basis coefficients (to check whether
+    the composed ideal has blown up far beyond what norm_bound=3 suggests -
+    the suspected real cost driver, since find_alpha_rhoB_s1_s2_O's own
+    search cost is believed to scale with J's basis size, not with our
+    nominal alpha/beta height bound),
+  - the find_alpha_rhoB_s1_s2_O call itself.
+Uses a deliberately tiny norm_bound=3 and search heights=50 so even a
+"normal-speed" run should finish in well under a minute; if it does not,
+that itself is diagnostic (points at the ideal construction step, not the
+search heights, being the actual bottleneck).
+"""
+function diagnose_monoid_timing(d::Int; n_candidates::Int = 5, norm_bound::Int = 3,
+                                 mn_height::Int = 50, q_gen_height::Int = 50)
+    F = AdmissibleTuple(d)
+    sd = _ray_class_shin_setup(F)
+    D, K, O, d_check = sd.D, sd.K, sd.O, sd.d_check
+    P_O, mP_O, rho_reps = sd.P_O, sd.mP_O, sd.rho_reps
+
+    dbar = mod(d, 2) == 1 ? d : 2 * d
+    m_ideal = ideal(O, dbar)
+    b1 = _nf_elem_of(K, basis(O)[1])
+    b2 = _nf_elem_of(K, basis(O)[2])
+    picard_classes = collect(P_O)
+    class_ideals = [mP_O(g) for g in picard_classes]
+    coord_bound = max(3, Int(ceil(sqrt(Float64(norm_bound)))) * 3)
+
+    println("Picard class representative norms: ",
+            [Int(norm(Pi)) for Pi in class_ideals])
+
+    betas = Tuple{Int,Int,Int}[]
+    for bi in -coord_bound:coord_bound, bj in -coord_bound:coord_bound
+        (bi == 0 && bj == 0) && continue
+        beta = K(bi) * b1 + K(bj) * b2
+        nb = abs(Int(norm(beta)))
+        (nb == 0 || nb > norm_bound) && continue
+        is_beta_in_S_m(beta, O, m_ideal) || continue
+        push!(betas, (bi, bj, nb))
+    end
+    alphas = Tuple{Int,Int,Int}[]
+    for ai in -coord_bound:coord_bound, aj in -coord_bound:coord_bound
+        (ai == 0 && aj == 0) && continue
+        alpha = K(ai) * b1 + K(aj) * b2
+        na = abs(Int(norm(alpha)))
+        (na == 0 || na > norm_bound) && continue
+        push!(alphas, (ai, aj, na))
+    end
+    println("alphas found: ", length(alphas), "   betas found: ", length(betas))
+    isempty(alphas) && error("no alpha candidates at this norm_bound - raise it")
+    isempty(betas) && error("no beta (in S_m) candidates at this norm_bound - raise it")
+
+    n_done = 0
+    for ci in 1:length(class_ideals), (ai, aj, na) in alphas, (bi, bj, nb) in betas
+        n_done >= n_candidates && break
+        n_done += 1
+        println("\n--- candidate ", n_done, " of ", n_candidates,
+                ": class ", ci, "  alpha_coords=(", ai, ",", aj, ") N=", na,
+                "  beta_coords=(", bi, ",", bj, ") N=", nb, " ---")
+        alpha = K(ai) * b1 + K(aj) * b2
+        beta  = K(bi) * b1 + K(bj) * b2
+
+        t1 = @elapsed a = class_ideals[ci] * ideal(O, alpha)
+        println("  time to build P_i*(alpha): ", t1, " s")
+        t2 = @elapsed a = a * inv(ideal(O, beta))
+        println("  time to multiply by inv((beta)): ", t2, " s")
+
+        t3 = @elapsed nrm = norm(a)
+        println("  norm(a) = ", nrm, "  (time: ", t3, " s)")
+        t4 = @elapsed bas = basis(a)
+        coeffs_all = BigInt[]
+        for b in bas
+            nb_elem = _nf_elem_of(K, b)
+            for k in (0, 1)
+                c = QQ(coeff(nb_elem, k))
+                push!(coeffs_all, abs(BigInt(numerator(c))))
+                push!(coeffs_all, abs(BigInt(denominator(c))))
+            end
+        end
+        max_coeff = maximum(coeffs_all)
+        println("  basis(a) largest numerator/denominator (coeff size check): ", max_coeff,
+                "  (time to fetch basis: ", t4, " s)")
+
+        u_a = picard_classes[ci]
+        rho_a_init = rho_reps[u_a]
+        t5 = @elapsed begin
+            local ok = true
+            local rho_a, s1_a, s2_a
+            try
+                _, rho_a, s1_a, s2_a = find_alpha_rhoB_s1_s2_O(
+                    a, rho_a_init, rho_a_init, u_a, P_O, mP_O, O, K,
+                    d, rho_a_init, d_check; mn_height = mn_height,
+                    q_gen_height = q_gen_height)
+            catch e
+                ok = false
+                println("  find_alpha_rhoB_s1_s2_O THREW: ", e)
+            end
+            if ok
+                println("  find_alpha_rhoB_s1_s2_O succeeded: rho_B=", rho_a,
+                        " s1=", s1_a, " s2=", s2_a)
+            end
+        end
+        println("  time in find_alpha_rhoB_s1_s2_O: ", t5, " s")
+    end
+    println("\n=== done: ", n_done, " candidates timed ===")
+end
+
+
+"""
     check_table_duplicates(d::Int; tol::Float64 = 1e-30)
 
 Scans all entries of the ray class table for modulus `d` and groups them by
@@ -4730,6 +5996,29 @@ function test_all_twists(d::Int)
         println("  missing indices: ", findall(x -> x === nothing, ray_class_lookup_table))
     end
 
+    # Persistent, growing extension of the ray class table into the monoid
+    # Jbar_m^flat(O) (see ray_class_monoid_lookup's docstring for the exact
+    # project-owner algorithm and definitions) - shared across every twist
+    # below, so a class discovered while processing one twist is reused
+    # (not re-searched) by every later lookup that needs it.
+    monoid_table = NamedTuple[]
+
+    # Persists (class_idx, alpha_coord1, alpha_coord2) -> the full computed
+    # result for that ray_class_monoid_lookup candidate, across EVERY call
+    # below (every point of every twist) - see ray_class_monoid_lookup's
+    # docstring, "CROSS-CALL CANDIDATE CACHE". Without this, every lookup
+    # miss re-pays the find_alpha_rhoB_s1_s2_O cost for the same cheap,
+    # low-norm candidates from scratch.
+    candidate_cache = Dict{Tuple{Int,Int,Int}, Any}()
+
+    # Persists (alpha, rho_B, b_O) per Picard class across EVERY call below -
+    # see ray_class_monoid_lookup's docstring, "PERFORMANCE FIX: PER-CLASS
+    # find_alpha_rhoB_s1_s2_O CACHING". Without this, each new lookup call
+    # would re-pay the full O(height^5) find_b_with_verified_principal_product
+    # search the first time it happens to hit a given class, even if an
+    # EARLIER call already paid that cost for the same class.
+    class_hints = Dict{Any, NamedTuple}()
+
     n_principal = min(5, length(principal_triples))
     println("\n=== Testing first ", n_principal, " principal twists ===")
     for (k, (J, I, gamma)) in enumerate(principal_triples[1:n_principal])
@@ -4740,7 +6029,10 @@ function test_all_twists(d::Int)
         new_ovs, gF, psi = twisted_chi_general(F, J, gamma, K, O,
                                                 true, P_O, mP_O,
                                                 rho_reps, gQ_reps, F_class, j_cache;
-                                                ray_class_lookup_table = ray_class_lookup_table)
+                                                ray_class_lookup_table = ray_class_lookup_table,
+                                                monoid_table = monoid_table,
+                                                candidate_cache = candidate_cache,
+                                                class_hints = class_hints)
     end
 
     n_nonprincipal = min(20, length(nonprincipal_triples))
@@ -4753,7 +6045,10 @@ function test_all_twists(d::Int)
         new_ovs, gF, psi = twisted_chi_general(F, J, gamma, K, O,
                                                 false, P_O, mP_O,
                                                 rho_reps, gQ_reps, F_class, j_cache;
-                                                ray_class_lookup_table = ray_class_lookup_table)
+                                                ray_class_lookup_table = ray_class_lookup_table,
+                                                monoid_table = monoid_table,
+                                                candidate_cache = candidate_cache,
+                                                class_hints = class_hints)
     end
 end
 
@@ -5252,4 +6547,4 @@ function test_ray_class_covariance(d_val::Int; p1::Int = 0, p2::Int = 1)
             shin_conj_recheck = shin_conj)
 end
 
-check_nonunit_shift_invariance(21)
+diagnose_stuck_monoid_lookup(21, 0, 18)

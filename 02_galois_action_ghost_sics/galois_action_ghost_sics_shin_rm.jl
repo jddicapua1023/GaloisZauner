@@ -1,7 +1,7 @@
 using Random
 #Random.seed!(305817264)
-Random.seed!(672049183)
-#Random.seed!(891357246)
+#Random.seed!(672049183) #working for latest 9_11 version
+Random.seed!(891357246)
 
 
 # galois_action_ghost_sics.jl
@@ -1992,7 +1992,8 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                               elem1_max_u::Integer = 10_000_000,
                               monoid_table::Vector = NamedTuple[],
                               candidate_cache::Dict = Dict{Tuple{Int,Int,Int}, Any}(),
-                              class_hints::Dict = Dict{Any, NamedTuple}())
+                              class_hints::Dict = Dict{Any, NamedTuple}(),
+                              full_monoid_table::Union{Nothing,Vector} = nothing)
     d = Int(F.d)
     D = Int(F.D)
     a = gen(K)
@@ -2324,35 +2325,68 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     ray_class_lookup_table_local)
                 local lookup_entry
                 if match_idx === nothing
-                    # PROJECT OWNER ALGORITHM: a lookup miss against the
-                    # (verified-complete) 288-entry GROUP table means the
-                    # target shin value comes from the ray class MONOID
-                    # Jbar_m^flat(O), not the group. Dynamically enumerate
-                    # elements of Jbar_m^flat(O) (see ray_class_monoid_lookup's
-                    # own docstring for the exact algorithm and the verbatim
-                    # S_m / J_m^*(O) / Jbar_m^flat(O) definitions this is
-                    # built from), growing `monoid_table` in place so later
-                    # lookups (other points, other twists) reuse work already
-                    # done here instead of re-searching from scratch.
+                    # REVISED PER PROJECT OWNER: the ray class monoid
+                    # Jbar_m^flat(O) is FINITE and small (592 classes for
+                    # d=21) - build it in FULL, once, up front
+                    # (full_monoid_table, via ray_class_monoid_table_v2,
+                    # threaded through exactly like monoid_table/
+                    # candidate_cache/class_hints), and do a direct value
+                    # lookup against it - no incremental norm-bound search at
+                    # all. Confirmed empirically (diagnose_full_monoid_
+                    # membership) that a genuine shin_val_lookup value DOES
+                    # appear in this table; the earlier incremental search
+                    # (ray_class_monoid_lookup) was solving a problem that
+                    # did not need solving that way.
                     println("  [monoid lookup] shin^{[$p1,$p2]}_A(rho) = ", shin_val_lookup,
-                            " not in the group table - searching Jbar_m^flat(O)...")
-                    mres = ray_class_monoid_lookup(F, shin_val_lookup;
-                                                    sd = (D = D, q = q_val, d = d, K = K, O = O,
-                                                          P_O = P_O, mP_O = mP_O, rho_reps = rho_reps,
-                                                          d_check = d_check),
-                                                    rho_base = rho,
-                                                    p_query = (p1, p2),
-                                                    group_table = ray_class_lookup_table_local,
-                                                    known_monoid_entries = monoid_table,
-                                                    candidate_cache = candidate_cache,
-                                                    class_hints = class_hints,
-                                                    tol = ray_class_lookup_tol)
-                    append!(monoid_table, mres.new_entries)
-                    mres.found ||
-                        error("elem1 lookup: shin^{[", p1, ",", p2, "]}_A(rho) = ", shin_val_lookup,
-                              " not found anywhere in Jbar_m^flat(O) within the search bound - ",
-                              "either the bound needs raising, or something upstream is wrong")
-                    lookup_entry = mres.entry
+                            " not in the group table - looking up in the full monoid table...")
+                    full_monoid_table === nothing &&
+                        error("twisted_chi_general: a lookup miss against the group table ",
+                              "occurred but full_monoid_table was not provided - build it once ",
+                              "(ray_class_monoid_table_v2) and pass it through, the same way ",
+                              "monoid_table/candidate_cache/class_hints are already threaded")
+                    full_match = nothing
+                    for e in full_monoid_table
+                        if abs(Complex{BigFloat}(e.shin_value) - shin_val_lookup) < ray_class_lookup_tol
+                            full_match = e
+                            break
+                        end
+                    end
+                    full_match === nothing &&
+                        error("p=($p1,$p2): shin^{[$p1,$p2]}_A(rho) = ", shin_val_lookup,
+                              " was not found ANYWHERE in the full, exhaustively-built monoid ",
+                              "table (", length(full_monoid_table), " classes). Per the project ",
+                              "owner: since the monoid is finite and has been built in full, this ",
+                              "is definitive - it means shin_val_lookup itself is being computed ",
+                              "incorrectly, NOT that a larger search would help. Do not attempt to ",
+                              "work around this by searching further.")
+                    # full_match gives us WHICH ideal - re-derive (rho_B,s1,s2)
+                    # for it via find_alpha_rhoB_s1_s2_O, exactly the same way
+                    # ray_class_monoid_lookup already does for its own
+                    # candidates (via find_with_class_cache), so lookup_entry
+                    # has identical semantics regardless of which path found
+                    # it. Uses the SAME class_hints cache, so this pays the
+                    # full per-class search cost only once per Picard class,
+                    # not once per lookup.
+                    u_match = full_match.A0
+                    local rho_match, s1_match, s2_match
+                    if haskey(class_hints, u_match)
+                        hint = class_hints[u_match]
+                        _, rho_match, s1_match, s2_match = find_alpha_rhoB_s1_s2_O(
+                            full_match.J, rho_reps[u_match], rho, u_match, P_O, mP_O, O, K,
+                            d, rho, d_check;
+                            alpha_hint = hint.alpha, rho_B_hint = hint.rho_B, b_O_hint = hint.b_O)
+                    else
+                        res_match = find_alpha_rhoB_s1_s2_O(
+                            full_match.J, rho_reps[u_match], rho, u_match, P_O, mP_O, O, K,
+                            d, rho, d_check)
+                        b_O_match, _ = find_b_with_verified_principal_product(
+                            O, K, full_match.J, [ideal(O, d), ideal(O, d + 1)])
+                        class_hints[u_match] = (alpha = res_match[1], rho_B = res_match[2],
+                                                 b_O = b_O_match)
+                        _, rho_match, s1_match, s2_match = res_match
+                    end
+                    lookup_entry = (J = full_match.J, rho_B = rho_match, s1 = s1_match,
+                                    s2 = s2_match, shin_value = full_match.shin_value)
                 else
                     lookup_entry = ray_class_lookup_table_local[match_idx]
                 end
@@ -3905,9 +3939,20 @@ Construction, following Theorem 2.19 with `m = dO`:
   coordinate of `x` w.r.t. the Z-basis of `O` is divisible by `d`.
 
 Returns a vector of NamedTuples, one per monoid class:
-`(A0, rho, alpha, p_vec, r_num, members, is_unit, shin_value)` where
-`members` is the full list of grid points in that class and `r_num` is the
-integer numerator vector of the NORMALIZED lift actually fed to `shin`.
+`(A0, rho, alpha, J, p_vec, r_num, members, is_unit, shin_value)` where `J`
+is the actual ideal a_r = gam[pt]*b_O^{-1} this class represents (an
+integral ideal, class A0 - see the b_O computation above for why), suitable
+for direct use as `U_elem1` in twisted_chi_general's downstream
+`J_bj = J*U_elem1` multiplication; `members` is the full list of grid
+points in that class and `r_num` is the integer numerator vector of the
+NORMALIZED lift actually fed to `shin`.
+
+Confirmed (2025 session, `diagnose_full_monoid_membership`): every genuine
+shin_val_lookup value DOES appear somewhere in this table when the full
+592-class (d=21) table is built and searched directly, rather than via
+`ray_class_monoid_lookup`'s incremental norm-bound search - the search was
+never actually necessary; the monoid is small enough to build in full,
+once, up front.
 """
 function ray_class_monoid_table_v2(F::AdmissibleTuple; shared_data = nothing,
                                     verbose::Bool = true, basis_height::Int = 8)
@@ -3988,6 +4033,21 @@ function ray_class_monoid_table_v2(F::AdmissibleTuple; shared_data = nothing,
         rho_bf = BigFloat(coeff(rho, 0)) + BigFloat(coeff(rho, 1)) * sqrt(BigFloat(D))
         rho_c = fc(rho)
 
+        # b_O for this class, needed to construct an actual usable IDEAL
+        # a_r = gam[pt]*b_O^{-1} per entry (Theorem 2.19: a_r's class = g,
+        # since gam[pt] is principal and b_O has class g^{-1}). This is the
+        # same find_b_with_verified_principal_product call
+        # find_alpha_rhoB_s1_s2_O already makes internally to get alpha/rho
+        # - it does not expose b_O in its return, so this repeats that one
+        # search per class (4 times total here), the same established
+        # pattern already used for this exact situation in
+        # ray_class_monoid_lookup's `find_with_class_cache` and in
+        # ray_class_shin_table's `fiber_cache`.
+        b_O, _ = find_b_with_verified_principal_product(O, K, Jg, [ideal(O, d), ideal(O, d + 1)])
+        NbO = QQ(norm(b_O))
+        bO_gens = [_nf_elem_of(K, x) for x in basis(b_O)]
+        bO_inv_gens = [quad_conj(K, bg) // NbO for bg in bO_gens]   # b_O^{-1} = conj(b_O)/N(b_O)
+
         # ---- units of O, and the Sigma-positive ones, as residues mod dO ----
         # BUGFIX: hj_automorph_for_root can return either L or -L (both
         # represent the same automorphism of rho, since -I acts trivially on
@@ -4062,7 +4122,25 @@ function ray_class_monoid_table_v2(F::AdmissibleTuple; shared_data = nothing,
             x = K(pt[2]) * rho - K(pt[1])
             rel = QQ(abs(norm(x))) / NI_B
             is_unit = isone(denominator(rel)) && gcd(Int(numerator(rel)), d) == 1
-            push!(entries, (A0 = g, rho = rho, alpha = alpha, p_vec = [pt[1], pt[2]],
+
+            # a_r = gam[pt] * b_O^{-1}, the actual ideal this monoid class
+            # represents (class = g, per Theorem 2.19 - see the b_O comment
+            # above). Guaranteed integral by the theory (r is already in the
+            # (1/d)Z^2 normalized form); convert to a genuine integral-typed
+            # ideal (not just FractionalIdeal with denominator 1) so it is
+            # type-consistent with the group table's own entries - the same
+            # fix already applied in ray_class_monoid_lookup, for the exact
+            # same downstream reason (mP_O \ (J*U_elem1) has no method for
+            # FractionalIdeal).
+            a_r_gens = [gam[pt] * bg for bg in bO_inv_gens]
+            a_r = fractional_ideal(O, a_r_gens)
+            isone(denominator(a_r)) ||
+                error("ray_class_monoid_table_v2: a_r for class ", g, ", point ", pt,
+                      " is not integral (denominator = ", denominator(a_r), ") - this should be ",
+                      "impossible per Theorem 2.19's own normalization; something upstream is wrong")
+            J_entry = numerator(a_r)
+
+            push!(entries, (A0 = g, rho = rho, alpha = alpha, J = J_entry, p_vec = [pt[1], pt[2]],
                             r_num = rn, members = members, is_unit = is_unit,
                             shin_value = val))
         end
@@ -4557,6 +4635,19 @@ end
                              group_table, known_monoid_entries,
                              candidate_cache, tol, initial_norm_bound,
                              max_norm_bound, verbose)
+
+SUPERSEDED, per the project owner: the ray class monoid Jbar_m^flat(O) is
+FINITE (592 classes for d=21) and small enough to build in FULL, once, up
+front, via `ray_class_monoid_table_v2` - no incremental norm-bound search
+needed at all. `twisted_chi_general` no longer calls this function; it does
+a direct value lookup against a pre-built `full_monoid_table` instead (see
+that function's own comments at the lookup-miss branch). Confirmed
+empirically (`diagnose_full_monoid_membership`) that a genuine
+shin_val_lookup value DOES appear in the full table - this incremental
+search was solving a problem that did not need solving that way. Left
+defined (fully working, extensively debugged) since it may still be useful
+for comparison/verification, but it is DEAD CODE on the current production
+path.
 
 Implements the project owner's algorithm for extending the ray class table
 into the monoid Jbar_m^flat(O) on a lookup miss. Matching is by shin VALUE,
@@ -5448,6 +5539,538 @@ end
 
 
 """
+    diagnose_reduced_level_consistency(d::Int, p1::Int, p2::Int; tol::Float64 = 1e-9)
+
+Tests a specific hypothesis about why a non-unit point's monoid lookup might
+be searching for a value that no candidate can ever match, raised while
+p=(0,18), d=21 was stuck past round 8 (~2 million candidates, norms up to
+~800,000, no match - see diagnose_stuck_monoid_lookup) with no direct hit
+at any of the 4 Picard classes either.
+
+`shin_val_lookup` in twisted_chi_general is built as:
+    A_lookup, _ = stabilizer_power_in_Gamma_s(L_rho_base, [p1/d, p2/d])
+    shin_val_lookup = shin(A_lookup, rho_bf_base, [p1, p2], d)
+For a NON-UNIT point (gcd(p1,p2,d) = g > 1), the rational number p1/d (resp.
+p2/d) has TRUE ORDER d/g in Q/Z, not d - e.g. for p=(0,18), d=21: g=3, and
+18/21 = 6/7 in lowest terms, order 7. `stabilizer_power_in_Gamma_s` finds
+its result purely from the RATIONAL VALUE of [p1/d,p2/d] (via QQ, which
+Hecke reduces to lowest terms internally), so A_lookup is unaffected by
+which integer representation was used to express that same rational value -
+it is exactly the stabilizer for a point of true order d/g, regardless.
+
+But `shin`'s own internal formula does
+    p_transformed = mod.(s_R .* (red.R * Int.(p)), d)
+using the RAW INTEGER p and the RAW MODULUS d passed in - NOT the point's
+reduced order. So shin(A_lookup, rho, [0,18], 21) and
+shin(A_lookup, rho, [0,6], 7) - two ways of asking "what is the value at
+the same underlying rational point 6/7" - are NOT obviously required to
+agree; they invoke shin's mod-d reduction at two DIFFERENT moduli entirely.
+If they disagree, `shin_val_lookup` for non-unit points is not well-defined
+as currently computed, which would fully explain a brute-force search never
+finding a match at any norm - there would be nothing to find.
+
+Compares these two evaluations directly, with no new field/order setup
+needed: `shin` takes `p` and `d` as raw arguments independent of any
+AdmissibleTuple, so this only needs the SAME A_lookup and rho_base already
+in scope in twisted_chi_general - one comparison, seconds to run, gives a
+definitive yes/no rather than more speculation.
+
+If p is already a unit point (gcd(p1,p2,d) = 1), there is no smaller level
+to compare against and the function reports that and returns.
+"""
+function diagnose_reduced_level_consistency(d::Int, p1::Int, p2::Int; tol::Float64 = 1e-9)
+    F = AdmissibleTuple(d)
+    sd = _ray_class_shin_setup(F)
+    D, K, O = sd.D, sd.K, sd.O
+    rho_reps, F_class = sd.rho_reps, sd.F_class
+    rho_base = rho_reps[F_class]
+
+    g = gcd(gcd(p1, p2), d)
+    println("p = ($p1,$p2)   d = $d   gcd(p1,p2,d) = ", g)
+    if g == 1
+        println("This is already a unit point (primitive at modulus $d) - there is no smaller ",
+                "level to compare against, so there is nothing for this diagnostic to test.")
+        return nothing
+    end
+
+    d_reduced = d ÷ g
+    p1_reduced = p1 ÷ g
+    p2_reduced = p2 ÷ g
+    println("Reduced level: d' = d/g = ", d_reduced, "   (p1',p2') = (", p1_reduced, ",",
+            p2_reduced, ")")
+
+    r1 = QQ(p1, d); r1_red = QQ(p1_reduced, d_reduced)
+    r2 = QQ(p2, d); r2_red = QQ(p2_reduced, d_reduced)
+    println("sanity check: p1/d = ", r1, "   p1'/d' = ", r1_red, "   (must be EQUAL)")
+    println("sanity check: p2/d = ", r2, "   p2'/d' = ", r2_red, "   (must be EQUAL)")
+    (r1 == r1_red && r2 == r2_red) ||
+        error("diagnose_reduced_level_consistency: the reduction arithmetic itself is wrong ",
+              "(r1=", r1, " vs r1_red=", r1_red, ", r2=", r2, " vs r2_red=", r2_red,
+              ") - stop here, this is a bug in THIS diagnostic, not in the thing being diagnosed")
+
+    L_rho_base = hj_automorph_for_root(rho_base, D)
+    A_lookup, _ = stabilizer_power_in_Gamma_s(L_rho_base, [r1, r2])
+    rho_bf_base = BigFloat(coeff(rho_base, 0)) + BigFloat(coeff(rho_base, 1)) * sqrt(BigFloat(D))
+
+    val_full = Complex{BigFloat}(shin(A_lookup, rho_bf_base, [p1, p2], d))
+    val_reduced = Complex{BigFloat}(shin(A_lookup, rho_bf_base, [p1_reduced, p2_reduced], d_reduced))
+
+    println("\nshin(A, rho, [", p1, ",", p2, "], ", d, ")           = ", val_full)
+    println("shin(A, rho, [", p1_reduced, ",", p2_reduced, "], ", d_reduced, ")             = ",
+            val_reduced)
+    diff = abs(val_full - val_reduced)
+    println("|difference| = ", diff, diff < tol ? "   <- SAME (within tol)" : "   <- DIFFERENT")
+
+    if diff < tol
+        println("\n=> shin IS consistent between the full and reduced representations of the ",
+                "same rational point. shin_val_lookup for this point should be a genuine, ",
+                "well-defined target - the stuck search's failure to find it points elsewhere ",
+                "(most likely: it genuinely needs a norm beyond what has been tried, or there is ",
+                "a separate bug in the enumeration/comparison itself, not in how the target value ",
+                "was computed).")
+    else
+        println("\n=> shin gives a DIFFERENT value depending on whether it is evaluated with the ",
+                "point's FULL (unreduced) integers or its TRUE reduced level. shin_val_lookup, as ",
+                "currently computed by twisted_chi_general for any non-unit point (gcd(p1,p2,d) > ",
+                "1), is ambiguous - two equally natural ways of expressing the SAME target point ",
+                "give different answers. This would fully explain why the brute-force search can ",
+                "never find a match at any norm: there is no single well-defined value to find. ",
+                "This needs to be resolved (almost certainly by pinning down which of the two - ",
+                "or a third, correct - convention the theory actually specifies) before trusting ",
+                "ANY lookup for a point with gcd(p1,p2,d) > 1.")
+    end
+    return (val_full = val_full, val_reduced = val_reduced, diff = diff)
+end
+
+
+"""
+    diagnose_coord_bound_sufficiency(d::Int; norm_bound::Int = 200,
+                                      safety_factors::Vector{Int} = [3, 6, 10, 20, 40])
+
+Tests the ONE remaining unruled-out explanation for why the p=(0,18), d=21
+search found nothing across ~2 million candidates (norms up to ~800,000):
+that shin_val_lookup is well-defined (confirmed exactly by
+diagnose_reduced_level_consistency, difference = 0.0), the enumeration's
+underlying MATH is exhaustive (proven earlier: every integral ideal `a` in
+a Picard class arises as alpha*Q_i^{-1} for SOME alpha in Q_i), but the
+IMPLEMENTATION's coordinate search radius,
+    coord_bound = max(5, ceil(sqrt(norm_bound)) * 3)
+(the "*3" was chosen by feel when this was written, never verified
+sufficient) might be too small for some class's specific lattice geometry
+after `lattice_reduce_2d` - which would mean the search silently SKIPS
+valid candidates within the norm bound it claims to have covered, not
+merely being slow to reach large ones. This is a different, more serious
+failure mode than "needs more time" - it means the search could run
+FOREVER and still never find a match that exists at a modest, already-
+searched norm.
+
+For each Picard class and each safety factor in `safety_factors`, counts
+how many DISTINCT Na = N(a) values are found up to `norm_bound`. Prints the
+counts side by side.
+
+READ THE OUTPUT AS:
+  - If the count is the SAME for every safety factor (per class), the *3
+    factor was already sufficient at this norm_bound - no completeness gap
+    here, and the p=(0,18) mystery is more likely explained by that class
+    genuinely needing a very large norm (surprising for D=44, but not
+    something this diagnostic rules out).
+  - If the count INCREASES as the safety factor grows (does not plateau),
+    that proves the current search implementation is incomplete even at
+    small, already-explored norm bounds - candidates within the stated
+    bound are being missed, and `ray_class_monoid_lookup`'s coord_bound
+    formula needs to be fixed (a provably-sufficient bound derived from the
+    reduced basis' own properties, not a fixed multiplicative fudge factor)
+    before any further monoid search results can be trusted.
+"""
+function diagnose_coord_bound_sufficiency(d::Int; norm_bound::Int = 200,
+                                           safety_factors::Vector{Int} = [3, 6, 10, 20, 40])
+    F = AdmissibleTuple(d)
+    sd = _ray_class_shin_setup(F)
+    K, O = sd.K, sd.O
+    P_O, mP_O = sd.P_O, sd.mP_O
+
+    picard_classes = collect(P_O)
+    n_classes = length(picard_classes)
+    class_ideals = [mP_O(u) for u in picard_classes]
+    Pgens = [[_nf_elem_of(K, x) for x in basis(Ji)] for Ji in class_ideals]
+    NQ = [QQ(norm(Ji)) for Ji in class_ideals]
+    Qgens_raw = [[quad_conj(K, gg) for gg in Pgens[i]] for i in 1:n_classes]
+    places = real_places(K)
+    Qgens = [collect(lattice_reduce_2d(Qgens_raw[i][1], Qgens_raw[i][2], K, places))
+             for i in 1:n_classes]
+
+    println("norm_bound = ", norm_bound, "   safety_factors tested = ", safety_factors)
+    for i in 1:n_classes
+        w1, w2 = Qgens[i][1], Qgens[i][2]
+        println("\n=== class $i of $n_classes  (N(Q_i) = ", NQ[i], ") ===")
+        prev_count = nothing
+        for sf in safety_factors
+            coord_bound = max(5, Int(ceil(sqrt(Float64(norm_bound)))) * sf)
+            found_Nas = Set{Any}()
+            for c1 in 0:coord_bound, c2 in (c1 == 0 ? 1 : -coord_bound):coord_bound
+                alpha = K(c1) * w1 + K(c2) * w2
+                Nalpha = abs(norm(alpha))
+                iszero(Nalpha) && continue
+                Na = Nalpha // NQ[i]
+                Na > norm_bound && continue
+                push!(found_Nas, Na)
+            end
+            n_found = length(found_Nas)
+            grew = prev_count !== nothing && n_found > prev_count
+            println("  safety_factor=", sf, "  coord_bound=", coord_bound,
+                    "  distinct Na values found=", n_found,
+                    grew ? "   <-- GREW from previous factor (missing candidates at smaller factor!)" : "")
+            prev_count = n_found
+        end
+    end
+    println("\nIf every class's count plateaus (stops growing) well before the largest safety ",
+            "factor tested, the *3 default is fine at this norm_bound. If any class is STILL ",
+            "growing at the largest factor tested, re-run with larger norm_bound and/or ",
+            "safety_factors - an unbounded growth pattern would be strong evidence of a genuine ",
+            "completeness bug, not just needing a bigger (but still fixed) fudge factor.")
+end
+
+
+"""
+    diagnose_theorem219_cross_check(d::Int, p1::Int, p2::Int; tol::Float64 = 1e-9)
+
+Cross-checks `shin_val_lookup` (the value twisted_chi_general's monoid
+search is trying to match) against `ray_class_monoid_table_v2`'s
+independent, direct Theorem 2.19 construction - built earlier this session
+specifically as a from-the-definition alternative to the search-and-compare
+approach, and never previously run against a real stuck case.
+
+This closes a real gap in `diagnose_stuck_monoid_lookup`'s Part 1 check:
+that check evaluated shin at each Picard class's OWN root using the RAW,
+unshifted (p1,p2) - but Theorem 2.19 requires a SIGN-NORMALIZED LIFT (find
+n1 so that r1 = p1/d + n1 satisfies r2*rho' - r1 > 0) before the
+construction is valid; `ray_class_monoid_shin_table` (the original, pre-v2
+monoid builder) was found earlier this session to have exactly this bug
+(using an unnormalized lift), and v2 was written to fix it. Part 1 never
+applied that same normalization, so it was testing a DIFFERENT, likely
+invalid construction at each class, not the one v2 (or the theorem) actually
+specifies.
+
+For each Picard class, replicates ray_class_monoid_table_v2's exact
+per-class, per-point logic (find_alpha_rhoB_s1_s2_O for that class's own
+(alpha,rho), the trace-sign-normalized L, the sign-normalized lift rn, and
+shin(A, rho_bf, rn, d) using the SHIFTED rn - not the raw (p1,p2)) and
+compares each class's resulting value against shin_val_lookup.
+
+READ THE OUTPUT AS:
+  - A match at any class: that class's Theorem-2.19 construction (with the
+    correct lift normalization) IS the answer, and the brute-force search
+    was simply exploring the wrong space (or this class's true generator
+    genuinely has a large norm, and this bypasses needing to find it by
+    search at all, going straight to (alpha, rho, s1, s2) for the class).
+  - No match anywhere: strengthens the case that shin_val_lookup itself,
+    as twisted_chi_general currently constructs it (raw (p1,p2), no lift
+    normalization, evaluated ONLY at the base fiber), is not what Theorem
+    2.19's construction actually produces for ANY class at this point - a
+    genuine methodology mismatch between how the target is computed and how
+    every candidate (whether from the search or from v2) is computed, which
+    would explain a search that can never succeed regardless of norm bound.
+"""
+function diagnose_theorem219_cross_check(d::Int, p1::Int, p2::Int; tol::Float64 = 1e-9)
+    F = AdmissibleTuple(d)
+    sd = _ray_class_shin_setup(F)
+    D, K, O = sd.D, sd.K, sd.O
+    P_O, mP_O, rho_reps, F_class, d_check, all_triples =
+        sd.P_O, sd.mP_O, sd.rho_reps, sd.F_class, sd.d_check, sd.all_triples
+    rho_base = rho_reps[F_class]
+
+    # shin_val_lookup, EXACTLY as twisted_chi_general computes it: raw
+    # (p1,p2), no lift normalization, base fiber only.
+    L_rho_base = hj_automorph_for_root(rho_base, D)
+    A_lookup, _ = stabilizer_power_in_Gamma_s(L_rho_base, [QQ(p1, d), QQ(p2, d)])
+    rho_bf_base = BigFloat(coeff(rho_base, 0)) + BigFloat(coeff(rho_base, 1)) * sqrt(BigFloat(D))
+    target_val = Complex{BigFloat}(shin(A_lookup, rho_bf_base, [p1, p2], d))
+    println("target (shin_val_lookup, twisted_chi_general's own construction) = ", target_val)
+
+    places = real_places(K)
+    i_conj = findfirst(pl -> Float64(real(embedding(pl)(gen(K)))) < 0, places)
+    emb_conj = embedding(places[i_conj])
+    emb_main = embedding(places[3 - i_conj])
+    fm(x) = Float64(real(emb_main(x)))
+    fc(x) = Float64(real(emb_conj(x)))
+
+    picard_classes = collect(P_O)
+    println("\n--- ray_class_monoid_table_v2's own construction, per Picard class ---")
+    for g in picard_classes
+        Jg = nothing
+        for t in all_triples
+            if (mP_O \ t[1]) == g
+                Jg = t[1]
+                break
+            end
+        end
+        if Jg === nothing
+            println("  class $g: no ray class representative ideal found - skipped")
+            continue
+        end
+
+        local alpha, rho
+        ok = true
+        try
+            alpha, rho, _, _ = find_alpha_rhoB_s1_s2_O(Jg, rho_reps[g], rho_base, g, P_O, mP_O,
+                                                         O, K, d, rho_base, d_check;
+                                                         mn_height = 3000, q_gen_height = 3000)
+        catch e
+            ok = false
+        end
+        if !ok || !(fm(alpha) > 0 && fc(alpha) > 0) || !(fm(rho) > fc(rho))
+            println("  class $g: could not get a valid Theorem 2.19 (alpha,rho) - skipped")
+            continue
+        end
+
+        rho_bf = BigFloat(coeff(rho, 0)) + BigFloat(coeff(rho, 1)) * sqrt(BigFloat(D))
+        rho_c = fc(rho)
+
+        L_raw = hj_automorph_for_root(rho, D)
+        L = (L_raw[1,1] + L_raw[2,2]) > 0 ? L_raw : -L_raw
+
+        # the sign-normalized lift - THIS is what diagnose_stuck_monoid_lookup's
+        # Part 1 check omitted
+        r2 = QQ(p2, d)
+        n1 = Int(floor(Float64(r2) * rho_c - p1 / d)) - 1
+        r1 = QQ(p1, d) + n1
+        @assert Float64(r2) * rho_c - Float64(r1) > 0
+        rn = [p1 + d * n1, p2]
+
+        local A
+        try
+            A, _ = stabilizer_power_in_Gamma_s(L, [QQ(rn[1], d), QQ(rn[2], d)])
+        catch e
+            println("  class $g: could not build stabilizer matrix for the shifted point - skipped")
+            continue
+        end
+        val = Complex{BigFloat}(shin(A, rho_bf, rn, d))
+        is_match = abs(val - target_val) < tol
+        println("  class $g (rho=", rho, ", rn=", rn, "):  shin = ", val,
+                is_match ? "   <<< MATCH" : "")
+    end
+    println("\nIf none of the classes above matched, this is strong evidence that ",
+            "shin_val_lookup's own construction (raw point, base fiber only, no lift ",
+            "normalization) is not producing a value any Theorem-2.19-correct construction ",
+            "would ever assign to this point - a methodology mismatch, not a search-depth ",
+            "problem.")
+end
+
+
+"""
+    diagnose_full_monoid_membership(d::Int, p1::Int, p2::Int; tol::Float64 = 1e-9)
+
+The decisive test, as opposed to another partial hypothesis: the ray class
+monoid is FINITE. Rather than searching an ever-growing norm bound, or
+testing one construction against another, build the ENTIRE monoid (every
+class in every one of the 4 Picard fibers, via `ray_class_monoid_table_v2`
+- the direct, from-the-definition construction: every grid point in every
+fiber, correctly grouped by the Sigma-positive-unit equivalence, no search
+or norm bound involved at all) and check directly whether `shin_val_lookup`
+appears ANYWHERE in it.
+
+Two checks, from most to least specific:
+
+  1. SELF-CONSISTENCY: find the specific monoid class, within the BASE
+     fiber (F_class) alone, that (p1,p2) itself belongs to (i.e. the entry
+     whose `members` list contains (p1,p2)), and compare ITS shin_value
+     against shin_val_lookup - which was ALSO computed at this exact fiber,
+     for this exact point. These are two different code paths (v2's
+     from-the-definition construction vs twisted_chi_general's direct
+     covariance-based formula) evaluating what should be the SAME thing.
+     If they disagree, that is a direct, surgical proof of a bug in one of
+     the two constructions - not a search-depth or coverage question at
+     all.
+
+  2. FULL-TABLE MEMBERSHIP: scan every entry across all 4 fibers for a
+     shin_value matching the target, exactly per the project owner's
+     proposal - if the finite monoid has been built completely and
+     correctly, the target MUST appear somewhere in it if it is a genuine,
+     reachable value at all. No match anywhere is definitive: it proves
+     shin_val_lookup does not correspond to any actual monoid class, i.e. a
+     real bug in how the target value itself is computed - not evidence
+     that a larger search or a different construction would eventually
+     succeed.
+
+Also reports the total entry/class counts per fiber, for context (how large
+the "entire monoid" actually is here).
+"""
+function diagnose_full_monoid_membership(d::Int, p1::Int, p2::Int; tol::Float64 = 1e-9)
+    F = AdmissibleTuple(d)
+    sd = _ray_class_shin_setup(F)
+    D, K = sd.D, sd.K
+    rho_reps, F_class = sd.rho_reps, sd.F_class
+    rho_base = rho_reps[F_class]
+
+    L_rho_base = hj_automorph_for_root(rho_base, D)
+    A_lookup, _ = stabilizer_power_in_Gamma_s(L_rho_base, [QQ(p1, d), QQ(p2, d)])
+    rho_bf_base = BigFloat(coeff(rho_base, 0)) + BigFloat(coeff(rho_base, 1)) * sqrt(BigFloat(D))
+    target_val = Complex{BigFloat}(shin(A_lookup, rho_bf_base, [p1, p2], d))
+    println("target (shin_val_lookup) = ", target_val)
+
+    println("\nBuilding the ENTIRE monoid (all 4 Picard fibers, every grid point, no search) ",
+            "via ray_class_monoid_table_v2 ...")
+    entries = ray_class_monoid_table_v2(F; shared_data = sd, verbose = true)
+    println("\nTotal monoid classes found across all fibers: ", length(entries))
+
+    # ---- check 1: self-consistency within the base fiber specifically ----
+    println("\n--- CHECK 1: self-consistency at the base fiber for (p1,p2)=(", p1, ",", p2, ") ---")
+    base_entry = nothing
+    for e in entries
+        e.A0 == F_class || continue
+        if (p1, p2) in e.members
+            base_entry = e
+            break
+        end
+    end
+    if base_entry === nothing
+        println("  (p1,p2) was not found in ANY base-fiber equivalence class - unexpected, ",
+                "since ray_class_monoid_table_v2 enumerates every point in 0:d-1 x 0:d-1 for ",
+                "every fiber. This itself would be worth reporting back.")
+    else
+        diff1 = abs(Complex{BigFloat}(base_entry.shin_value) - target_val)
+        println("  base-fiber class containing (", p1, ",", p2, "): p_vec=", base_entry.p_vec,
+                "  r_num=", base_entry.r_num, "  is_unit=", base_entry.is_unit)
+        println("  v2's shin_value for this class = ", base_entry.shin_value)
+        println("  |difference from shin_val_lookup| = ", diff1,
+                diff1 < tol ? "   <- SAME (self-consistent)" : "   <- DIFFERENT (inconsistent!)")
+    end
+
+    # ---- check 2: full-table membership, exactly the project owner's proposal ----
+    println("\n--- CHECK 2: does the target value appear ANYWHERE in the full monoid? ---")
+    best_idx = 0
+    best_diff = nothing
+    for (idx, e) in enumerate(entries)
+        diff = abs(Complex{BigFloat}(e.shin_value) - target_val)
+        if best_diff === nothing || diff < best_diff
+            best_diff = diff
+            best_idx = idx
+        end
+    end
+    if best_diff !== nothing && best_diff < tol
+        e = entries[best_idx]
+        println("  MATCH found: fiber A0=", e.A0, "  p_vec=", e.p_vec, "  r_num=", e.r_num,
+                "  is_unit=", e.is_unit, "  |diff|=", best_diff)
+    else
+        println("  NO MATCH anywhere in the full, exhaustively-constructed monoid.")
+        println("  closest entry found: fiber A0=", entries[best_idx].A0,
+                "  p_vec=", entries[best_idx].p_vec, "  |diff|=", best_diff, " (NOT within tol)")
+        println("\n  => Since the monoid is finite and has now been built in full (not merely ",
+                "searched up to some norm), this is definitive: shin_val_lookup does not ",
+                "correspond to any actual monoid class. This points to a bug in how the target ",
+                "value itself is computed (twisted_chi_general's shin_val_lookup construction), ",
+                "not in the search or in ray_class_monoid_table_v2's construction.")
+    end
+    return (target_val = target_val, entries = entries, base_entry = base_entry,
+            best_idx = best_idx, best_diff = best_diff)
+end
+
+
+"""
+    diagnose_coordinate_convention_mismatch(d::Int, points::Vector{Tuple{Int,Int}};
+                                             tol::Float64 = 1e-9)
+
+Follows up on diagnose_full_monoid_membership's finding for p=(0,18), d=21:
+shin_val_lookup(0,18) matched ray_class_monoid_table_v2's value for a
+DIFFERENT point, (3,0), to 73 decimal digits (diff ~ 1e-73, i.e. as exact
+as BigFloat precision allows) - not a coincidence, a genuine match, just
+under the "wrong" label. Since 18 = -3 mod 21, (0,18) = (0,-3), and the
+matched point (3,0) = (-(-3), 0) - exactly the map
+    (p1,p2) -> (-p2, p1)     (the 90-degree rotation matrix [[0,-1],[1,0]])
+This is a real, fixable coordinate-CONVENTION mismatch between how
+twisted_chi_general labels grid points for shin_val_lookup and how the rest
+of the table machinery (v2, and presumably the group table too) labels
+them - NOT evidence that the target is unreachable or needs a bigger
+search.
+
+This function tests whether that SAME rotation (or one of several other
+natural candidate transforms - identity, both 90-degree rotations, both
+reflections along the two axes, and negation of both coordinates) explains
+the match UNIVERSALLY across several points, not just the one already
+checked. For each point in `points` and each candidate transform T, checks
+whether shin_val_lookup(p) matches v2's base-fiber value at T(p) (using the
+SAME full-monoid membership lookup as diagnose_full_monoid_membership, so
+this does not depend on T(p) already being the SAME class in v2's own
+grouping - it looks up whichever class actually contains T(p)).
+
+READ THE OUTPUT AS: if exactly ONE candidate transform matches for EVERY
+point tested, that confirms a universal, systematic convention mismatch -
+almost certainly a swapped/negated (s1,s2) or (p1,p2) coordinate somewhere
+in how twisted_chi_general builds A_lookup/rho_bf_base relative to how the
+rest of the codebase (v2's rn construction, or the group table's own s1/s2)
+builds the equivalent quantities. If different points need different
+transforms, or none work consistently, the (0,18) match may be closer to a
+coincidence than a systematic bug, and this needs more investigation before
+attempting a fix.
+"""
+function diagnose_coordinate_convention_mismatch(d::Int, points::Vector{Tuple{Int,Int}};
+                                                  tol::Float64 = 1e-9)
+    F = AdmissibleTuple(d)
+    sd = _ray_class_shin_setup(F)
+    D, K = sd.D, sd.K
+    rho_reps, F_class = sd.rho_reps, sd.F_class
+    rho_base = rho_reps[F_class]
+    L_rho_base = hj_automorph_for_root(rho_base, D)
+    rho_bf_base = BigFloat(coeff(rho_base, 0)) + BigFloat(coeff(rho_base, 1)) * sqrt(BigFloat(D))
+
+    println("Building the full monoid once (shared across all points tested) ...")
+    entries = ray_class_monoid_table_v2(F; shared_data = sd, verbose = false)
+    println("Total monoid classes: ", length(entries), "\n")
+
+    transforms = [
+        ("identity",        (a, b) -> (a, b)),
+        ("rotate90 CCW",    (a, b) -> (-b, a)),
+        ("rotate90 CW",     (a, b) -> (b, -a)),
+        ("negate both",     (a, b) -> (-a, -b)),
+        ("swap",            (a, b) -> (b, a)),
+        ("reflect p1",      (a, b) -> (-a, b)),
+        ("reflect p2",      (a, b) -> (a, -b)),
+    ]
+
+    function value_at(p1, p2)
+        A_lookup, _ = stabilizer_power_in_Gamma_s(L_rho_base, [QQ(p1, d), QQ(p2, d)])
+        return Complex{BigFloat}(shin(A_lookup, rho_bf_base, [p1, p2], d))
+    end
+
+    function v2_value_containing(p1, p2)
+        pm = (mod(p1, d), mod(p2, d))
+        for e in entries
+            e.A0 == F_class || continue
+            pm in e.members && return Complex{BigFloat}(e.shin_value)
+        end
+        return nothing
+    end
+
+    results = Dict{String, Vector{Bool}}(name => Bool[] for (name, _) in transforms)
+    for (p1, p2) in points
+        target = value_at(p1, p2)
+        println("p=($p1,$p2):  shin_val_lookup = ", target)
+        for (name, tfun) in transforms
+            tp1, tp2 = tfun(p1, p2)
+            v2val = v2_value_containing(tp1, tp2)
+            ok = v2val !== nothing && abs(v2val - target) < tol
+            push!(results[name], ok)
+            println("    T=$name  ->  (", mod(tp1, d), ",", mod(tp2, d), ")  match=", ok)
+        end
+        println()
+    end
+
+    println("--- summary: which transform matched EVERY point tested? ---")
+    any_universal = false
+    for (name, _) in transforms
+        all_ok = all(results[name])
+        println("  $name: ", count(results[name]), "/", length(points), " points matched",
+                all_ok ? "   <<< UNIVERSAL MATCH" : "")
+        any_universal |= all_ok
+    end
+    any_universal || println("\nNo single candidate transform explained every point tested - ",
+                              "the true mismatch (if it is one) may not be one of the 7 simple ",
+                              "candidates tried here.")
+    return results
+end
+
+
+"""
     diagnose_monoid_lookup_v2_timing(d::Int; n_candidates_per_class = 3,
                                       coord_bound = 5)
 
@@ -5996,6 +6619,18 @@ function test_all_twists(d::Int)
         println("  missing indices: ", findall(x -> x === nothing, ray_class_lookup_table))
     end
 
+    # Built once for the whole run: the ENTIRE ray class monoid
+    # Jbar_m^flat(O), per the project owner's revised approach - the monoid
+    # is finite and small (592 classes for d=21), so build it in full and do
+    # a direct value lookup on a group-table miss, rather than an
+    # incremental norm-bound search (ray_class_monoid_lookup, now
+    # superseded - see its docstring). Threaded through every
+    # twisted_chi_general call below exactly like ray_class_lookup_table.
+    println("\nComputing the full ray class monoid table once for this run ",
+            "(used by every twisted_chi_general call below on a group-table miss) ...")
+    full_monoid_table = ray_class_monoid_table_v2(F; shared_data = sd, verbose = true)
+    println("  done: ", length(full_monoid_table), " monoid classes across all Picard fibers.")
+
     # Persistent, growing extension of the ray class table into the monoid
     # Jbar_m^flat(O) (see ray_class_monoid_lookup's docstring for the exact
     # project-owner algorithm and definitions) - shared across every twist
@@ -6032,7 +6667,8 @@ function test_all_twists(d::Int)
                                                 ray_class_lookup_table = ray_class_lookup_table,
                                                 monoid_table = monoid_table,
                                                 candidate_cache = candidate_cache,
-                                                class_hints = class_hints)
+                                                class_hints = class_hints,
+                                                full_monoid_table = full_monoid_table)
     end
 
     n_nonprincipal = min(20, length(nonprincipal_triples))
@@ -6048,7 +6684,8 @@ function test_all_twists(d::Int)
                                                 ray_class_lookup_table = ray_class_lookup_table,
                                                 monoid_table = monoid_table,
                                                 candidate_cache = candidate_cache,
-                                                class_hints = class_hints)
+                                                class_hints = class_hints,
+                                                full_monoid_table = full_monoid_table)
     end
 end
 
@@ -6547,4 +7184,4 @@ function test_ray_class_covariance(d_val::Int; p1::Int = 0, p2::Int = 1)
             shin_conj_recheck = shin_conj)
 end
 
-diagnose_stuck_monoid_lookup(21, 0, 18)
+test_all_twists(21)

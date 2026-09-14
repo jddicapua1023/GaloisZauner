@@ -1,13 +1,12 @@
-
 using Random
 #Random.seed!(305817264)
 #Random.seed!(672049183)
 #Random.seed!(891357246)
-Random.seed!(384726195)
+#Random.seed!(384726195)
 #Random.seed!(927401853)
 #Random.seed!(112358013)
 #Random.seed!(654890271)
-#Random.seed!(208475639)
+Random.seed!(208475639)
 
 
 
@@ -2259,7 +2258,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 p = [p1, p2]
                 gp = [p1, mod(Ng * p2, d)]
                 newp = mod.(M_g * p, d)
-                QA = BigFloat(-QQ_form(newp...) / (d * (d - 2)))
+                QA = BigFloat(-QQ_form(newp...)) / BigFloat(d * (d - 2))
                 s = isodd(d) ? 1 : (1 + newp[1]) * (1 + newp[2])
                 new_ovs[gp[1]+1, gp[2]+1] = ζ^QA * (-1)^s * c_g *
                                               shin_of_tuple(gF, newp)
@@ -2896,16 +2895,52 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
 
                 println("    p=($p1,$p2): integralnewdu = ", integralnewdu)
 
-                QA = BigFloat(-QQ_form_p(integralnewdu...) / (d * (d - 2)))
-                s = isodd(d) ? 1 : (1 + integralnewdu[1]) * (1 + integralnewdu[2])
-                # "The acted on shin value": computed via the general shin
-                # wrapper directly on the RAW (not necessarily HJ-reduced)
-                # A_bj_p/rho_j_bf_p - per project owner, this is exactly
-                # why the general wrapper was built, so this no longer
-                # needs rho_j (or A_bj_p) to already be HJ-reduced the way
-                # shin_rm strictly requires.
-                new_ovs[gp[1]+1, gp[2]+1] = ζ^QA * (-1)^s * c_g_j_p *
-                                              shin(A_bj_p, rho_j_bf_p, integralnewdu, d)
+                # ---- PHASE FIX (9/13, revised after review) ----
+                # Reference: the PRINCIPAL path gives arg v(p)v(-p) = 0 on all 440
+                # points, and evaluates every phase-determining factor with ONE
+                # object - the TUPLE's canonical A (gF.A), for every point:
+                #     QA = -Q_{gF.A}(newp)/(d(d-2)),  c from rademacher(gF.A),
+                #     shin_of_tuple(gF, newp),
+                # with newp in the tuple's own coordinates. This path did not:
+                #   (a) shin was evaluated via the wrapper with A_bj_p, the
+                #       per-point MINIMAL stabilizer power (L^3 for generic
+                #       points, L^1 for the two L_j-fixed points) - not the
+                #       tuple's A; and
+                #   (b) QA used gF_j.A's form on the UNREDUCED du, although the
+                #       wrapper evaluates in the HJ-reduced frame (du_red).
+                # A first revision of this fix made QA/c consistent with A_red =
+                # R*A_bj*R^-1 - i.e. with the minimal stabilizer power - which is
+                # the wrong A: Q_{gF.A} is always divisible by d(d-2) (the tuple's
+                # A is I mod d(d-2)), which is exactly why the original exact
+                # division never failed in 22,000+ evaluations, and Q_{A_red}
+                # failed precisely at p=(7,7), du=[14,14], an L_j-FIXED point
+                # where A_bj = L^1 != tuple power. Now: keep the reduction to
+                # du_red (the coordinate change the principal path never needs)
+                # and evaluate QA, c and shin ALL with the tuple's A on du_red -
+                # the principal-path recipe applied verbatim to (gF_j, du_red).
+                # The wrapper's A_bj-based value is kept for the diagnostic only.
+                red_p = find_hj_reducing_matrix(A_bj_p, rho_j_bf_p)
+                beta_p = red_p.root_used == :x ? red_p.x0 : red_p.conjx0
+                s_R_p = Int(sign(red_p.R[2,1] * beta_p + red_p.R[2,2]))
+                du_red = mod.(s_R_p .* (red_p.R * integralnewdu), d)
+                QA_old = BigFloat(-QQ_form_p(integralnewdu...)) / BigFloat(d * (d - 2))
+                QA = BigFloat(-QQ_form_p(du_red...)) / BigFloat(d * (d - 2))
+                s = isodd(d) ? 1 : (1 + du_red[1]) * (1 + du_red[2])
+                shin_tuple_val = shin_of_tuple(gF_j_p, du_red)
+                shin_wrapper_val = shin(A_bj_p, rho_j_bf_p, integralnewdu, d)
+                # roots of gQ_j = <a,b,c>: a t^2 + b t + c = 0, printed next to the
+                # wrapper's reduced_root so a frame mismatch would be visible.
+                aQ, bQ, cQ = Int(gQ_j_p.a), Int(gQ_j_p.b), Int(gQ_j_p.c)
+                sqQ = sqrt(BigFloat(bQ^2 - 4 * aQ * cQ))
+                println("    p=($p1,$p2): [phase-fix] det(R) = ", red_p.detR, "  s_R = ", s_R_p,
+                        "  du_red = ", du_red,
+                        "  QA(tuple A, du_red) = ", Float64(QA),
+                        "  QA(old: tuple A, unreduced du) = ", Float64(QA_old),
+                        "  |shin_of_tuple| = ", Float64(abs(shin_tuple_val)),
+                        "  |shin wrapper(A_bj)| = ", Float64(abs(shin_wrapper_val)),
+                        "  reduced_root = ", Float64(red_p.reduced_root),
+                        "  roots of gQ_j = ", Float64((-bQ + sqQ) / (2 * aQ)), ", ", Float64((-bQ - sqQ) / (2 * aQ)))
+                new_ovs[gp[1]+1, gp[2]+1] = ζ^QA * (-1)^s * c_g_j_p * shin_tuple_val
 
                 # DIAGNOSTIC (purely additive, off by default): dump every
                 # phase-determining intermediate quantity for hand-picked
@@ -5122,7 +5157,7 @@ function check_nonunit_shift_invariance(d::Int; p1::Union{Int,Nothing} = nothing
         integralnewdu = [du_to_int_mod_d_local(d * u, d) for u in newdu]
 
         c_g_j_cand = e(-BigFloat(rademacher(gF_j_cand.A)) / 24) / (chi * sqrt(BigFloat(d + 1)))
-        QA = BigFloat(-QQ_form_cand(integralnewdu...) / (d * (d - 2)))
+        QA = BigFloat(-QQ_form_cand(integralnewdu...)) / BigFloat(d * (d - 2))
         s_par = isodd(d) ? 1 : (1 + integralnewdu[1]) * (1 + integralnewdu[2])
 
         value = ζ^QA * (-1)^s_par * c_g_j_cand * shin(A_bj_cand, rho_j_bf, integralnewdu, d)
@@ -7211,19 +7246,21 @@ function diagnose_twist_across_seeds(d::Int, J_gens::Vector, gamma_coords::Tuple
                                                candidate_cache = Dict{Tuple{Int,Int,Int},Any}(),
                                                class_hints = Dict{Any,NamedTuple}(),
                                                full_monoid_table = full_monoid_table)
-        fails = Tuple{Int,Int}[]
+        fails = Tuple{Int,Int}[]; phase_fails = Tuple{Int,Int}[]
         for p1 in 0:d-1, p2 in 0:d-1
             (p1 == 0 && p2 == 0) && continue
             pr = new_ovs[p1+1, p2+1] * new_ovs[mod(-p1, d)+1, mod(-p2, d)+1]
             abs(Float64(abs(pr)) - 1.0 / (d + 1)) > tol && push!(fails, (p1, p2))
+            abs(Float64(angle(pr))) > 1e-8 && push!(phase_fails, (p1, p2))
         end
-        push!(results, (seed = sdn, class = uJ, gF = gF, n_fail = length(fails), fails = sort(fails)))
+        push!(results, (seed = sdn, class = uJ, gF = gF, n_fail = length(fails), fails = sort(fails),
+                        n_phase_fail = length(phase_fails)))
     end
 
     println("\n\n=== SEED SUMMARY === (same J and gamma on every seed)")
     for r in results
         println("seed ", r.seed, ":  Picard class label ", r.class, "   gF = ", r.gF,
-                "   failing pairs: ", r.n_fail)
+                "   failing pairs (magnitude): ", r.n_fail, "   pairs with nonzero phase: ", r.n_phase_fail)
         r.n_fail > 0 && println("    failing points: ", r.fails)
     end
     nf = [r.n_fail for r in results]

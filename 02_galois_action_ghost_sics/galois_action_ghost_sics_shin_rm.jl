@@ -1140,7 +1140,10 @@ function find_b_with_verified_principal_product(O, K, J, moduli;
     b2 = _nf_elem_of(K, basis(O)[2])
     J_gens_nf = [_nf_elem_of(K, x) for x in basis(J)]
 
+    t_b = time()
     for height in 1:max_height
+        height >= 3 && println(stderr, "    [b-search] J = ", J, "  height ", height, "/", max_height,
+                               "  (", round(time() - t_b, digits = 1), " s so far; cost ~ height^4 per level)")
         for c1 in -height:height, c2 in -height:height
             for d1 in -height:height, d2 in -height:height
                 (abs(c1) != height && abs(c2) != height &&
@@ -1165,6 +1168,18 @@ function find_b_with_verified_principal_product(O, K, J, moduli;
                     false
                 end
                 cop || continue
+
+                # Same J_m^*(O) requirement as in enumerate_principal_ray_classes:
+                # coprimality to the moduli does not imply invertibility when a
+                # conductor prime is not among them (d=15: q=4, moduli 15 and 16;
+                # 16 = 2^4 does catch it here, but keep the check explicit - b_O
+                # is later inverted, and a non-invertible b would fail silently).
+                inv_ok = try
+                    first(Hecke.is_invertible(I))
+                catch
+                    false
+                end
+                inv_ok || continue
 
                 I_gens_nf = [_nf_elem_of(K, x) for x in basis(I)]
                 prod_gens = lattice_product_gens(J_gens_nf, I_gens_nf)
@@ -1377,7 +1392,11 @@ function find_alpha_rho_direct(I, K, O, d_val; mn_height::Int = 3000,
             "  |bd2|^2 = ", e2[1]^2+e2[2]^2)
 
     n_mn_tried = 0
+    t_mn = time()
     for h in 0:mn_height
+        (h in (10, 25, 50, 100, 200, 400, 800, 1600, 3000)) &&
+            println(stderr, "    [mn-search] height ", h, "/", mn_height,
+                    "  (", round(time() - t_mn, digits = 1), " s so far; no (alpha, rho_B) accepted yet)")
         for m in -h:h, n in -h:h
             max(abs(m), abs(n)) == h || continue
             (m == 0 && n == 0) && continue
@@ -1827,8 +1846,18 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
     verbose && println("  [two-stage] searching primitive (m,n) pairs for alpha, rho_B jointly")
 
     n_mn_tried = 0
-
+    # rejection tally per Stage-1 filter, so a fruitless search reports WHICH
+    # condition kills every candidate rather than just "nothing found"
+    rej = Dict(:mixed_sign => 0, :root_order => 0, :root_order_flipped => 0,
+               :excluded => 0, :rational => 0,
+               :lattice_err => 0, :order_ne_O => 0, :alpha_ideal_err => 0,
+               :ideal_eq => 0, :accepted => 0)
+    t_mn = time()
     for h in 0:mn_height
+        (h in (10, 25, 50, 100, 200, 400, 800, 1600, 3000)) &&
+            println(stderr, "    [mn-search] height ", h, "/", mn_height,
+                    "  (", round(time() - t_mn, digits = 1), " s so far; no (alpha, rho_B) accepted yet)",
+                    "  Stage-1 rejections: ", sort(collect(rej), by = x -> -x[2]))
         for m in -h:h, n in -h:h
             max(abs(m), abs(n)) == h || continue   # only the new shell at this height
             (m == 0 && n == 0) && continue
@@ -1849,6 +1878,7 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
             elseif neg_ok
                 -alpha_cand
             else
+                rej[:mixed_sign] += 1
                 continue   # mixed sign at the two places - this direction can't work
             end
 
@@ -1865,33 +1895,59 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
             rho_B = beta / alpha_cand
             main_val  = Float64(emb_main(rho_B))
             conj_val  = Float64(emb_conj(rho_B))
-            # CHANGED: no longer negating or conjugating to force the
-            # "larger root" convention. If rho_B fails it (conj(rho_B) >
-            # rho_B), this (m,n) pair is rejected outright and the search
-            # continues to the next primitive pair, rather than trying to
-            # repair this one.
-            main_val > conj_val || continue
+            # BUGFIX (9/15, d=15 hang): the previous version rejected the
+            # (m,n) pair outright when rho_B failed the "larger root"
+            # convention (conj(rho_B) > rho_B). That is wrong, and for d=15
+            # (q=4, conductor at the prime 2, d+1 = 16) it is fatal: the
+            # Stage-1 rejection tally showed :root_order killing ~92% of all
+            # candidates and :mixed_sign the other ~8%, with EVERY other
+            # filter at exactly 0, at a stable ~11.7:1 ratio across all
+            # heights up to 400 - i.e. nothing ever reached Stage 2, at any
+            # height, and the mn_height=3000 search was guaranteed to run for
+            # ~30 min and then throw.
+            #
+            # The complementary basis vector is only determined up to the
+            # general Bezout solution (p_ + t*m, q_ + t*n), and gcdx returns
+            # one arbitrary representative; in particular -beta is an equally
+            # valid choice (m*(-q_) - n*(-p_) = -1 is still unimodular), and
+            # it sends rho_B -> -rho_B, which SWAPS which root is larger.
+            # So a failure here is a fixable orientation, not a bad (m,n).
+            # {alpha, -beta} spans the same lattice, so alpha*(Z + Z*(-rho_B))
+            # is the same ideal and the downstream bdO_O equality check is
+            # unaffected (:ideal_eq stayed 0 throughout, as expected).
+            if !(main_val > conj_val)
+                beta = -beta
+                rho_B = -rho_B
+                main_val, conj_val = -main_val, -conj_val
+                rej[:root_order_flipped] += 1
+            end
+            # after the flip this can only still fail if the two embeddings are
+            # equal, i.e. rho_B is rational - caught by the iszero(c1) test below
+            if !(main_val > conj_val); rej[:root_order] += 1; continue; end
 
-            (rho_B in exclude) && continue   # skip previously-rejected candidates, used by retry loops
+            if rho_B in exclude; rej[:excluded] += 1; continue; end
 
             c1 = coeff(rho_B, 1)
-            iszero(c1) && continue   # rho_B must have a nonzero irrational part
+            if iszero(c1); rej[:rational] += 1; continue; end
 
             rhoB_lattice_O = try
                 fractional_ideal(O, [K(1), rho_B])
             catch
+                rej[:lattice_err] += 1
                 continue
             end
-            order(rhoB_lattice_O) == O || continue
+            if order(rhoB_lattice_O) != O; rej[:order_ne_O] += 1; continue; end
 
             # explicit verification of the defining equation, rather than
             # trusting the algebraic derivation blindly
             alpha_ideal = try
                 fractional_ideal(O, [alpha])
             catch
+                rej[:alpha_ideal_err] += 1
                 continue
             end
-            alpha_ideal * rhoB_lattice_O == bdO_O || continue
+            if alpha_ideal * rhoB_lattice_O != bdO_O; rej[:ideal_eq] += 1; continue; end
+            rej[:accepted] += 1
 
             verbose && println("  [two-stage] alpha (totally positive) = ", alpha,
                     "  rho_B = ", rho_B, "  from (m,n)=(", m, ",", n, ")",
@@ -2052,6 +2108,8 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
         end
     end
 
+    println(stderr, "    [mn-search] EXHAUSTED: no Stage-1 candidate ever accepted.",
+            "  Final rejection tally: ", sort(collect(rej), by = x -> -x[2]))
     error("Could not find alpha, rho_B, s1, s2 within given bounds ",
           "(mn_height=", mn_height, ", q_gen_height=", q_gen_height, ")")
 end
@@ -2260,7 +2318,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 newp = mod.(M_g * p, d)
                 QA = BigFloat(-QQ_form(newp...)) / BigFloat(d * (d - 2))
                 s = isodd(d) ? 1 : (1 + newp[1]) * (1 + newp[2])
-                new_ovs[gp[1]+1, gp[2]+1] = ζ^QA * (-1)^s * c_g *
+                new_ovs[gp[1]+1, gp[2]+1] = chi * ζ^QA * (-1)^s * c_g *
                                               shin_of_tuple(gF, newp)
             end
         end
@@ -2940,7 +2998,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                         "  |shin wrapper(A_bj)| = ", Float64(abs(shin_wrapper_val)),
                         "  reduced_root = ", Float64(red_p.reduced_root),
                         "  roots of gQ_j = ", Float64((-bQ + sqQ) / (2 * aQ)), ", ", Float64((-bQ - sqQ) / (2 * aQ)))
-                new_ovs[gp[1]+1, gp[2]+1] = ζ^QA * (-1)^s * c_g_j_p * shin_tuple_val
+                new_ovs[gp[1]+1, gp[2]+1] = chi * ζ^QA * (-1)^s * c_g_j_p * shin_tuple_val
 
                 # DIAGNOSTIC (purely additive, off by default): dump every
                 # phase-determining intermediate quantity for hand-picked
@@ -3205,7 +3263,19 @@ function ray_class_group_representatives(K, O, m, Sigma)
         push!(all_reps, J)
         push!(all_triples, (J, trivial, one(K), is_principal_J))
         for (I, gamma, h) in principal_reps
-            I_O = contract(I, O)
+            # I_O MUST be the principal O-ideal (gamma) itself. It was previously
+            # rebuilt as contract(OK*(gamma), O), but (gamma*OK) meet O equals
+            # gamma*O ONLY when gamma is coprime to the conductor of O. For d=21
+            # (conductor prime 3 | d) every generator coprime to m is coprime
+            # to the conductor, so the round trip was the identity. For d=15
+            # (conductor 4*OK, prime 2 not dividing m=15) even-norm generators
+            # are legitimately in J_m^*(O) but the contraction returns a
+            # strictly larger, NON-invertible module (e.g. gamma=-2(7+4sqrt3):
+            # gamma*O has index 4 in O, contract(gamma*OK,O)=2Z+4sqrt3*Z has
+            # index 2). That mismatch is exactly what the fast-fiber check
+            # "elem_check does not generate Jfull*b_O" detected on all 48
+            # even-norm entries (9/15 run). Build (gamma) directly in O.
+            I_O = ideal(O, O(elem_in_nf(gamma)))
             push!(all_reps, J * I_O)
             push!(all_triples, (J, I_O, elem_in_nf(gamma), is_principal_J))
         end
@@ -3569,6 +3639,75 @@ function _ray_class_shin_setup(F::AdmissibleTuple)
             gQ_reps = gQ_reps, F_class = F_class, d_check = d_check)
 end
 
+"""
+    fiber_orientation_sign(K, O, rho_B, rho_ref; unit_bound = 60)
+
+Orientation of the lattice basis (rho_B, 1) relative to (rho_ref, 1), for two
+roots in the SAME Picard class: with mu*(Z+Z*rho_B) = Z+Z*rho_ref, returns
+`(sign(N(mu)), mu)`. sign(N(mu)) = +1 means the GL_2(Z) element taking rho_ref
+to rho_B has det +1 (same NARROW class); -1 means det -1 (opposite narrow
+class), in which case the covariance theorem's det = -1 branch applies and a
+shin value computed at rho_B is the invariant of the class evaluated at the
+CONJUGATE of the reference root. Returns `(nothing, nothing)` if the quotient
+lattice could not be verified principal (should not happen for same-class
+roots).
+
+Why this matters (9/15, d=15): find_alpha_rhoB_s1_s2_O only enforces
+rho_B > rho_B' on each root by itself, which is orientation-blind. For d=21
+every anchor root happened to be rho_ref + integer (det +1), so the group and
+monoid tables were in the same frame as twisted_chi_general's lookup at
+rho_F. For d=15 BOTH anchors came out with N(mu) < 0 (-47 and -13/3), so every
+table value was conj(lookup value) (verified: test_ray_class_covariance gave
+exact complex conjugates to ~55 digits) and no lookup could ever succeed.
+The table builders now evaluate such fibers at conj(rho_B) instead. (If O had
+a unit of norm -1 the sign of N(mu) would be ambiguous, but then wide = narrow
+class and both frames give the same class invariant.)
+"""
+function fiber_orientation_sign(K, O, rho_B, rho_ref; unit_bound::Int = 60)
+    LB_gens = [K(1), K(rho_B)]
+    NB = norm(fractional_ideal(O, LB_gens))
+    LB_inv = fractional_ideal(O, [quad_conj(K, g) // NB for g in LB_gens])
+    Q = fractional_ideal(O, [K(1), K(rho_ref)]) * LB_inv
+    okp, mu = try
+        is_principal_O_verified(K, O, [_nf_elem_of(K, x) for x in basis(Q)]; unit_bound = unit_bound)
+    catch
+        (false, nothing)
+    end
+    okp || return (nothing, nothing)
+    return (norm(K(mu)) > 0 ? 1 : -1, mu)
+end
+
+"""
+    root_bf_in_frame(rho_B, D, conj_frame::Bool)
+
+BigFloat value of `rho_B` in the main embedding (conj_frame = false) or of its
+conjugate (conj_frame = true). NOTE: handing `shin` the conjugate root does NOT
+compute shin_A^r(conj(rho_B)) - find_hj_reducing_matrix then ends with the
+wrong root on top (its "reduced_root < 1" warning) - so the table builders do
+not use the conj_frame = true branch; they use `shin_value_in_frame` instead.
+"""
+function root_bf_in_frame(rho_B, D, conj_frame::Bool)
+    c0 = BigFloat(coeff(rho_B, 0)); c1 = BigFloat(coeff(rho_B, 1)) * sqrt(BigFloat(D))
+    return conj_frame ? c0 - c1 : c0 + c1
+end
+
+"""
+    shin_value_in_frame(A, rho_B, D, p_vec, d, conj_frame::Bool)
+
+The class invariant shin_A^{p/d} for the representative (rho_B, p) expressed
+in the REFERENCE root's frame: shin evaluated at rho_B's main embedding when
+the fiber has orientation det +1, and its COMPLEX CONJUGATE when det -1
+(fiber_orientation_sign). Empirical basis: test_ray_class_covariance(15;0,1)
+found the trivial ray class's value computed at the det -1 anchor root
+(J = O, b_O = (1+2*sqrt(12))) to be exactly conj(shin^{[0,1]}(rho_F)) to ~55
+digits, i.e. the frame flip acts as complex conjugation on the values.
+"""
+function shin_value_in_frame(A, rho_B, D, p_vec, d, conj_frame::Bool)
+    v = shin(A, root_bf_in_frame(rho_B, D, false), p_vec, d)
+    return conj_frame ? conj(v) : v
+end
+
+
 function ray_class_shin_table(F::AdmissibleTuple;
                                mn_height::Int = 3000,
                                q_gen_height::Int = 3000,
@@ -3800,8 +3939,11 @@ function ray_class_shin_table_fast(F::AdmissibleTuple;
                     Float64(emb_conj(elem2_anchor)) > 0 ||
                         error("elem2_anchor is not sign-adjusted as expected (emb_conj <= 0)")
                     L = hj_automorph_for_root(rho_B, D; max_u = max_u)
+                    osign, _ = fiber_orientation_sign(K, O, rho_B, rho_B_init)   # see docstring
+                    osign === nothing && error("could not determine orientation of anchor rho_B")
                     fiber_cache[u_B] = (alpha = alpha, rho_B = rho_B, b_O = b_O,
-                                         elem2_anchor = elem2_anchor, L = L, J0 = Jfull)
+                                         elem2_anchor = elem2_anchor, L = L, J0 = Jfull,
+                                         conj_frame = (osign == -1))
                 end
                 t_anchor += dt
                 println("  [ANCHOR] alpha = ", alpha, "  rho_B = ", rho_B,
@@ -3862,9 +4004,7 @@ function ray_class_shin_table_fast(F::AdmissibleTuple;
                       "vector over d as expected")
             p_vec = [Int(numerator(p1_exact)), Int(numerator(p2_exact))]
 
-            rho_B_bf = BigFloat(coeff(rho_B, 0)) + BigFloat(coeff(rho_B, 1)) * sqrt(BigFloat(D))
-
-            val = shin(A, rho_B_bf, p_vec, d)
+            val = shin_value_in_frame(A, rho_B, D, p_vec, d, fiber_cache[u_B].conj_frame)
             println("  shin value = ", val)
             table[idx] = (Jfull, p_vec, val)
         catch e
@@ -3953,9 +4093,16 @@ function _ray_class_shin_table_fast_quiet_impl(F::AdmissibleTuple;
 
     for (idx, (J, I_O, gamma, is_principal_J)) in enumerate(all_triples)
         Jfull = all_reps[idx]
+        t_triple = time()
         try
             u_B = mP_O \ J
             is_anchor = (I_O == trivial_I_O)
+            # progress goes to STDERR: the public wrapper redirects stdout to
+            # devnull, so this is the only channel that stays visible. Anchors
+            # are the only expensive entries (two nested height-bounded
+            # searches); non-anchors reuse the fiber cache and are fast.
+            println(stderr, "  [table] triple ", idx, "/", n_classes, "  class ", u_B,
+                    is_anchor ? "  ANCHOR (running find_alpha_rhoB_s1_s2_O + b_O search) ..." : "")
 
             local alpha, rho_B, s1, s2
             if is_anchor
@@ -3971,8 +4118,19 @@ function _ray_class_shin_table_fast_quiet_impl(F::AdmissibleTuple;
                 Float64(emb_conj(elem2_anchor)) > 0 ||
                     error("elem2_anchor is not sign-adjusted as expected (emb_conj <= 0)")
                 L = hj_automorph_for_root(rho_B, D; max_u = max_u)
+                # Orientation of this anchor root relative to the class's
+                # reference root (see fiber_orientation_sign): det -1 means the
+                # whole fiber must be evaluated at conj(rho_B).
+                osign, mu_or = fiber_orientation_sign(K, O, rho_B, rho_B_init)
+                osign === nothing && error("could not determine orientation of anchor rho_B = ", rho_B,
+                                           " relative to rho_ref = ", rho_B_init)
+                conj_frame = (osign == -1)
+                println(stderr, "  [table] anchor class ", u_B, ": N(mu) = ", norm(K(mu_or)),
+                        "  orientation det = ", osign,
+                        conj_frame ? "  -> conjugating this fiber's values (frame flip)" : "")
                 fiber_cache[u_B] = (alpha = alpha, rho_B = rho_B, b_O = b_O,
-                                     elem2_anchor = elem2_anchor, L = L, J0 = Jfull)
+                                     elem2_anchor = elem2_anchor, L = L, J0 = Jfull,
+                                     conj_frame = conj_frame)
             else
                 haskey(fiber_cache, u_B) ||
                     error("no anchor cached yet for this Picard class - expected the trivial-I_O ",
@@ -4017,11 +4175,15 @@ function _ray_class_shin_table_fast_quiet_impl(F::AdmissibleTuple;
                       "vector over d as expected")
             p_vec = [Int(numerator(p1_exact)), Int(numerator(p2_exact))]
 
-            rho_B_bf = BigFloat(coeff(rho_B, 0)) + BigFloat(coeff(rho_B, 1)) * sqrt(BigFloat(D))
-
-            val = shin(A, rho_B_bf, p_vec, d)
-            table[idx] = (J = Jfull, s1 = s1, s2 = s2, rho_B = rho_B, shin_value = val)
+            conj_frame = fiber_cache[u_B].conj_frame
+            val = shin_value_in_frame(A, rho_B, D, p_vec, d, conj_frame)
+            table[idx] = (J = Jfull, s1 = s1, s2 = s2, rho_B = rho_B, shin_value = val,
+                          conj_frame = conj_frame)
+            is_anchor && println(stderr, "  [table] triple ", idx, " done in ",
+                                 round(time() - t_triple, digits = 1), " s")
         catch e
+            println(stderr, "  [table] triple ", idx, " FAILED after ",
+                    round(time() - t_triple, digits = 1), " s: ", sprint(showerror, e))
             table[idx] = nothing
         end
     end
@@ -4085,6 +4247,159 @@ function check_table_units(d::Int)
 end
 
 """
+    check_table_conjugation_closure(d::Int; tol::Float64 = 1e-10)
+
+Complex conjugation is an element of Gal(ray class field / K), so it permutes
+ray classes; hence the SET of group-table shin values must be closed under
+z -> conj(z). For every entry, looks for an entry whose value is conj(its
+value) and reports closure per Picard fiber (and per sign of N(gamma) of the
+entry's principal part, since orientation is what a mixed-sign generator
+changes). A fiber that is NOT closed cannot be a correct set of ray-class
+invariants. Added 9/15 after test_ray_class_covariance(15;0,1) showed the
+F-fiber anchor value is EXACTLY conj(shin_lookup) with det(gamma) = -1 and
+N(mu) = -47 < 0, i.e. the anchor root rho_B is in the right wide Picard class
+but the opposite NARROW class (orientation) relative to rho_F.
+"""
+function check_table_conjugation_closure(d::Int; tol::Float64 = 1e-10)
+    F = AdmissibleTuple(d)
+    sd = _ray_class_shin_setup(F)
+    K, O, mP_O = sd.K, sd.O, sd.mP_O
+    tbl = ray_class_shin_table_fast_quiet(F; shared_data = sd)
+    vals = [e === nothing ? nothing : Complex{BigFloat}(e.shin_value) for e in tbl]
+    # For each entry i, find entries j with |v_j| == |v_i| (modulus match), then
+    # classify the ratio conj(v_i)/v_j: +1 (literal closure), -1 (closure up to
+    # sign), or something else (printed as a phase in units of 2*pi/(2*d*(d-2)),
+    # the natural root-of-unity scale of the ghost phase factors).
+    n_plus = 0; n_minus = 0; n_other = 0; n_none = 0; n_total = 0
+    per_fiber = Dict{Any,Vector{Int}}()   # cls => [plus, minus, other, none]
+    for (i, v) in enumerate(vals)
+        v === nothing && continue
+        n_total += 1
+        cls = mP_O \ tbl[i].J
+        st = get!(per_fiber, cls, [0, 0, 0, 0])
+        c = conj(v)
+        js = [j for (j, w) in enumerate(vals) if w !== nothing && abs(abs(w) - abs(c)) < tol * abs(c)]
+        if isempty(js)
+            n_none += 1; st[4] += 1
+            println("  entry ", i, " (class ", cls, "): no entry with matching modulus |v| = ", Float64(abs(v)))
+            continue
+        end
+        found = false
+        for j in js
+            r = c / vals[j]
+            if abs(r - 1) < tol
+                n_plus += 1; st[1] += 1; found = true; break
+            elseif abs(r + 1) < tol
+                n_minus += 1; st[2] += 1; found = true; break
+            end
+        end
+        if !found
+            n_other += 1; st[3] += 1
+            j = js[1]
+            r = c / vals[j]
+            ph = Float64(angle(r)) / (2 * pi) * (2 * d * (d - 2))
+            println("  entry ", i, " (class ", cls, "): conj(v_i)/v_", j, " = ", Float64(real(r)), " + ",
+                    Float64(imag(r)), "im  (|r| = ", Float64(abs(r)), ", phase = ", ph,
+                    " in units of 2pi/(2d(d-2)))")
+        end
+    end
+    println("check_table_conjugation_closure(", d, "): of ", n_total, " entries, conj(v) is in the table:")
+    println("  exactly (+1): ", n_plus, "   up to sign (-1): ", n_minus,
+            "   other ratio: ", n_other, "   no modulus match at all: ", n_none)
+    for (cls, st) in sort(collect(per_fiber), by = x -> string(x[1]))
+        println("  fiber ", cls, ": +1: ", st[1], "  -1: ", st[2], "  other: ", st[3], "  none: ", st[4])
+    end
+    return tbl
+end
+
+"""
+    diagnose_orientation_flip(d::Int; p1::Int = 0, p2::Int = 1, tol::Float64 = 1e-10)
+
+Tests the orientation hypothesis directly at one point. Takes the F-fiber
+ANCHOR entry (rho_B, s1, s2) of the group table and re-evaluates its shin
+value with the lattice basis orientation reversed:
+    rho_B -> -rho_B,  s2 -> -s2  (so s2*rho_B - s1 is the SAME element),
+    L, A recomputed for -rho_B.
+Prints the original table value, its conjugate, the lookup value
+shin^{[p1,p2]}_{A_lookup}(rho_F) that twisted_chi_general fails to find, and
+the flipped value - and whether the flipped value equals the lookup value
+and/or conj(table value). Also reports, for EVERY anchor in the table, the
+sign of N(mu) for mu*(Z+Z*rho_B) = Z+Z*rho_rep (rho_rep = rho_reps[class])
+when that quotient is principal, i.e. whether each fiber's anchor is
+oriented consistently (det +1) with that class's reference root.
+"""
+function diagnose_orientation_flip(d::Int; p1::Int = 0, p2::Int = 1, tol::Float64 = 1e-10)
+    F = AdmissibleTuple(d)
+    sd = _ray_class_shin_setup(F)
+    D, K, O, mP_O, rho_reps, F_class = sd.D, sd.K, sd.O, sd.mP_O, sd.rho_reps, sd.F_class
+    tbl = ray_class_shin_table_fast_quiet(F; shared_data = sd)
+    trivial_I_O = ideal(O, 1)
+
+    rho = rho_reps[F_class]
+    rho_bf = BigFloat(coeff(rho, 0)) + BigFloat(coeff(rho, 1)) * sqrt(BigFloat(D))
+    L_rho = hj_automorph_for_root(rho, D)
+    A_lookup, _ = stabilizer_power_in_Gamma_s(L_rho, [QQ(p1, d), QQ(p2, d)])
+    val_lookup = Complex{BigFloat}(shin(A_lookup, rho_bf, [p1, p2], d))
+    println("rho_F = ", rho, "   lookup value shin^[", p1, ",", p2, "](rho_F) = ", val_lookup)
+
+    # anchor orientation survey
+    println("\n--- anchor orientation survey (sign N(mu), mu*(Z+Z*rho_B) = Z+Z*rho_rep) ---")
+    for (i, e) in enumerate(tbl)
+        e === nothing && continue
+        sd.all_triples[i][2] == trivial_I_O || continue
+        cls = mP_O \ e.J
+        rho_rep = rho_reps[cls]
+        # inverse via the conjugate/norm trick (Hecke's inv() is avoided on the
+        # non-maximal order everywhere else in this file, for the same reason)
+        LB_gens = [K(1), e.rho_B]
+        NB = norm(fractional_ideal(O, LB_gens))
+        LB_inv = fractional_ideal(O, [quad_conj(K, g) // NB for g in LB_gens])
+        Q = fractional_ideal(O, [K(1), rho_rep]) * LB_inv
+        okp, mu = try
+            is_principal_O_verified(K, O, [_nf_elem_of(K, x) for x in basis(Q)])
+        catch err
+            (false, nothing)
+        end
+        if okp
+            nmu = norm(K(mu))   # rational in general (rho_rep may have denominators)
+            println("  anchor ", i, " class ", cls, ": rho_B = ", e.rho_B,
+                    "  N(mu) = ", nmu, "  => det = ", nmu > 0 ? "+1" : "-1")
+        else
+            println("  anchor ", i, " class ", cls, ": rho_B = ", e.rho_B,
+                    "  (quotient with rho_rep not verified principal - skipped)")
+        end
+    end
+
+    # flip experiment on the F-fiber anchor
+    idx = findfirst(i -> tbl[i] !== nothing && sd.all_triples[i][2] == trivial_I_O &&
+                         (mP_O \ tbl[i].J) == F_class, 1:length(tbl))
+    idx === nothing && error("no F-fiber anchor entry found")
+    e = tbl[idx]
+    val_table = Complex{BigFloat}(e.shin_value)
+    println("\nF-fiber anchor entry ", idx, ": J = ", e.J, "  rho_B = ", e.rho_B,
+            "  s1 = ", e.s1, "  s2 = ", e.s2)
+    println("  table value        = ", val_table)
+    println("  conj(table value)  = ", conj(val_table))
+
+    # Where does the lookup value sit in the (frame-corrected) table? The point
+    # (p1,p2) = (0,1) at rho_F is the unit rho_F itself, i.e. the TRIVIAL ray
+    # class, whose table entry is NOT the anchor (the anchor <47,...> = (1+2*sqrt12)
+    # is a different ray class) - so search all entries.
+    hits = [i for (i, t) in enumerate(tbl) if t !== nothing &&
+            abs(Complex{BigFloat}(t.shin_value) - val_lookup) < tol]
+    hits_conj = [i for (i, t) in enumerate(tbl) if t !== nothing &&
+                 abs(Complex{BigFloat}(t.shin_value) - conj(val_lookup)) < tol]
+    println("\n  entries whose value == lookup value:       ", hits,
+            isempty(hits) ? "" : "   J = " * string(tbl[hits[1]].J) *
+                                  "  gamma = " * string(sd.all_triples[hits[1]][3]))
+    println("  entries whose value == conj(lookup value): ", hits_conj,
+            isempty(hits_conj) ? "" : "   J = " * string(tbl[hits_conj[1]].J) *
+                                       "  gamma = " * string(sd.all_triples[hits_conj[1]][3]))
+    val_flip = val_table
+    return (val_lookup = val_lookup, val_table = val_table, val_flip = val_flip)
+end
+
+"""
     ray_class_monoid_shin_table(F; shared_data = nothing, group_table = nothing)
 
 The full table of KFA eq. (2.55): for m = dO, the image of Υ_m on the ray
@@ -4107,7 +4422,10 @@ function ray_class_monoid_shin_table(F::AdmissibleTuple; shared_data = nothing, 
     rhoBs = unique([e.rho_B for e in tbl if e !== nothing])
     entries = NamedTuple[]
     for rho_B in rhoBs
-        rho_B_bf = BigFloat(coeff(rho_B, 0)) + BigFloat(coeff(rho_B, 1)) * sqrt(BigFloat(D))
+        # honour the group table's per-fiber frame (see fiber_orientation_sign)
+        e_first = tbl[findfirst(e -> e !== nothing && e.rho_B == rho_B, tbl)]
+        cf = hasproperty(e_first, :conj_frame) ? e_first.conj_frame : false
+        rho_B_bf = root_bf_in_frame(rho_B, D, false)
         L = hj_automorph_for_root(rho_B, D)
         Lpos = (L[1,1] + L[2,2]) > 0 ? L : -L      # matrix of the totally positive unit
         I_B = fractional_ideal(O, [K(1), rho_B])
@@ -4126,6 +4444,7 @@ function ray_class_monoid_shin_table(F::AdmissibleTuple; shared_data = nothing, 
             end
             A, _ = stabilizer_power_in_Gamma_s(Lpos, [QQ(p1, d), QQ(p2, d)])
             val = shin(A, rho_B_bf, [p1, p2], d)
+            cf && (val = conj(val))                 # frame flip, see shin_value_in_frame
             x = K(p2) * rho_B - K(p1)
             rel = QQ(abs(norm(x))) / NI_B
             is_unit = isone(denominator(rel)) && gcd(Int(numerator(rel)), d) == 1
@@ -4356,7 +4675,17 @@ function ray_class_monoid_table_v2(F::AdmissibleTuple; shared_data = nothing,
         fm(rho) > fc(rho) ||
             error("ray_class_monoid_table_v2: rho = ", rho, " has rho <= rho' for Picard class ", g)
 
-        rho_bf = BigFloat(coeff(rho, 0)) + BigFloat(coeff(rho, 1)) * sqrt(BigFloat(D))
+        # Same orientation correction as the group table (see fiber_orientation_sign):
+        # only the root handed to `shin` changes; the residue/lift bookkeeping
+        # below (rho_c, Sigma-positive units, a_r) is ideal-level and stays.
+        osign_g, mu_g = fiber_orientation_sign(K, O, rho, rho_reps[g])
+        osign_g === nothing && error("ray_class_monoid_table_v2: could not determine orientation of rho = ",
+                                     rho, " relative to rho_reps[g] for class ", g)
+        conj_frame_g = (osign_g == -1)
+        verbose && println("  [monoid v2] class ", g, ": N(mu) = ", norm(K(mu_g)),
+                           "  orientation det = ", osign_g,
+                           conj_frame_g ? "  -> conjugating this class's values (frame flip)" : "")
+        rho_bf = root_bf_in_frame(rho, D, false)
         rho_c = fc(rho)
 
         # b_O for this class, needed to construct an actual usable IDEAL
@@ -4445,6 +4774,7 @@ function ray_class_monoid_table_v2(F::AdmissibleTuple; shared_data = nothing,
             rn = rnum[pt]
             A, _ = stabilizer_power_in_Gamma_s(L, [QQ(rn[1], d), QQ(rn[2], d)])
             val = shin(A, rho_bf, rn, d)
+            conj_frame_g && (val = conj(val))       # frame flip, see shin_value_in_frame
             x = K(pt[2]) * rho - K(pt[1])
             rel = QQ(abs(norm(x))) / NI_B
             is_unit = isone(denominator(rel)) && gcd(Int(numerator(rel)), d) == 1
@@ -7462,6 +7792,7 @@ function test_ray_class_group_size_first_n_tuples(n::Int)
     end
 end
 
+#test_all_twists(15)
 #diagnose_twist_across_seeds(21, [(5, 0), (3, 3//2)], (-20, -3), [208475639])
 
 #test_ray_class_group_size_first_n_tuples(101)
@@ -7625,7 +7956,9 @@ function diagnose_elem1_lookup(d_val::Int; p1::Int = 0, p2::Int = 1)
     # via setprecision, or locally within shin/shin_rm) rather than to
     # change any of the algebra above.
     old_prec = precision(BigFloat)
-    for prec in (1024, 4096, 16384)
+    # (9/15) 4096/16384 bits took effectively forever at d=15 (A entries ~2700)
+    # and 1024 already agreed with 256 to ~55 digits; precision is not the issue.
+    for prec in (1024,)
         setprecision(BigFloat, prec) do
             rho_bf_p = BigFloat(coeff(rho, 0)) + BigFloat(coeff(rho, 1)) * sqrt(BigFloat(D))
             sv = shin(A_lookup, rho_bf_p, [p1, p2], d)
@@ -7898,14 +8231,18 @@ function test_ray_class_covariance(d_val::Int; p1::Int = 0, p2::Int = 1)
             shin_conj_recheck = shin_conj)
 end
 
+#test_all_twists(15)
 #diagnose_twist_across_seeds(21, [(5, 0), (3, 3//2)], (-20, -3), [208475639])
 
 # The failing run's twist: J = <5, 3//2*sqrt(44) + 3>, gamma = 1, non-principal.
 # Forced onto every seed below (broken seed 208475639 + two others). Redirect
 # output to a file and read the "=== SEED SUMMARY ===" block at the end.
+#test_all_twists(15)
 #diagnose_twist_across_seeds(21, [(5, 0), (3, 3//2)], (-20, -3), [208475639])
 #diagnose_twist_across_seeds(21, [(5, 0), (3, 3//2)], (1, 0), [208475639])
 #diagnose_seed_lift_differences(21, [305817264, 672049183, 208475639])
 #diagnose_group_lookup_ambiguity(21)
 #test_all_twists(21; phase_debug_points = [(1,15),(20,6),(2,14),(19,7),(0,2),(0,19)])
-test_all_twists(21)
+
+#diagnose_orientation_flip(15; p1 = 0, p2 = 1)
+test_all_twists(15)

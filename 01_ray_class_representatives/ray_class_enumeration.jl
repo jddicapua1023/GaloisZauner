@@ -193,6 +193,13 @@ function enumerate_principal_ray_classes(K, ord, m, Sigma, N)
             n > norm_bound && continue
             I = try ideal(ord, gamma) catch; continue end
             coprime_to_m_ideal(I) || continue
+            # NOTE (9/15): a principal ideal (gamma), gamma != 0, is ALWAYS
+            # invertible (inverse (1/gamma)), so an is_invertible filter here
+            # is a no-op; the earlier "even-norm generators are not invertible"
+            # diagnosis was wrong. Even-norm gamma (coprime to m=15 but not to
+            # the conductor prime 2) ARE in J_m^*(O). The real d=15 bug was the
+            # consumer contracting gamma*OK back to O - see
+            # ray_class_group_representatives in the main file.
             push!(results, (gamma, I, n))
         end
         sort!(results, by = x -> x[3])
@@ -222,7 +229,11 @@ function enumerate_principal_ray_classes(K, ord, m, Sigma, N)
             end
 
             if is_new
-                push!(collected, (OK * I, gamma, n))   # lifted to OK
+                # Return the O-ideal (gamma) itself, NOT OK*I: lifting to OK and
+                # contracting back is not the identity when gamma meets the
+                # conductor (d=15, even norms), and every consumer wants an
+                # O-ideal anyway.
+                push!(collected, (I, gamma, n))
                 println("  Found class ", length(collected),
                         ": generator=", gamma, " norm=", n)
                 length(collected) >= N && break

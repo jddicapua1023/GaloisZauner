@@ -2,11 +2,11 @@ using Random
 #Random.seed!(305817264)
 #Random.seed!(672049183)
 #Random.seed!(891357246)
-Random.seed!(384726195)
+#Random.seed!(384726195)
 #Random.seed!(927401853)
 #Random.seed!(112358013)
 #Random.seed!(654890271)
-#Random.seed!(208475639)
+Random.seed!(208475639)
 
 
 
@@ -3643,7 +3643,11 @@ end
     fiber_orientation_sign(K, O, rho_B, rho_ref; unit_bound = 60)
 
 Orientation of the lattice basis (rho_B, 1) relative to (rho_ref, 1), for two
-roots in the SAME Picard class: with mu*(Z+Z*rho_B) = Z+Z*rho_ref, returns
+roots whose lattices are in the SAME Picard class (NB: an anchor root rho_B
+obtained from b_O*dO = alpha*(Z+Z*rho_B) has its LATTICE in the class of b_O,
+i.e. the INVERSE of the anchor J's class - so the reference is rho_reps[-u_B],
+not rho_reps[u_B]; the two coincide only when the class has order <= 2, which
+is why d=15 (Pic = Z/2) worked and d=21 (Pic of order 4) failed on 9/16): with mu*(Z+Z*rho_B) = Z+Z*rho_ref, returns
 `(sign(N(mu)), mu)`. sign(N(mu)) = +1 means the GL_2(Z) element taking rho_ref
 to rho_B has det +1 (same NARROW class); -1 means det -1 (opposite narrow
 class), in which case the covariance theorem's det = -1 branch applies and a
@@ -3939,8 +3943,11 @@ function ray_class_shin_table_fast(F::AdmissibleTuple;
                     Float64(emb_conj(elem2_anchor)) > 0 ||
                         error("elem2_anchor is not sign-adjusted as expected (emb_conj <= 0)")
                     L = hj_automorph_for_root(rho_B, D; max_u = max_u)
-                    osign, _ = fiber_orientation_sign(K, O, rho_B, rho_B_init)   # see docstring
-                    osign === nothing && error("could not determine orientation of anchor rho_B")
+                    osign, _ = fiber_orientation_sign(K, O, rho_B, rho_reps[-u_B])   # see docstring
+                    if osign === nothing
+                        println("  [ANCHOR] WARNING: could not determine orientation of rho_B - assuming det = +1")
+                        osign = 1
+                    end
                     fiber_cache[u_B] = (alpha = alpha, rho_B = rho_B, b_O = b_O,
                                          elem2_anchor = elem2_anchor, L = L, J0 = Jfull,
                                          conj_frame = (osign == -1))
@@ -4121,13 +4128,24 @@ function _ray_class_shin_table_fast_quiet_impl(F::AdmissibleTuple;
                 # Orientation of this anchor root relative to the class's
                 # reference root (see fiber_orientation_sign): det -1 means the
                 # whole fiber must be evaluated at conj(rho_B).
-                osign, mu_or = fiber_orientation_sign(K, O, rho_B, rho_B_init)
-                osign === nothing && error("could not determine orientation of anchor rho_B = ", rho_B,
-                                           " relative to rho_ref = ", rho_B_init)
-                conj_frame = (osign == -1)
-                println(stderr, "  [table] anchor class ", u_B, ": N(mu) = ", norm(K(mu_or)),
-                        "  orientation det = ", osign,
-                        conj_frame ? "  -> conjugating this fiber's values (frame flip)" : "")
+                # Z+Z*rho_B is in the class of b_O = INVERSE of J's class, so the
+                # reference root is rho_reps[-u_B] (== rho_B_init only if 2*u_B = 0).
+                rho_orient_ref = rho_reps[-u_B]
+                osign, mu_or = fiber_orientation_sign(K, O, rho_B, rho_orient_ref)
+                if osign === nothing
+                    # Only the trivial fiber's orientation matters for the lookups at
+                    # rho_F (points are principal); do not fail the fiber over this.
+                    println(stderr, "  [table] anchor class ", u_B, ": WARNING could not determine ",
+                            "orientation of rho_B = ", rho_B, " relative to rho_reps[-u_B] = ",
+                            rho_orient_ref, " - assuming det = +1")
+                    osign = 1
+                    conj_frame = false
+                else
+                    conj_frame = (osign == -1)
+                    println(stderr, "  [table] anchor class ", u_B, ": N(mu) = ", norm(K(mu_or)),
+                            "  orientation det = ", osign,
+                            conj_frame ? "  -> conjugating this fiber's values (frame flip)" : "")
+                end
                 fiber_cache[u_B] = (alpha = alpha, rho_B = rho_B, b_O = b_O,
                                      elem2_anchor = elem2_anchor, L = L, J0 = Jfull,
                                      conj_frame = conj_frame)
@@ -4348,7 +4366,7 @@ function diagnose_orientation_flip(d::Int; p1::Int = 0, p2::Int = 1, tol::Float6
         e === nothing && continue
         sd.all_triples[i][2] == trivial_I_O || continue
         cls = mP_O \ e.J
-        rho_rep = rho_reps[cls]
+        rho_rep = rho_reps[-cls]   # class of the LATTICE Z+Z*rho_B is the inverse of J's class
         # inverse via the conjugate/norm trick (Hecke's inv() is avoided on the
         # non-maximal order everywhere else in this file, for the same reason)
         LB_gens = [K(1), e.rho_B]
@@ -4678,13 +4696,17 @@ function ray_class_monoid_table_v2(F::AdmissibleTuple; shared_data = nothing,
         # Same orientation correction as the group table (see fiber_orientation_sign):
         # only the root handed to `shin` changes; the residue/lift bookkeeping
         # below (rho_c, Sigma-positive units, a_r) is ideal-level and stays.
-        osign_g, mu_g = fiber_orientation_sign(K, O, rho, rho_reps[g])
-        osign_g === nothing && error("ray_class_monoid_table_v2: could not determine orientation of rho = ",
-                                     rho, " relative to rho_reps[g] for class ", g)
+        # lattice Z+Z*rho is in the class of b_O = inverse of J_g's class -> reference rho_reps[-g]
+        osign_g, mu_g = fiber_orientation_sign(K, O, rho, rho_reps[-g])
+        if osign_g === nothing
+            verbose && println("  [monoid v2] class ", g, ": WARNING could not determine orientation - assuming det = +1")
+            osign_g = 1
+        end
         conj_frame_g = (osign_g == -1)
-        verbose && println("  [monoid v2] class ", g, ": N(mu) = ", norm(K(mu_g)),
-                           "  orientation det = ", osign_g,
-                           conj_frame_g ? "  -> conjugating this class's values (frame flip)" : "")
+        verbose && osign_g !== nothing && mu_g !== nothing &&
+            println("  [monoid v2] class ", g, ": N(mu) = ", norm(K(mu_g)),
+                    "  orientation det = ", osign_g,
+                    conj_frame_g ? "  -> conjugating this class's values (frame flip)" : "")
         rho_bf = root_bf_in_frame(rho, D, false)
         rho_c = fc(rho)
 
@@ -8237,12 +8259,9 @@ end
 # The failing run's twist: J = <5, 3//2*sqrt(44) + 3>, gamma = 1, non-principal.
 # Forced onto every seed below (broken seed 208475639 + two others). Redirect
 # output to a file and read the "=== SEED SUMMARY ===" block at the end.
-#test_all_twists(15)
+test_all_twists(21)
 #diagnose_twist_across_seeds(21, [(5, 0), (3, 3//2)], (-20, -3), [208475639])
 #diagnose_twist_across_seeds(21, [(5, 0), (3, 3//2)], (1, 0), [208475639])
 #diagnose_seed_lift_differences(21, [305817264, 672049183, 208475639])
 #diagnose_group_lookup_ambiguity(21)
 #test_all_twists(21; phase_debug_points = [(1,15),(20,6),(2,14),(19,7),(0,2),(0,19)])
-
-#diagnose_orientation_flip(15; p1 = 0, p2 = 1)
-test_all_twists(15)

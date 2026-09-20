@@ -1463,6 +1463,7 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
                                   mn_height::Int = 3000,           # bound for the joint (alpha,rho_B) primitive-vector search
                                   q_gen_height::Int = 3000,        # bound for locating a generator of Q = Jb_O * (alpha)^{-1}
                                   exclude::Vector = [],            # rho_B candidates to skip (used to retry for a DIFFERENT valid rho_B)
+                                  d1::Int = d_val + 1,             # the (d+1) coprimality ideal; pass d1 = d+1 explicitly when d_val is the modulus d-bar = 2d (even d)
                                   verbose::Bool = false,           # print internal [two-stage] search log (now called many times per outer retry loop, so off by default)
                                   alpha_hint = nothing,            # if alpha_hint, rho_B_hint, b_O_hint are ALL supplied,
                                   rho_B_hint = nothing,            # skip stage 1 (the expensive (m,n) search) entirely and
@@ -1710,7 +1711,7 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
     # here. b_O is now selected by directly EXHIBITING a generator mu of
     # J*b_O (disc-log-free, maximal-order machinery + HNF only), which is
     # the literal condition [b_O] = [J]^{-1} needs.
-    d1_ideal = ideal(O, d_val + 1)
+    d1_ideal = ideal(O, d1)   # NOT d_val + 1: for even d the modulus d_val = 2d but the coprimality ideal is still (d+1)
     b_O, mu_Jb = find_b_with_verified_principal_product(O, K, J, [dO_O, d1_ideal])
     verbose && println("  [two-stage] b_O (J*b_O verifiably principal) = ", b_O)
     verbose && println("  [two-stage] certified generator mu of J*b_O = ", mu_Jb)
@@ -2183,6 +2184,12 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                               full_monoid_table::Union{Nothing,Vector} = nothing,
                               phase_debug_points::Vector{Tuple{Int,Int}} = Tuple{Int,Int}[])
     d = Int(F.d)
+    # EVEN d (9/18): ray-class modulus d-bar (2d for even d). All Theorem 2.19
+    # point representations, lookups, class products and twisted points below
+    # live mod d-bar; the ghost cocycle shin^{p/d} and the phase scale d(d-2)
+    # keep d. See the principal branch (which validated this recipe with the
+    # twisted point M_g*p mod 2d) and the block comment before the grid loop.
+    dm = isodd(d) ? d : 2 * d
     D = Int(F.D)
     a = gen(K)
     OK = maximal_order(K)
@@ -2310,32 +2317,60 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         c_g = e(-BigFloat(rademacher(gF.A)) / 24) / (chi * sqrt(BigFloat(d + 1)))
         println("  c_g = ", c_g)
 
-        for p1 = 0:d-1
-            for p2 = 0:d-1
-                (p1 == 0 && p2 == 0) && continue
+        # EVEN d (9/18): the normalized ghost overlaps nu_p are functions on
+        # Z^2 with period d-bar = 2d (paper Def. 1.11 / Lemma 1.42), NOT d: the
+        # raw cocycle shin^{p/d}_A(rho) is d-periodic (Lemma 2.14) but the SF
+        # phase xi_d^{-Q(p)} (-1)^{(1+p1)(1+p2)} is only 2d-periodic. The
+        # identity nu_p * nu_{-p} = 1 (Thm 5.8) holds with -p the honest
+        # negative in Z^2, i.e. mod 2d. So for even d we build the twisted
+        # overlaps V on the full 2d x 2d grid - the twisted point M_g*p and the
+        # index (p1, Ng*p2) both taken mod 2d, with M_g lifted to Z/2d - check
+        # V(q) V(-q mod 2d) = 1/(d+1) for ALL q (no sign anywhere), and read the
+        # coefficient of D_p, p in [0,d)^2, straight off V. Reading off V is
+        # exactly the paper's Pi~ = sum_{p in [0,d)^2} mu~_{Gp} D_p and handles
+        # the Lemma 1.42 reduction automatically. For odd d, d-bar = d and this
+        # is byte-identical to the old code.
+        dbar = isodd(d) ? d : 2 * d
+        M_g_bar = isodd(d) ? M_g : multiplication_matrix_mod_d(K(gamma), rho_g, dbar, D)
+        isodd(d) || println("  M_g mod d-bar = 2d: ", M_g_bar)
+        isodd(d) || isodd(Ng) || error("even d: N(gamma) = ", Ng, " must be coprime to d-bar = 2d")
+
+        V = zeros(Complex{BigFloat}, dbar, dbar)
+        for p1 = 0:dbar-1
+            for p2 = 0:dbar-1
+                (mod(p1, d) == 0 && mod(p2, d) == 0) && continue
                 p = [p1, p2]
-                gp = [p1, mod(Ng * p2, d)]
-                newp = mod.(M_g * p, d)
-                QA = BigFloat(-QQ_form(newp...)) / BigFloat(d * (d - 2))
-                s = isodd(d) ? 1 : (1 + newp[1]) * (1 + newp[2])
-                new_ovs[gp[1]+1, gp[2]+1] = chi * ζ^QA * (-1)^s * c_g *
-                                              shin_of_tuple(gF, newp)
+                gp = mod.([p1, Ng * p2], dbar)          # index, mod d-bar
+                newp_bar = mod.(M_g_bar * p, dbar)       # phase argument (2d-periodic)
+                newp = mod.(newp_bar, d)                 # cocycle argument (d-periodic)
+                QA = BigFloat(-QQ_form(newp_bar...)) / BigFloat(d * (d - 2))
+                s = isodd(d) ? 1 : (1 + newp_bar[1]) * (1 + newp_bar[2])
+                V[gp[1]+1, gp[2]+1] = chi * ζ^QA * (-1)^s * c_g * shin_of_tuple(gF, newp)
             end
         end
+        for p1 = 0:d-1, p2 = 0:d-1
+            (p1 == 0 && p2 == 0) && continue
+            new_ovs[p1+1, p2+1] = V[p1+1, p2+1]
+        end
 
-        println("  v(p)*v(-p) for all nonzero p:")
-        for p1 = 0:d-1
-            for p2 = 0:d-1
-                (p1 == 0 && p2 == 0) && continue
-                mp1 = mod(-p1, d)
-                mp2 = mod(-p2, d)
-                product = new_ovs[p1+1, p2+1] * new_ovs[mp1+1, mp2+1]
+        println("  v(p)*v(-p) for all p != 0 mod d",
+                isodd(d) ? ":" : " (even d: on the 2d x 2d grid, -p mod 2d, expected 1/(d+1) everywhere):")
+        n_dev = 0
+        for p1 = 0:dbar-1
+            for p2 = 0:dbar-1
+                (mod(p1, d) == 0 && mod(p2, d) == 0) && continue
+                mp1 = mod(-p1, dbar)
+                mp2 = mod(-p2, dbar)
+                product = V[p1+1, p2+1] * V[mp1+1, mp2+1]
+                ok = abs(product - 1 / BigFloat(d + 1)) < 1e-8
+                ok || (n_dev += 1)
                 println("    p=($p1,$p2): v(p)*v(-p) = ", Float64(real(product)),
                         " + ", Float64(imag(product)), "im",
                         "  |v(p)*v(-p)| = ", Float64(abs(product)),
-                        "  1/(d+1) = ", 1.0/(d+1))
+                        "  1/(d+1) = ", 1.0/(d+1), ok ? "" : "   <-- DEVIATION")
             end
         end
+        println("  deviations of v(p)*v(-p) from 1/(d+1): ", n_dev, " of ", dbar^2 - (dbar ÷ d)^2)
 
     else
         # u_B is computed FIRST, and the cache is keyed on it directly - the
@@ -2364,7 +2399,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         # the joint find_alpha_rhoB_s1_s2_O search remains the real
         # correctness gate and is unaffected by this relaxation.
         q_val = Int(F.q)
-        d_check = d
+        d_check = dm
         for (p, _) in factor(q_val)
             while d_check % Int(p) == 0
                 d_check ÷= Int(p)
@@ -2402,7 +2437,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
             j_class = F_class + u_B
 
             alpha, rho_B, s1, s2 = find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O,
-                                                             O, K, d, rho, d_check;
+                                                             O, K, dm, rho, d_check; d1 = d + 1,
                                                              mn_height = 3000,
                                                              q_gen_height = 3000)
             println("  Using rho_B = ", rho_B, "  alpha = ", alpha)
@@ -2495,18 +2530,26 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                           # used only for the final gF = AdmissibleTuple(...) return
                           # value below - see printed note when first set.
 
-        for p1 = 0:d-1
-            for p2 = 0:d-1
-                (p1 == 0 && p2 == 0) && continue
+        # EVEN d (9/18): as in the principal branch, the twisted overlaps are
+        # built on the full d-bar x d-bar grid V_np (index (p1, NJ*Ng*p2) mod
+        # d-bar), checked via v(p) v(-p mod d-bar) = 1/(d+1) for all p != 0 mod
+        # d, and the coefficient of D_p, p in [0,d)^2, is read straight off V_np.
+        # For odd d, d-bar = d and this is the old loop.
+        V_np = zeros(Complex{BigFloat}, dm, dm)
+        isodd(d) || isodd(NJ * Ng) || error("even d: NJ*Ng = ", NJ * Ng, " must be coprime to d-bar = 2d")
 
-                gp = [p1, mod(NJ * Ng * p2, d)]
+        for p1 = 0:dm-1
+            for p2 = 0:dm-1
+                (mod(p1, d) == 0 && mod(p2, d) == 0) && continue
+
+                gp = mod.([p1, NJ * Ng * p2], dm)
                 p = [p1, p2]
 
                 # elem1 via reverse lookup - see the block comment above
                 # (right after Ng/NJ) for the full reasoning.
                 A_lookup, _ = stabilizer_power_in_Gamma_s(
-                    L_rho_base, [QQ(p1, d), QQ(p2, d)]; max_power = elem1_max_power)
-                shin_val_lookup = shin(A_lookup, rho_bf_base, [p1, p2], d)
+                    L_rho_base, [QQ(p1, dm), QQ(p2, dm)]; max_power = elem1_max_power)
+                shin_val_lookup = shin(A_lookup, rho_bf_base, [p1, p2], dm)
 
                 match_idx = findfirst(
                     e -> e !== nothing && abs(e.shin_value - shin_val_lookup) < ray_class_lookup_tol,
@@ -2561,14 +2604,14 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                         hint = class_hints[u_match]
                         _, rho_match, s1_match, s2_match = find_alpha_rhoB_s1_s2_O(
                             full_match.J, rho_reps[u_match], rho, u_match, P_O, mP_O, O, K,
-                            d, rho, d_check;
+                            dm, rho, d_check; d1 = d + 1,
                             alpha_hint = hint.alpha, rho_B_hint = hint.rho_B, b_O_hint = hint.b_O)
                     else
                         res_match = find_alpha_rhoB_s1_s2_O(
                             full_match.J, rho_reps[u_match], rho, u_match, P_O, mP_O, O, K,
-                            d, rho, d_check)
+                            dm, rho, d_check; d1 = d + 1)
                         b_O_match, _ = find_b_with_verified_principal_product(
-                            O, K, full_match.J, [ideal(O, d), ideal(O, d + 1)])
+                            O, K, full_match.J, [ideal(O, dm), ideal(O, d + 1)])
                         class_hints[u_match] = (alpha = res_match[1], rho_B = res_match[2],
                                                  b_O = b_O_match)
                         _, rho_match, s1_match, s2_match = res_match
@@ -2578,7 +2621,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 else
                     lookup_entry = ray_class_lookup_table_local[match_idx]
                 end
-                elem1 = K(d) * (K(lookup_entry.s2) * lookup_entry.rho_B - K(lookup_entry.s1))
+                elem1 = K(dm) * (K(lookup_entry.s2) * lookup_entry.rho_B - K(lookup_entry.s1))
                 println("    p=($p1,$p2): lookup_entry.J (U_elem1, the actual ideal) = ", lookup_entry.J,
                         "   N = ", norm(lookup_entry.J))
 
@@ -2607,7 +2650,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                         println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: searching for a ",
                                 "different rho_B/s1/s2 (previous one exhausted its rho_j search)")
                         _, rho_B_new, s1_new, s2_new = find_alpha_rhoB_s1_s2_O(
-                            J, rho_B_init, rho, u_B, P_O, mP_O, O, K, d, rho, d_check;
+                            J, rho_B_init, rho, u_B, P_O, mP_O, O, K, dm, rho, d_check; d1 = d + 1,
                             mn_height = 3000, q_gen_height = 3000, exclude = excluded_rho_B_p)
                         (rho_B_new, s1_new, s2_new)
                     end
@@ -2663,7 +2706,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     rho_Bj_init = rho_reps[u_Bj]
                     alpha_bj, rho_j_raw, s1_bj, s2_bj = find_alpha_rhoB_s1_s2_O(
                         J_bj, rho_Bj_init, rho_Bj_init, u_Bj, P_O, mP_O, O, K,
-                        d, rho_Bj_init, d_check; mn_height = 3000, q_gen_height = 3000)
+                        dm, rho_Bj_init, d_check; d1 = d + 1, mn_height = 3000, q_gen_height = 3000)
                     println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: rho_j = ", rho_j_raw,
                             "  alpha_bj = ", alpha_bj, "  s1_bj = ", s1_bj, "  s2_bj = ", s2_bj)
 
@@ -2736,7 +2779,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     b_b2 = _nf_elem_of(K, basis(b_cls)[2])
                     crho_j = quad_conj(K, rho_j_raw)
                     t219_status, t219_alpha, t219_gamma =
-                        theorem219_gate(K, O, mP_O, -u_Bj, rho_j_raw, d)
+                        theorem219_gate(K, O, mP_O, -u_Bj, rho_j_raw, dm)
                     if t219_status === :not_principal
                         error("p=($p1,$p2): THEOREM 2.19 GATE FAILED for rho_j = ", rho_j_raw,
                               " - b*(Z*rho_j+Z)^{-1} is NOT PRINCIPAL. Principality here is a ",
@@ -2818,11 +2861,11 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     # exact algebraic element from find_alpha_rhoB_s1_s2_O
                     # above), matching how this chain always used a single
                     # consistent rho_j throughout.
-                    M_g_j_cand = multiplication_matrix_mod_d(K(gamma), rho_j_raw, d, D)
+                    M_g_j_cand = multiplication_matrix_mod_d(K(gamma), rho_j_raw, dm, D)
 
                     det_M_g_j = mod(M_g_j_cand[1,1]*M_g_j_cand[2,2] -
-                                    M_g_j_cand[1,2]*M_g_j_cand[2,1], d)
-                    gcd_det_d = gcd(det_M_g_j, d)
+                                    M_g_j_cand[1,2]*M_g_j_cand[2,1], dm)
+                    gcd_det_d = gcd(det_M_g_j, dm)
                     if gcd_det_d != 1
                         println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: REJECTED ",
                                 "(det(M_g_j) mod d = ", det_M_g_j, ", gcd with d = ", gcd_det_d,
@@ -2856,8 +2899,8 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     u2_prod, u1_prod = find_rho_j_and_coords(product, rho_j_raw)
                     u2_cand, u1_cand = s2_bj, s1_bj
                     _red_du(u) = begin
-                        x = u * d
-                        isone(denominator(x)) ? string(Int(mod(numerator(x), d))) : string("non-integral(", x, ")")
+                        x = u * dm
+                        isone(denominator(x)) ? string(Int(mod(numerator(x), dm))) : string("non-integral(", x, ")")
                     end
                     println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: du from class multiplication (USED) = (",
                             _red_du(u1_cand), ", ", _red_du(u2_cand),
@@ -2903,15 +2946,15 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     # exactly like the other two rejection conditions (exclude
                     # this rho_B, continue to the next attempt) instead of
                     # letting it escape uncaught.
-                    du_cand = [to_du_mod_d(u1_cand, d), to_du_mod_d(u2_cand, d)]
+                    du_cand = [to_du_mod_d(u1_cand, dm), to_du_mod_d(u2_cand, dm)]
                     raw_newdu_cand = M_g_j_cand * du_cand
-                    newdu_cand = [to_du_mod_d(raw_newdu_cand[1], d), to_du_mod_d(raw_newdu_cand[2], d)]
+                    newdu_cand = [to_du_mod_d(raw_newdu_cand[1], dm), to_du_mod_d(raw_newdu_cand[2], dm)]
                     integralnewdu_cand = Int[]
                     coprimality_ok = true
                     for u in newdu_cand
-                        du_int = d * u
+                        du_int = dm * u
                         try
-                            push!(integralnewdu_cand, du_to_int_mod_d(du_int, d))
+                            push!(integralnewdu_cand, du_to_int_mod_d(du_int, dm))
                         catch e
                             println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: REJECTED ",
                                     "(integralnewdu computation failed: ", e, ") - trying a different rho_B")
@@ -2980,11 +3023,13 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 red_p = find_hj_reducing_matrix(A_bj_p, rho_j_bf_p)
                 beta_p = red_p.root_used == :x ? red_p.x0 : red_p.conjx0
                 s_R_p = Int(sign(red_p.R[2,1] * beta_p + red_p.R[2,2]))
-                du_red = mod.(s_R_p .* (red_p.R * integralnewdu), d)
+                # du_red lives mod d-bar (the 2d-periodic phase needs it); the
+                # cocycle argument is its reduction mod d (Lemma 2.14).
+                du_red = mod.(s_R_p .* (red_p.R * integralnewdu), dm)
                 QA_old = BigFloat(-QQ_form_p(integralnewdu...)) / BigFloat(d * (d - 2))
                 QA = BigFloat(-QQ_form_p(du_red...)) / BigFloat(d * (d - 2))
                 s = isodd(d) ? 1 : (1 + du_red[1]) * (1 + du_red[2])
-                shin_tuple_val = shin_of_tuple(gF_j_p, du_red)
+                shin_tuple_val = shin_of_tuple(gF_j_p, mod.(du_red, d))
                 shin_wrapper_val = shin(A_bj_p, rho_j_bf_p, integralnewdu, d)
                 # roots of gQ_j = <a,b,c>: a t^2 + b t + c = 0, printed next to the
                 # wrapper's reduced_root so a frame mismatch would be visible.
@@ -2998,7 +3043,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                         "  |shin wrapper(A_bj)| = ", Float64(abs(shin_wrapper_val)),
                         "  reduced_root = ", Float64(red_p.reduced_root),
                         "  roots of gQ_j = ", Float64((-bQ + sqQ) / (2 * aQ)), ", ", Float64((-bQ - sqQ) / (2 * aQ)))
-                new_ovs[gp[1]+1, gp[2]+1] = chi * ζ^QA * (-1)^s * c_g_j_p * shin_tuple_val
+                V_np[gp[1]+1, gp[2]+1] = chi * ζ^QA * (-1)^s * c_g_j_p * shin_tuple_val
 
                 # DIAGNOSTIC (purely additive, off by default): dump every
                 # phase-determining intermediate quantity for hand-picked
@@ -3024,7 +3069,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     println("  [phase-debug]   c_g_j_p = ", c_g_j_p)
                     println("  [phase-debug]   zeta^QA = ", ζ^QA, "   (-1)^s = ", (-1)^s)
                     println("  [phase-debug]   raw shin(...) = ", shin(A_bj_p, rho_j_bf_p, integralnewdu, d))
-                    println("  [phase-debug]   new_ovs[gp] = ", new_ovs[gp[1]+1, gp[2]+1])
+                    println("  [phase-debug]   V_np[gp] = ", V_np[gp[1]+1, gp[2]+1])
                 end
 
                 let sh_plus = shin(A_bj_p, rho_j_bf_p, integralnewdu, d),
@@ -3044,19 +3089,29 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
 
         println("  all |vv(p)vv(-p)| correct: ", test1)
 
-        println("  v(p)*v(-p) for all nonzero p (after Galois action):")
-        for p1 = 0:d-1
-            for p2 = 0:d-1
-                (p1 == 0 && p2 == 0) && continue
-                mp1 = mod(-p1, d)
-                mp2 = mod(-p2, d)
-                product = new_ovs[p1+1, p2+1] * new_ovs[mp1+1, mp2+1]
+        for p1 = 0:d-1, p2 = 0:d-1
+            (p1 == 0 && p2 == 0) && continue
+            new_ovs[p1+1, p2+1] = V_np[p1+1, p2+1]
+        end
+
+        println("  v(p)*v(-p) for all p != 0 mod d (after Galois action",
+                isodd(d) ? "):" : "; even d: on the 2d x 2d grid, -p mod 2d, expected 1/(d+1) everywhere):")
+        n_dev = 0
+        for p1 = 0:dm-1
+            for p2 = 0:dm-1
+                (mod(p1, d) == 0 && mod(p2, d) == 0) && continue
+                mp1 = mod(-p1, dm)
+                mp2 = mod(-p2, dm)
+                product = V_np[p1+1, p2+1] * V_np[mp1+1, mp2+1]
+                ok = abs(product - 1 / BigFloat(d + 1)) < 1e-8
+                ok || (n_dev += 1)
                 println("    p=($p1,$p2): v(p)*v(-p) = ", Float64(real(product)),
                         " + ", Float64(imag(product)), "im",
                         "  |v(p)*v(-p)| = ", Float64(abs(product)),
-                        "  1/(d+1) = ", 1.0/(d+1))
+                        "  1/(d+1) = ", 1.0/(d+1), ok ? "" : "   <-- DEVIATION")
             end
         end
+        println("  deviations of v(p)*v(-p) from 1/(d+1): ", n_dev, " of ", dm^2 - (dm ÷ d)^2)
     end
 
     max_imag = maximum(abs.(imag.(new_ovs)))
@@ -3626,14 +3681,16 @@ function _ray_class_shin_setup(F::AdmissibleTuple)
     # d_check: strip q's own prime factors out of d before the coprimality
     # target used inside find_alpha_rhoB_s1_s2_O's search (see the identical
     # comment/reasoning in twisted_chi_general - required whenever q | d).
-    d_check = d
+    # EVEN d (9/18): the ray-class modulus is d-bar = 2d (m above), so the
+    # coprimality target for the Theorem 2.19 searches is d-bar too.
+    d_check = dbar
     for (p, _) in factor(q)
         while d_check % Int(p) == 0
             d_check ÷= Int(p)
         end
     end
 
-    return (D = D, q = q, d = d, K = K, O = O,
+    return (D = D, q = q, d = d, dbar = dbar, K = K, O = O,
             all_reps = all_reps, all_triples = all_triples,
             P_O = P_O, mP_O = mP_O, rho_reps = rho_reps,
             gQ_reps = gQ_reps, F_class = F_class, d_check = d_check)
@@ -3721,6 +3778,12 @@ function ray_class_shin_table(F::AdmissibleTuple;
                                shared_data::Union{Nothing,NamedTuple} = nothing)
     sd = shared_data === nothing ? _ray_class_shin_setup(F) : shared_data
     D, q, d = sd.D, sd.q, sd.d
+    # EVEN d (9/18): every Theorem 2.19 point representation runs at the
+    # ray-class modulus d-bar (= 2d for even d, = d for odd d): the (s1,s2)
+    # vectors have denominator d-bar and the stored value is the d-bar-modulus
+    # invariant shin^{p/d-bar}, used only for identification. The ghost
+    # cocycle itself (shin^{p/d}) is only ever evaluated in twisted_chi_general.
+    dm = hasproperty(sd, :dbar) ? sd.dbar : (isodd(d) ? d : 2 * d)
     K, O = sd.K, sd.O
     all_reps, all_triples = sd.all_reps, sd.all_triples
     P_O, mP_O, rho_reps, gQ_reps, F_class = sd.P_O, sd.mP_O, sd.rho_reps, sd.gQ_reps, sd.F_class
@@ -3790,12 +3853,12 @@ function ray_class_shin_table(F::AdmissibleTuple;
             println("  A = ", A, "  (also has -I in Gamma_s stabilizer? ", has_neg_I,
                     ")  (", round(dt, digits=3), " s)")
 
-            p1_exact = s1 * d
-            p2_exact = s2 * d
+            p1_exact = s1 * dm
+            p2_exact = s2 * dm
             (isone(denominator(p1_exact)) && isone(denominator(p2_exact))) ||
-                error("s = [$s1,$s2] does not have denominator dividing d = $d ",
-                      "(s*d = [$p1_exact, $p2_exact]) - cannot express as an integer ",
-                      "vector over d as expected")
+                error("s = [$s1,$s2] does not have denominator dividing d-bar = $dm ",
+                      "(s*d-bar = [$p1_exact, $p2_exact]) - cannot express as an integer ",
+                      "vector over d-bar as expected")
             p_vec = [Int(numerator(p1_exact)), Int(numerator(p2_exact))]
 
             rho_B_bf = BigFloat(coeff(rho_B, 0)) + BigFloat(coeff(rho_B, 1)) * sqrt(BigFloat(D))
@@ -3898,6 +3961,12 @@ function ray_class_shin_table_fast(F::AdmissibleTuple;
                                     shared_data::Union{Nothing,NamedTuple} = nothing)
     sd = shared_data === nothing ? _ray_class_shin_setup(F) : shared_data
     D, q, d = sd.D, sd.q, sd.d
+    # EVEN d (9/18): every Theorem 2.19 point representation runs at the
+    # ray-class modulus d-bar (= 2d for even d, = d for odd d): the (s1,s2)
+    # vectors have denominator d-bar and the stored value is the d-bar-modulus
+    # invariant shin^{p/d-bar}, used only for identification. The ghost
+    # cocycle itself (shin^{p/d}) is only ever evaluated in twisted_chi_general.
+    dm = hasproperty(sd, :dbar) ? sd.dbar : (isodd(d) ? d : 2 * d)
     K, O = sd.K, sd.O
     all_reps, all_triples = sd.all_reps, sd.all_triples
     P_O, mP_O, rho_reps, gQ_reps, F_class = sd.P_O, sd.mP_O, sd.rho_reps, sd.gQ_reps, sd.F_class
@@ -3934,10 +4003,10 @@ function ray_class_shin_table_fast(F::AdmissibleTuple;
                     rho_B_init = rho_reps[u_B]
                     alpha, rho_B, s1, s2 = find_alpha_rhoB_s1_s2_O(
                         Jfull, rho_B_init, rho_B_init, u_B, P_O, mP_O, O, K,
-                        d, rho_B_init, d_check;
+                        dm, rho_B_init, d_check; d1 = d + 1,
                         mn_height = mn_height, q_gen_height = q_gen_height)
                     b_O, _ = find_b_with_verified_principal_product(
-                        O, K, Jfull, [ideal(O, d), ideal(O, d + 1)])
+                        O, K, Jfull, [ideal(O, dm), ideal(O, d + 1)])
                     elem2_anchor = K(s2) * rho_B - K(s1)
                     abs(Float64(emb_conj(elem2_anchor))) > 0 || error("elem2_anchor is zero under emb_conj")
                     Float64(emb_conj(elem2_anchor)) > 0 ||
@@ -4003,15 +4072,15 @@ function ray_class_shin_table_fast(F::AdmissibleTuple;
             A, has_neg_I = stabilizer_power_in_Gamma_s(L, s_vec; max_power = max_power)
             println("  A = ", A, "  (also has -I in Gamma_s stabilizer? ", has_neg_I, ")")
 
-            p1_exact = s1 * d
-            p2_exact = s2 * d
+            p1_exact = s1 * dm
+            p2_exact = s2 * dm
             (isone(denominator(p1_exact)) && isone(denominator(p2_exact))) ||
-                error("s = [$s1,$s2] does not have denominator dividing d = $d ",
-                      "(s*d = [$p1_exact, $p2_exact]) - cannot express as an integer ",
-                      "vector over d as expected")
+                error("s = [$s1,$s2] does not have denominator dividing d-bar = $dm ",
+                      "(s*d-bar = [$p1_exact, $p2_exact]) - cannot express as an integer ",
+                      "vector over d-bar as expected")
             p_vec = [Int(numerator(p1_exact)), Int(numerator(p2_exact))]
 
-            val = shin_value_in_frame(A, rho_B, D, p_vec, d, fiber_cache[u_B].conj_frame)
+            val = shin_value_in_frame(A, rho_B, D, p_vec, dm, fiber_cache[u_B].conj_frame)
             println("  shin value = ", val)
             table[idx] = (Jfull, p_vec, val)
         catch e
@@ -4083,6 +4152,12 @@ function _ray_class_shin_table_fast_quiet_impl(F::AdmissibleTuple;
                                           shared_data::Union{Nothing,NamedTuple} = nothing)
     sd = shared_data === nothing ? _ray_class_shin_setup(F) : shared_data
     D, q, d = sd.D, sd.q, sd.d
+    # EVEN d (9/18): every Theorem 2.19 point representation runs at the
+    # ray-class modulus d-bar (= 2d for even d, = d for odd d): the (s1,s2)
+    # vectors have denominator d-bar and the stored value is the d-bar-modulus
+    # invariant shin^{p/d-bar}, used only for identification. The ghost
+    # cocycle itself (shin^{p/d}) is only ever evaluated in twisted_chi_general.
+    dm = hasproperty(sd, :dbar) ? sd.dbar : (isodd(d) ? d : 2 * d)
     K, O = sd.K, sd.O
     all_reps, all_triples = sd.all_reps, sd.all_triples
     P_O, mP_O, rho_reps, gQ_reps, F_class = sd.P_O, sd.mP_O, sd.rho_reps, sd.gQ_reps, sd.F_class
@@ -4116,10 +4191,10 @@ function _ray_class_shin_table_fast_quiet_impl(F::AdmissibleTuple;
                 rho_B_init = rho_reps[u_B]
                 alpha, rho_B, s1, s2 = find_alpha_rhoB_s1_s2_O(
                     Jfull, rho_B_init, rho_B_init, u_B, P_O, mP_O, O, K,
-                    d, rho_B_init, d_check;
+                    dm, rho_B_init, d_check; d1 = d + 1,
                     mn_height = mn_height, q_gen_height = q_gen_height)
                 b_O, _ = find_b_with_verified_principal_product(
-                    O, K, Jfull, [ideal(O, d), ideal(O, d + 1)])
+                    O, K, Jfull, [ideal(O, dm), ideal(O, d + 1)])
                 elem2_anchor = K(s2) * rho_B - K(s1)
                 abs(Float64(emb_conj(elem2_anchor))) > 0 || error("elem2_anchor is zero under emb_conj")
                 Float64(emb_conj(elem2_anchor)) > 0 ||
@@ -4185,16 +4260,16 @@ function _ray_class_shin_table_fast_quiet_impl(F::AdmissibleTuple;
             L = fiber_cache[u_B].L
             A, has_neg_I = stabilizer_power_in_Gamma_s(L, s_vec; max_power = max_power)
 
-            p1_exact = s1 * d
-            p2_exact = s2 * d
+            p1_exact = s1 * dm
+            p2_exact = s2 * dm
             (isone(denominator(p1_exact)) && isone(denominator(p2_exact))) ||
-                error("s = [$s1,$s2] does not have denominator dividing d = $d ",
-                      "(s*d = [$p1_exact, $p2_exact]) - cannot express as an integer ",
-                      "vector over d as expected")
+                error("s = [$s1,$s2] does not have denominator dividing d-bar = $dm ",
+                      "(s*d-bar = [$p1_exact, $p2_exact]) - cannot express as an integer ",
+                      "vector over d-bar as expected")
             p_vec = [Int(numerator(p1_exact)), Int(numerator(p2_exact))]
 
             conj_frame = fiber_cache[u_B].conj_frame
-            val = shin_value_in_frame(A, rho_B, D, p_vec, d, conj_frame)
+            val = shin_value_in_frame(A, rho_B, D, p_vec, dm, conj_frame)
             table[idx] = (J = Jfull, s1 = s1, s2 = s2, rho_B = rho_B, shin_value = val,
                           conj_frame = conj_frame)
             is_anchor && println(stderr, "  [table] triple ", idx, " done in ",
@@ -4623,6 +4698,9 @@ function ray_class_monoid_table_v2(F::AdmissibleTuple; shared_data = nothing,
     D, d, K, O = sd.D, sd.d, sd.K, sd.O
     P_O, mP_O = sd.P_O, sd.mP_O
     rho_reps, all_triples = sd.rho_reps, sd.all_triples
+    # EVEN d (9/18): the monoid is Jbar^flat_m(O) with m = d-bar*O; every
+    # residue, grid point, lift and value below is at modulus d-bar.
+    dm = hasproperty(sd, :dbar) ? sd.dbar : (isodd(d) ? d : 2 * d)
 
     places = real_places(K)
     i_conj = findfirst(p -> Float64(real(embedding(p)(gen(K)))) < 0, places)
@@ -4632,12 +4710,12 @@ function ray_class_monoid_table_v2(F::AdmissibleTuple; shared_data = nothing,
     fm(x) = Float64(real(emb_main(x)))
     fc(x) = Float64(real(emb_conj(x)))
 
-    m = ideal(O, d)
+    m = ideal(O, dm)
 
-    # x in dO  <=>  all Z-basis coordinates of x divisible by d
+    # x in mO  <=>  all Z-basis coordinates of x divisible by d-bar
     function in_dO(x)
         try
-            return all(iszero(mod(c, ZZ(d))) for c in coordinates(O(x)))
+            return all(iszero(mod(c, ZZ(dm))) for c in coordinates(O(x)))
         catch
             return false
         end
@@ -4685,7 +4763,7 @@ function ray_class_monoid_table_v2(F::AdmissibleTuple; shared_data = nothing,
         Jg === nothing && error("ray_class_monoid_table_v2: no ray class representative ideal ",
                                 "found in Picard class ", g)
         alpha, rho, _, _ = find_alpha_rhoB_s1_s2_O(Jg, rho_reps[g], rho_base, g, P_O, mP_O,
-                                                    O, K, d, rho_base, d_check;
+                                                    O, K, dm, rho_base, d_check; d1 = d + 1,
                                                     mn_height = 3000, q_gen_height = 3000)
         (fm(alpha) > 0 && fc(alpha) > 0) ||
             error("ray_class_monoid_table_v2: non-totally-positive alpha = ", alpha,
@@ -4720,7 +4798,7 @@ function ray_class_monoid_table_v2(F::AdmissibleTuple; shared_data = nothing,
         # pattern already used for this exact situation in
         # ray_class_monoid_lookup's `find_with_class_cache` and in
         # ray_class_shin_table's `fiber_cache`.
-        b_O, _ = find_b_with_verified_principal_product(O, K, Jg, [ideal(O, d), ideal(O, d + 1)])
+        b_O, _ = find_b_with_verified_principal_product(O, K, Jg, [ideal(O, dm), ideal(O, d + 1)])
         NbO = QQ(norm(b_O))
         bO_gens = [_nf_elem_of(K, x) for x in basis(b_O)]
         bO_inv_gens = [quad_conj(K, bg) // NbO for bg in bO_gens]   # b_O^{-1} = conj(b_O)/N(b_O)
@@ -4753,15 +4831,15 @@ function ray_class_monoid_table_v2(F::AdmissibleTuple; shared_data = nothing,
         #      Theorem 2.19 lift normalization r2*rho' - r1 > 0 ----
         gam = Dict{Tuple{Int,Int}, Any}()
         rnum = Dict{Tuple{Int,Int}, Vector{Int}}()
-        for p1 in 0:d-1, p2 in 0:d-1
+        for p1 in 0:dm-1, p2 in 0:dm-1
             (p1 == 0 && p2 == 0) && continue        # the zero class; excluded by Thm 2.19
-            r2 = QQ(p2, d)
-            # pick n1 so that r1 = p1/d + n1 satisfies r2*rho' - r1 > 0
-            n1 = Int(floor(Float64(r2) * rho_c - p1 / d)) - 1
-            r1 = QQ(p1, d) + n1
+            r2 = QQ(p2, dm)
+            # pick n1 so that r1 = p1/d-bar + n1 satisfies r2*rho' - r1 > 0
+            n1 = Int(floor(Float64(r2) * rho_c - p1 / dm)) - 1
+            r1 = QQ(p1, dm) + n1
             @assert Float64(r2) * rho_c - Float64(r1) > 0
             gam[(p1, p2)] = alpha * (r2 * rho - r1)
-            rnum[(p1, p2)] = [p1 + d * n1, p2]
+            rnum[(p1, p2)] = [p1 + dm * n1, p2]
         end
 
         # ---- group by the equivalence relation ----
@@ -4773,7 +4851,7 @@ function ray_class_monoid_table_v2(F::AdmissibleTuple; shared_data = nothing,
         # group by that key - O(d^2 * #units) instead.
         function coord_key(x)
             c = coordinates(O(x))
-            return (Int(mod(c[1], ZZ(d))), Int(mod(c[2], ZZ(d))))
+            return (Int(mod(c[1], ZZ(dm))), Int(mod(c[2], ZZ(dm))))
         end
         keyof = Dict{Tuple{Int,Int}, Any}()
         for (pt, gx) in gam
@@ -4794,12 +4872,12 @@ function ray_class_monoid_table_v2(F::AdmissibleTuple; shared_data = nothing,
         for members in classes
             pt = members[1]
             rn = rnum[pt]
-            A, _ = stabilizer_power_in_Gamma_s(L, [QQ(rn[1], d), QQ(rn[2], d)])
-            val = shin(A, rho_bf, rn, d)
+            A, _ = stabilizer_power_in_Gamma_s(L, [QQ(rn[1], dm), QQ(rn[2], dm)])
+            val = shin(A, rho_bf, rn, dm)
             conj_frame_g && (val = conj(val))       # frame flip, see shin_value_in_frame
             x = K(pt[2]) * rho - K(pt[1])
             rel = QQ(abs(norm(x))) / NI_B
-            is_unit = isone(denominator(rel)) && gcd(Int(numerator(rel)), d) == 1
+            is_unit = isone(denominator(rel)) && gcd(Int(numerator(rel)), dm) == 1
 
             # a_r = gam[pt] * b_O^{-1}, the actual ideal this monoid class
             # represents (class = g, per Theorem 2.19 - see the b_O comment
@@ -7648,6 +7726,12 @@ function test_all_twists(d::Int; phase_debug_points::Vector{Tuple{Int,Int}} = Tu
     # reuses the SAME K/O instead of constructing its own.
     sd = _ray_class_shin_setup(F)
     D, q, d = sd.D, sd.q, sd.d
+    # EVEN d (9/18): every Theorem 2.19 point representation runs at the
+    # ray-class modulus d-bar (= 2d for even d, = d for odd d): the (s1,s2)
+    # vectors have denominator d-bar and the stored value is the d-bar-modulus
+    # invariant shin^{p/d-bar}, used only for identification. The ghost
+    # cocycle itself (shin^{p/d}) is only ever evaluated in twisted_chi_general.
+    dm = hasproperty(sd, :dbar) ? sd.dbar : (isodd(d) ? d : 2 * d)
     K, O = sd.K, sd.O
     all_reps, all_triples = sd.all_reps, sd.all_triples
     P_O, mP_O, rho_reps, gQ_reps, F_class = sd.P_O, sd.mP_O, sd.rho_reps, sd.gQ_reps, sd.F_class
@@ -8052,6 +8136,12 @@ function test_ray_class_covariance(d_val::Int; p1::Int = 0, p2::Int = 1)
     F = AdmissibleTuple(d_val)
     sd = _ray_class_shin_setup(F)
     D, q, d = sd.D, sd.q, sd.d
+    # EVEN d (9/18): every Theorem 2.19 point representation runs at the
+    # ray-class modulus d-bar (= 2d for even d, = d for odd d): the (s1,s2)
+    # vectors have denominator d-bar and the stored value is the d-bar-modulus
+    # invariant shin^{p/d-bar}, used only for identification. The ghost
+    # cocycle itself (shin^{p/d}) is only ever evaluated in twisted_chi_general.
+    dm = hasproperty(sd, :dbar) ? sd.dbar : (isodd(d) ? d : 2 * d)
     K, O = sd.K, sd.O
     P_O, mP_O, rho_reps, gQ_reps, F_class, d_check =
         sd.P_O, sd.mP_O, sd.rho_reps, sd.gQ_reps, sd.F_class, sd.d_check

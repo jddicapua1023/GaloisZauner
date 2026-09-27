@@ -102,6 +102,67 @@ function ghost_overlap_test_complex(ovs, d)
     return max_dev
 end
 
+"""
+    diagnose_sign_flips(new_ovs, d; max_flips = 8, tol = 1e-10)
+
+When a twisted ghost passes every structural check (Theorem 5.8 products,
+reality, moduli) but ||M^2 - M|| is O(0.1-1), the remaining freedom is an
+EVEN sign pattern on the overlaps - the square-root ambiguity of the Galois
+action. This greedy search flips one grid point at a time, keeping the flip
+that most reduces ||M^2 - M||, until the residual is below `tol` or no single
+flip helps. A single wrong sign costs about 2/sqrt(d(d+1)) in the residual
+(0.11 at d = 18), so the final list is essentially the set of points whose
+sign the twist got wrong; if the residual does NOT collapse, the defect is
+structural rather than a few signs. Float64 throughout (plenty for 1e-10).
+"""
+function diagnose_sign_flips(new_ovs, d; max_flips::Int = 8, tol::Float64 = 1e-10)
+    W = Dict{Tuple{Int,Int},Matrix{ComplexF64}}()
+    for p1 = 0:d-1, p2 = 0:d-1
+        (p1 == 0 && p2 == 0) && continue
+        W[(p1, p2)] = ComplexF64.(wh(p1, p2, d))
+    end
+    ov = ComplexF64.(new_ovs)
+    Id = Matrix{ComplexF64}(I, d, d)
+    function build(o)
+        M = Id / d
+        for ((p1, p2), Wp) in W
+            M += o[p1+1, p2+1] / d * Wp
+        end
+        return M
+    end
+    resid(o) = (M = build(o); norm(M * M - M))
+    res = resid(ov)
+    println("  [sign-flip search] initial ||M^2 - M|| = ", res)
+    flipped = Tuple{Int,Int}[]
+    for _ in 1:max_flips
+        res < tol && break
+        best = nothing; best_res = res
+        for p1 = 0:d-1, p2 = 0:d-1
+            (p1 == 0 && p2 == 0) && continue
+            ov[p1+1, p2+1] *= -1
+            r = resid(ov)
+            ov[p1+1, p2+1] *= -1
+            if r < best_res
+                best_res = r; best = (p1, p2)
+            end
+        end
+        if best === nothing
+            println("  [sign-flip search] no single-point flip improves the residual - stopping")
+            break
+        end
+        ov[best[1]+1, best[2]+1] *= -1
+        push!(flipped, best); res = best_res
+        println("  [sign-flip search] flip p = ", best, "  gcd(p, d) = ", gcd(gcd(best[1], best[2]), d),
+                "  p mod 2 = ", (mod(best[1], 2), mod(best[2], 2)),
+                "  -p mod d = ", (mod(-best[1], d), mod(-best[2], d)),
+                "  -> ||M^2 - M|| = ", res)
+    end
+    println("  [sign-flip search] result: ", length(flipped), " flip(s), final ||M^2 - M|| = ", res,
+            res < tol ? "  => ghost is CORRECT up to the sign at these points" :
+                        "  => NOT explained by <= $max_flips single-point sign flips (structural)")
+    return flipped
+end
+
 function express_in_basis(x, rho, D)
     p = coeff(x, 0)
     q_coeff = coeff(x, 1)
@@ -2575,11 +2636,74 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                               "occurred but full_monoid_table was not provided - build it once ",
                               "(ray_class_monoid_table_v2) and pass it through, the same way ",
                               "monoid_table/candidate_cache/class_hints are already threaded")
+                    # (9/22) Identify the class by MEMBERSHIP, not by value.
+                    # Each ray_class_monoid_table_v2 entry lists the grid
+                    # points `members` whose x_p = p2*rho - p1 lie in that
+                    # class (F-fiber, root rho_reps[F_class] = the same rho the
+                    # lookup uses), so "the entry with (p1,p2) in members" is
+                    # exact and tolerance-free. This matters because the
+                    # d-bar-modulus identification value shin^{p/d-bar}(rho) is
+                    # DEGENERATE at the 2-torsion points of the ghost (4r in Z^2,
+                    # e.g. p = (0,9) at d = 18): it is exactly 1 there for every
+                    # class at that level, so a value search matched a
+                    # different-level class (N = 12636 vs the true (9), N = 81),
+                    # the class product came out one level too deep, du/d landed
+                    # on the zero class and |shin| ~ 0.01 - the whole d = 18
+                    # non-principal defect (12 deviations, all on the 9-grid).
+                    # The value search is kept only as a fallback.
+                    # The v2 table's F-fiber may sit at a DIFFERENT root than the
+                    # lookup's rho (same lattice class, e.g. rho_F - 8 at d = 18),
+                    # so map p into the entry's frame first (lookup_point_in_frame).
+                    # Frame map gives p' up to an overall sign (Sigma-positivity of
+                    # the unit mu it comes with is not something the class buckets
+                    # let us fix a priori), so test BOTH p' and -p'. If both land in
+                    # the same entry (the 2-torsion points, where the value is
+                    # degenerate) there is no ambiguity; if they land in different
+                    # entries, the lookup VALUE (non-degenerate there) decides.
                     full_match = nothing
+                    p_frame = nothing
+                    cands = NamedTuple[]
                     for e in full_monoid_table
-                        if abs(Complex{BigFloat}(e.shin_value) - shin_val_lookup) < ray_class_lookup_tol
-                            full_match = e
-                            break
+                        (e.A0 == F_class && hasproperty(e, :members)) || continue
+                        if p_frame === nothing
+                            p_frame = e.rho == rho ? [p1, p2] :
+                                      lookup_point_in_frame(K, O, D, [p1, p2], rho, e.rho, dm)
+                            p_frame === nothing && break
+                            println("  [monoid lookup] p=($p1,$p2) at rho -> p' = +-(", p_frame[1], ",",
+                                    p_frame[2], ") at the monoid table's root ", e.rho)
+                        end
+                        pm = (mod(-p_frame[1], dm), mod(-p_frame[2], dm))
+                        hit_plus = (p_frame[1], p_frame[2]) in e.members
+                        hit_minus = pm in e.members
+                        if hit_plus || hit_minus
+                            push!(cands, (e = e, plus = hit_plus, minus = hit_minus,
+                                          vdiff = abs(Complex{BigFloat}(e.shin_value) - shin_val_lookup)))
+                        end
+                    end
+                    if length(cands) == 1
+                        full_match = cands[1].e
+                        println("  [monoid lookup] p=($p1,$p2): +p' and -p' lie in ONE class",
+                                cands[1].plus && cands[1].minus ? " (both)" : cands[1].plus ? " (+p')" : " (-p')")
+                    elseif length(cands) >= 2
+                        sort!(cands, by = c -> c.vdiff)
+                        full_match = cands[1].e
+                        println("  [monoid lookup] p=($p1,$p2): +p' and -p' lie in DIFFERENT classes; ",
+                                "taking the one whose value matches the lookup (|diff| = ", Float64(cands[1].vdiff),
+                                " vs ", Float64(cands[2].vdiff), "; chose ", cands[1].plus ? "+p'" : "-p'", ")")
+                    end
+                    if full_match !== nothing
+                        vdiff = abs(Complex{BigFloat}(full_match.shin_value) - shin_val_lookup)
+                        println("  [monoid lookup] p=($p1,$p2) identified by membership: class with ",
+                                length(full_match.members), " grid points, J = ", full_match.J,
+                                "  (value check |table - lookup| = ", Float64(vdiff),
+                                vdiff < ray_class_lookup_tol ? ")" : "  <-- value does not match; membership trusted)")
+                    else
+                        println("  [monoid lookup] p=($p1,$p2) not found by membership - falling back to value search")
+                        for e in full_monoid_table
+                            if abs(Complex{BigFloat}(e.shin_value) - shin_val_lookup) < ray_class_lookup_tol
+                                full_match = e
+                                break
+                            end
                         end
                     end
                     full_match === nothing &&
@@ -3132,6 +3256,9 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
 
     M_float = Complex{Float64}.(M)
     println("  ||M^2 - M||_F = ", norm(M_float^2 - M_float))
+    if norm(M_float^2 - M_float) > 1e-8
+        diagnose_sign_flips(new_ovs, d)
+    end
     println("  tr(M) = ", tr(M_float))
 
     vals, vecs = eigen(M_float)
@@ -3750,6 +3877,46 @@ not use the conj_frame = true branch; they use `shin_value_in_frame` instead.
 function root_bf_in_frame(rho_B, D, conj_frame::Bool)
     c0 = BigFloat(coeff(rho_B, 0)); c1 = BigFloat(coeff(rho_B, 1)) * sqrt(BigFloat(D))
     return conj_frame ? c0 - c1 : c0 + c1
+end
+
+"""
+    lookup_point_in_frame(K, O, D, p, rho_from, rho_to, dm)
+
+Map a grid point p (meaning the element x_p = p2*rho_from - p1, point p/dm)
+to the grid point p' at another root of the SAME Picard class with
+mu*(Z+Z*rho_to) = Z+Z*rho_from, such that the Theorem 2.19 class of p at
+rho_from equals the class of p' at rho_to. Writing mu = d' + c'*rho_from and
+mu*rho_to = b' + a'*rho_from (integers, det = a'd' - b'c' = +-1),
+    x_{p'}(rho_to) = x_p(rho_from) / mu   with   p' = det * (a' p1 + b' p2, c' p1 + d' p2),
+and the same IDEAL x*(Z+Z*rho)^{-1} results. Replacing mu by -mu if mu is
+Sigma-negative keeps the Sigma-positive-lift convention of the class map,
+which negates p'; hence the overall sign det*sgn(mu'). Returns nothing if
+the roots are not in the same class or the coordinates are not integral.
+
+Why (9/22, d=18): ray_class_monoid_table_v2 builds the F-fiber at its own
+root (here (1+sqrt285)/2 = rho_F - 8) while twisted_chi_general's lookup
+runs at rho_F; a raw membership test (p1,p2) in members compared points
+across the two frames and was wrong except where 8*p2 == 0 mod 36 - the
+9-grid, which is why only those points came out right.
+"""
+function lookup_point_in_frame(K, O, D, p::Vector{Int}, rho_from, rho_to, dm::Int)
+    osign, mu = fiber_orientation_sign(K, O, rho_to, rho_from)   # mu*(Z+Z*rho_to) = Z+Z*rho_from
+    osign === nothing && return nothing
+    mu = K(mu)
+    c_mu = express_in_basis(mu, K(rho_from), D)               # mu        = d' + c'*rho_from
+    c_mr = express_in_basis(mu * K(rho_to), K(rho_from), D)   # mu*rho_to = b' + a'*rho_from
+    all(isone(denominator(x)) for x in vcat(c_mu, c_mr)) || return nothing
+    # mu comes back multiplied by a large unit power (entries ~ 10^70), so
+    # keep everything in ZZ and reduce mod dm before converting to Int.
+    dp, cp = numerator(c_mu[1]), numerator(c_mu[2])
+    bp, ap = numerator(c_mr[1]), numerator(c_mr[2])
+    det = ap * dp - bp * cp
+    abs(det) == 1 || return nothing
+    mu_conj = BigFloat(coeff(mu, 0)) - BigFloat(coeff(mu, 1)) * sqrt(BigFloat(D))
+    sgn = Int(det) * (mu_conj > 0 ? 1 : -1)
+    q1 = mod(sgn * (ap * ZZ(p[1]) + bp * ZZ(p[2])), ZZ(dm))
+    q2 = mod(sgn * (cp * ZZ(p[1]) + dp * ZZ(p[2])), ZZ(dm))
+    return [Int(q1), Int(q2)]
 end
 
 """
@@ -8349,7 +8516,7 @@ end
 # The failing run's twist: J = <5, 3//2*sqrt(44) + 3>, gamma = 1, non-principal.
 # Forced onto every seed below (broken seed 208475639 + two others). Redirect
 # output to a file and read the "=== SEED SUMMARY ===" block at the end.
-test_all_twists(21)
+test_all_twists(29)
 #diagnose_twist_across_seeds(21, [(5, 0), (3, 3//2)], (-20, -3), [208475639])
 #diagnose_twist_across_seeds(21, [(5, 0), (3, 3//2)], (1, 0), [208475639])
 #diagnose_seed_lift_differences(21, [305817264, 672049183, 208475639])

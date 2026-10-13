@@ -2416,7 +2416,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 newp = mod.(newp_bar, d)                 # cocycle argument (d-periodic)
                 QA = BigFloat(-QQ_form(newp_bar...)) / BigFloat(d * (d - 2))
                 s = isodd(d) ? 1 : (1 + newp_bar[1]) * (1 + newp_bar[2])
-                V[gp[1]+1, gp[2]+1] = chi*ζ^QA * (-1)^s * c_g * shin_of_tuple_cached(gF, newp)
+                V[gp[1]+1, gp[2]+1] = chi * ζ^QA * (-1)^s * c_g * shin_of_tuple_cached(gF, newp)
             end
         end
         for p1 = 0:d-1, p2 = 0:d-1
@@ -3276,23 +3276,41 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         end
     end
 
+    # PRECISION (10/13): verify in BigFloat. Previously M was cast to Float64
+    # for ||M^2-M||, eigen() and the eigenvector psi feeding the ghost tests,
+    # so every test was capped at ~1e-16 * ||M||^2. Ghost M's are non-normal
+    # idempotents whose Frobenius norm grows with d, and the principal-twist
+    # ghost tests degraded as 3e-15 (d=9) -> 2e-8 (d=29) for that reason
+    # alone (the BigFloat overlaps are accurate to ~1e-70 throughout). A ghost
+    # M is a rank-1 idempotent, M = |psi><phi| / <phi|psi>, so every nonzero
+    # column is proportional to psi: take the largest column (full precision,
+    # no eigensolve). The Float64 eigen() printout is kept as a diagnostic.
+    M2M = M * M - M
+    res_big = norm(M2M)
+    normM = norm(M)
+    println("  ||M^2 - M||_F (BigFloat) = ", Float64(res_big), "   ||M||_F = ", Float64(normM),
+            "   relative = ", Float64(res_big / normM^2))
     M_float = Complex{Float64}.(M)
-    println("  ||M^2 - M||_F = ", norm(M_float^2 - M_float))
-    if norm(M_float^2 - M_float) > 1e-8
+    println("  ||M^2 - M||_F (Float64, diagnostic) = ", norm(M_float^2 - M_float))
+    if res_big > 1e-6
         diagnose_sign_flips(new_ovs, d)
     end
-    println("  tr(M) = ", tr(M_float))
+    println("  tr(M) = ", Float64(real(tr(M))), " + ", Float64(imag(tr(M))), "im")
 
     vals, vecs = eigen(M_float)
-    println("  All eigenvalues sorted by distance from 1:")
+    println("  All eigenvalues sorted by distance from 1 (Float64, diagnostic):")
     sorted_idx = sortperm(abs.(vals .- 1))
     for i in 1:min(5, d)
         println("    eigenvalue ", i, ": ", vals[sorted_idx[i]])
     end
 
-    idx = sorted_idx[1]
-    psi = Complex{BigFloat}.(vecs[:, idx])
+    # psi from the largest column of the BigFloat M (rank-1 idempotent)
+    col_norms = [norm(M[:, k]) for k in 1:d]
+    jmax = argmax(col_norms)
+    psi = M[:, jmax]
     psi = psi / norm(psi)
+    # consistency: M*psi should equal psi for an idempotent of rank 1
+    println("  ||M*psi - psi|| (BigFloat) = ", Float64(norm(M * psi - psi)))
 
     println("  ghost_frame_test = ", ghost_frame_test(psi))
     println("  ghost_overlap_test = ", ghost_overlap_test(psi))
@@ -3918,7 +3936,7 @@ of one class and across twists (all principal twists share gF). Keyed by
 canonical A - so a hit is exactly the value the uncached call would return.
 """
 function shin_of_tuple_cached(gF, q)
-    key = (Int(gF.d), string(gF.r), string(gF.Q), string(gF.A), Int(q[1]), Int(q[2]))
+    key = (Int(gF.d), string(gF.r), string(gF.Q), string(gF.A), Int(q[1]), Int(q[2]), precision(BigFloat))
     v = get(_SHIN_OF_TUPLE_CACHE, key, nothing)
     v === nothing || return v
     v = shin_of_tuple(gF, q)
@@ -3952,7 +3970,7 @@ function lookup_point_in_frame(K, O, D, p::Vector{Int}, rho_from, rho_to, dm::In
     # The linear map (a',b',c',d',sgn) depends only on the pair of roots (and
     # dm), not on p: compute it once (its is_principal search is the costly
     # part) and reuse it for every grid point.
-    key = (string(rho_from), string(rho_to), dm)
+    key = (string(rho_from), string(rho_to), dm, precision(BigFloat))
     fm = get(_FRAME_MAP_CACHE, key, missing)
     if fm === missing
         fm = nothing
@@ -7938,7 +7956,17 @@ function diagnose_twist_across_seeds(d::Int, J_gens::Vector, gamma_coords::Tuple
     return results
 end
 
-function test_all_twists(d::Int; phase_debug_points::Vector{Tuple{Int,Int}} = Tuple{Int,Int}[])
+function test_all_twists(d::Int; phase_debug_points::Vector{Tuple{Int,Int}} = Tuple{Int,Int}[],
+                         precision_bits::Int = 256)
+    # PRECISION (10/13): working precision for every BigFloat in this run
+    # (shin, phases, overlaps, M and the ghost tests). 256 bits gives ~1e-70
+    # on the overlaps for all d run so far; raise it (e.g. 512) only if the
+    # BigFloat residual ||M^2-M|| printed per twist starts to climb. Cost of
+    # shin grows faster than linearly in the precision, so do not raise it by
+    # default. The memo caches are keyed by precision, so changing it between
+    # runs in one session is safe.
+    setprecision(BigFloat, precision_bits)
+    println("BigFloat precision: ", precision(BigFloat), " bits")
     F = AdmissibleTuple(d)
     @show F
 
@@ -8104,7 +8132,10 @@ twists differs. Classes whose N shares a factor with d+1 (chi = 0, where the
 Kronecker symbol is not the Artin symbol) are skipped, not treated as +1.
 """
 function test_all_twists_2(d::Int; n_twists::Int = 5,
-                           phase_debug_points::Vector{Tuple{Int,Int}} = Tuple{Int,Int}[])
+                           phase_debug_points::Vector{Tuple{Int,Int}} = Tuple{Int,Int}[],
+                           precision_bits::Int = 256)
+    setprecision(BigFloat, precision_bits)      # see test_all_twists
+    println("BigFloat precision: ", precision(BigFloat), " bits")
     F = AdmissibleTuple(d)
     @show F
 
@@ -8702,7 +8733,7 @@ end
 # The failing run's twist: J = <5, 3//2*sqrt(44) + 3>, gamma = 1, non-principal.
 # Forced onto every seed below (broken seed 208475639 + two others). Redirect
 # output to a file and read the "=== SEED SUMMARY ===" block at the end.
-test_all_twists(25)
+test_all_twists(15)
 #diagnose_twist_across_seeds(21, [(5, 0), (3, 3//2)], (-20, -3), [208475639])
 #diagnose_twist_across_seeds(21, [(5, 0), (3, 3//2)], (1, 0), [208475639])
 #diagnose_seed_lift_differences(21, [305817264, 672049183, 208475639])

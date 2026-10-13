@@ -2243,6 +2243,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                               candidate_cache::Dict = Dict{Tuple{Int,Int,Int}, Any}(),
                               class_hints::Dict = Dict{Any, NamedTuple}(),
                               full_monoid_table::Union{Nothing,Vector} = nothing,
+                              point_id_cache::Dict = Dict{Tuple{Int,Int}, Any}(),
                               phase_debug_points::Vector{Tuple{Int,Int}} = Tuple{Int,Int}[])
     d = Int(F.d)
     # EVEN d (9/18): ray-class modulus d-bar (2d for even d). All Theorem 2.19
@@ -2287,9 +2288,18 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         ray_class_shin_table_fast_quiet(F) : ray_class_lookup_table
 
     if is_principal_J
-        chi_raw = kronecker_symbol(d + 1, NJ)
+        # (10/1) The Artin element of a principal twist is Art(J*(gamma)), so
+        # its action on sqrt(d+1) is ((d+1) / N(J)*|N(gamma)|) - NOT ((d+1)/N(J)),
+        # which ignores gamma and (J being the fixed trivial-class representative)
+        # is the same for every principal twist. Numerically nothing changes:
+        # chi appears both here and in 1/(chi*sqrt(d+1)) inside c_g, so it
+        # cancels (h(mu~) = h(nu~)/h(sqrt(d+1)) with sign chi on nu~). The
+        # printed value is now the true chi, and test_all_twists_2 selects on
+        # exactly this quantity.
+        NJ_Ng = NJ * abs(Ng)
+        chi_raw = kronecker_symbol(d + 1, NJ_Ng)
         chi = (chi_raw == 0) ? 1 : chi_raw
-        println("  chi = ", chi, " (NJ = ", NJ, ")")
+        println("  chi = ", chi, " (NJ*|Ng| = ", NJ_Ng, ")")
     else
         NJ_Ng = NJ * abs(Ng)
         chi_raw = kronecker_symbol(d + 1, NJ_Ng)
@@ -2406,7 +2416,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 newp = mod.(newp_bar, d)                 # cocycle argument (d-periodic)
                 QA = BigFloat(-QQ_form(newp_bar...)) / BigFloat(d * (d - 2))
                 s = isodd(d) ? 1 : (1 + newp_bar[1]) * (1 + newp_bar[2])
-                V[gp[1]+1, gp[2]+1] = chi * ζ^QA * (-1)^s * c_g * shin_of_tuple(gF, newp)
+                V[gp[1]+1, gp[2]+1] = chi*ζ^QA * (-1)^s * c_g * shin_of_tuple_cached(gF, newp)
             end
         end
         for p1 = 0:d-1, p2 = 0:d-1
@@ -2608,6 +2618,17 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
 
                 # elem1 via reverse lookup - see the block comment above
                 # (right after Ng/NJ) for the full reasoning.
+                # PERFORMANCE (9/24): the identification of this grid point's
+                # class (stabilizer power, shin^{p/d-bar}(rho_F), table scans,
+                # frame map) depends only on (p, F) - not on J or gamma - so it
+                # is computed once and reused by every later twist. Nothing
+                # after `elem1` below reads shin_val_lookup / A_lookup /
+                # full_match, and lookup_entry is never reassigned.
+                local lookup_entry
+                if haskey(point_id_cache, (p1, p2))
+                    lookup_entry = point_id_cache[(p1, p2)]
+                    println("    p=($p1,$p2): class identification reused from cache")
+                else
                 A_lookup, _ = stabilizer_power_in_Gamma_s(
                     L_rho_base, [QQ(p1, dm), QQ(p2, dm)]; max_power = elem1_max_power)
                 shin_val_lookup = shin(A_lookup, rho_bf_base, [p1, p2], dm)
@@ -2615,7 +2636,6 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 match_idx = findfirst(
                     e -> e !== nothing && abs(e.shin_value - shin_val_lookup) < ray_class_lookup_tol,
                     ray_class_lookup_table_local)
-                local lookup_entry
                 if match_idx === nothing
                     # REVISED PER PROJECT OWNER: the ray class monoid
                     # Jbar_m^flat(O) is FINITE and small (592 classes for
@@ -2745,6 +2765,8 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 else
                     lookup_entry = ray_class_lookup_table_local[match_idx]
                 end
+                point_id_cache[(p1, p2)] = lookup_entry
+                end   # point_id_cache
                 elem1 = K(dm) * (K(lookup_entry.s2) * lookup_entry.rho_B - K(lookup_entry.s1))
                 println("    p=($p1,$p2): lookup_entry.J (U_elem1, the actual ideal) = ", lookup_entry.J,
                         "   N = ", norm(lookup_entry.J))
@@ -3153,7 +3175,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 QA_old = BigFloat(-QQ_form_p(integralnewdu...)) / BigFloat(d * (d - 2))
                 QA = BigFloat(-QQ_form_p(du_red...)) / BigFloat(d * (d - 2))
                 s = isodd(d) ? 1 : (1 + du_red[1]) * (1 + du_red[2])
-                shin_tuple_val = shin_of_tuple(gF_j_p, mod.(du_red, d))
+                shin_tuple_val = shin_of_tuple_cached(gF_j_p, mod.(du_red, d))
                 shin_wrapper_val = shin(A_bj_p, rho_j_bf_p, integralnewdu, d)
                 # roots of gQ_j = <a,b,c>: a t^2 + b t + c = 0, printed next to the
                 # wrapper's reduced_root so a frame mismatch would be visible.
@@ -3879,6 +3901,33 @@ function root_bf_in_frame(rho_B, D, conj_frame::Bool)
     return conj_frame ? c0 - c1 : c0 + c1
 end
 
+# ---------------------------------------------------------------------------
+# PERFORMANCE (9/24): three memo caches. Each stores the result of a pure,
+# deterministic computation keyed by ALL of its inputs, so results are
+# bit-for-bit what the uncached call returns; none changes any value.
+# ---------------------------------------------------------------------------
+const _SHIN_OF_TUPLE_CACHE = Dict{Any, Any}()
+
+"""
+    shin_of_tuple_cached(gF, q)
+
+Memoized `shin_of_tuple(gF, q)`: the double-sine evaluation is the expensive
+core of every grid point, and the same (tuple, point) recurs across points
+of one class and across twists (all principal twists share gF). Keyed by
+(d, r, Q, A, q) - everything AdmissibleTuple(d, r, Q) is built from plus its
+canonical A - so a hit is exactly the value the uncached call would return.
+"""
+function shin_of_tuple_cached(gF, q)
+    key = (Int(gF.d), string(gF.r), string(gF.Q), string(gF.A), Int(q[1]), Int(q[2]))
+    v = get(_SHIN_OF_TUPLE_CACHE, key, nothing)
+    v === nothing || return v
+    v = shin_of_tuple(gF, q)
+    _SHIN_OF_TUPLE_CACHE[key] = v
+    return v
+end
+
+const _FRAME_MAP_CACHE = Dict{Any, Any}()
+
 """
     lookup_point_in_frame(K, O, D, p, rho_from, rho_to, dm)
 
@@ -3900,22 +3949,37 @@ across the two frames and was wrong except where 8*p2 == 0 mod 36 - the
 9-grid, which is why only those points came out right.
 """
 function lookup_point_in_frame(K, O, D, p::Vector{Int}, rho_from, rho_to, dm::Int)
-    osign, mu = fiber_orientation_sign(K, O, rho_to, rho_from)   # mu*(Z+Z*rho_to) = Z+Z*rho_from
-    osign === nothing && return nothing
-    mu = K(mu)
-    c_mu = express_in_basis(mu, K(rho_from), D)               # mu        = d' + c'*rho_from
-    c_mr = express_in_basis(mu * K(rho_to), K(rho_from), D)   # mu*rho_to = b' + a'*rho_from
-    all(isone(denominator(x)) for x in vcat(c_mu, c_mr)) || return nothing
-    # mu comes back multiplied by a large unit power (entries ~ 10^70), so
-    # keep everything in ZZ and reduce mod dm before converting to Int.
-    dp, cp = numerator(c_mu[1]), numerator(c_mu[2])
-    bp, ap = numerator(c_mr[1]), numerator(c_mr[2])
-    det = ap * dp - bp * cp
-    abs(det) == 1 || return nothing
-    mu_conj = BigFloat(coeff(mu, 0)) - BigFloat(coeff(mu, 1)) * sqrt(BigFloat(D))
-    sgn = Int(det) * (mu_conj > 0 ? 1 : -1)
-    q1 = mod(sgn * (ap * ZZ(p[1]) + bp * ZZ(p[2])), ZZ(dm))
-    q2 = mod(sgn * (cp * ZZ(p[1]) + dp * ZZ(p[2])), ZZ(dm))
+    # The linear map (a',b',c',d',sgn) depends only on the pair of roots (and
+    # dm), not on p: compute it once (its is_principal search is the costly
+    # part) and reuse it for every grid point.
+    key = (string(rho_from), string(rho_to), dm)
+    fm = get(_FRAME_MAP_CACHE, key, missing)
+    if fm === missing
+        fm = nothing
+        osign, mu = fiber_orientation_sign(K, O, rho_to, rho_from)   # mu*(Z+Z*rho_to) = Z+Z*rho_from
+        if osign !== nothing
+            mu = K(mu)
+            c_mu = express_in_basis(mu, K(rho_from), D)               # mu        = d' + c'*rho_from
+            c_mr = express_in_basis(mu * K(rho_to), K(rho_from), D)   # mu*rho_to = b' + a'*rho_from
+            if all(isone(denominator(x)) for x in vcat(c_mu, c_mr))
+                # mu comes back multiplied by a large unit power (entries ~ 10^70), so
+                # keep everything in ZZ and reduce mod dm before converting to Int.
+                dp, cp = numerator(c_mu[1]), numerator(c_mu[2])
+                bp, ap = numerator(c_mr[1]), numerator(c_mr[2])
+                det = ap * dp - bp * cp
+                if abs(det) == 1
+                    mu_conj = BigFloat(coeff(mu, 0)) - BigFloat(coeff(mu, 1)) * sqrt(BigFloat(D))
+                    sgn = Int(det) * (mu_conj > 0 ? 1 : -1)
+                    fm = (ap = mod(ap, ZZ(dm)), bp = mod(bp, ZZ(dm)), cp = mod(cp, ZZ(dm)),
+                          dp = mod(dp, ZZ(dm)), sgn = sgn)
+                end
+            end
+        end
+        _FRAME_MAP_CACHE[key] = fm
+    end
+    fm === nothing && return nothing
+    q1 = mod(fm.sgn * (fm.ap * ZZ(p[1]) + fm.bp * ZZ(p[2])), ZZ(dm))
+    q2 = mod(fm.sgn * (fm.cp * ZZ(p[1]) + fm.dp * ZZ(p[2])), ZZ(dm))
     return [Int(q1), Int(q2)]
 end
 
@@ -7960,6 +8024,7 @@ function test_all_twists(d::Int; phase_debug_points::Vector{Tuple{Int,Int}} = Tu
     # miss re-pays the find_alpha_rhoB_s1_s2_O cost for the same cheap,
     # low-norm candidates from scratch.
     candidate_cache = Dict{Tuple{Int,Int,Int}, Any}()
+    point_id_cache = Dict{Tuple{Int,Int}, Any}()      # per-point class identification, shared across twists
 
     # Persists (alpha, rho_B, b_O) per Picard class across EVERY call below -
     # see ray_class_monoid_lookup's docstring, "PERFORMANCE FIX: PER-CLASS
@@ -7984,6 +8049,7 @@ function test_all_twists(d::Int; phase_debug_points::Vector{Tuple{Int,Int}} = Tu
                                                 candidate_cache = candidate_cache,
                                                 class_hints = class_hints,
                                                 full_monoid_table = full_monoid_table,
+                                                point_id_cache = point_id_cache,
                                                 phase_debug_points = phase_debug_points)
     end
 
@@ -8002,8 +8068,128 @@ function test_all_twists(d::Int; phase_debug_points::Vector{Tuple{Int,Int}} = Tu
                                                 candidate_cache = candidate_cache,
                                                 class_hints = class_hints,
                                                 full_monoid_table = full_monoid_table,
+                                                point_id_cache = point_id_cache,
                                                 phase_debug_points = phase_debug_points)
     end
+end
+
+"""
+    test_all_twists_2(d::Int; n_twists::Int = 5, phase_debug_points = Tuple{Int,Int}[])
+
+PURPOSE (10/1): test the sign of the Galois action on PRINCIPAL classes in
+exactly the cases where it can be distinguished. For a principal ray class
+B = (gamma) (times the trivial-class representative J), let
+
+    chi = ( (d+1) / N )   with   N = N(J) * |N(gamma)|   (Kronecker symbol)
+
+i.e. chi = h(sqrt(d+1)) / sqrt(d+1) for h = Art(B). Two candidate rules for
+the sign of h(nu~_p) (the NORMALIZED ghost overlap, nu~ = sqrt(d+1)*mu~):
+    (a) "+ always on principal classes",   (b) "chi, like the general case".
+They only differ when chi = -1, so this function runs ONLY principal twists
+with chi = -1 (the first `n_twists` of them, in the enumeration's order).
+twisted_chi_general computes h(mu~_p) = h(nu~_p)/h(sqrt(d+1)) with rule (b),
+which is a NET-SIGN-FREE formula for mu~ (the two chi's cancel). So:
+    * every selected twist gives a ghost (||M^2-M|| ~ 1e-14)  => rule (b) holds;
+    * if rule (a) were right, each selected twist would come out with every
+      non-identity overlap negated, i.e. M -> (2/d) I - M, which is NOT
+      idempotent, so ||M^2-M|| would be O(1).
+Evidence so far (9/30): d=18, N(gamma) = -29, chi = -1, ghosts verified =>
+rule (b). By genus theory chi = +1 on every principal class when
+d = 0 or 3 (mod 4) ((d+1)/. is a product of genus characters of
+(d+1)(d-3)), so this function finds NOTHING for d = 11,12,15,16,19,20,...;
+it is informative exactly for d = 1 or 2 (mod 4): d = 10,13,14,17,18,21,22,25,...
+
+Setup (tables, caches) is identical to test_all_twists; only the choice of
+twists differs. Classes whose N shares a factor with d+1 (chi = 0, where the
+Kronecker symbol is not the Artin symbol) are skipped, not treated as +1.
+"""
+function test_all_twists_2(d::Int; n_twists::Int = 5,
+                           phase_debug_points::Vector{Tuple{Int,Int}} = Tuple{Int,Int}[])
+    F = AdmissibleTuple(d)
+    @show F
+
+    # Same shared setup as test_all_twists (one K/O for everything - see the
+    # BUGFIX comment there about duplicate order objects).
+    sd = _ray_class_shin_setup(F)
+    D, q, d = sd.D, sd.q, sd.d
+    K, O = sd.K, sd.O
+    all_triples = sd.all_triples
+    P_O, mP_O, rho_reps, gQ_reps, F_class = sd.P_O, sd.mP_O, sd.rho_reps, sd.gQ_reps, sd.F_class
+
+    println("conductor of O is: ", conductor(O))
+    println("Class group of O has order: ", order(P_O))
+    println("D = ", D, ", q = ", q, ", d mod 4 = ", mod(d, 4),
+            mod(d, 4) in (0, 3) ? "   (genus theory: chi = +1 on all principal classes; expect no twists)" : "")
+
+    principal_triples = [(J, I, gamma) for (J, I, gamma, is_princ) in all_triples if is_princ]
+    println("Principal triples: ", length(principal_triples))
+
+    # ---- select the principal twists with chi = -1 --------------------------
+    # chi = kronecker((d+1), N(J)*|N(gamma)|), the same quantity
+    # twisted_chi_general computes (there it cancels; here it SELECTS).
+    selected = Tuple{Any,Any,Any,Int}[]           # (J, I, gamma, N)
+    n_zero = 0; n_plus = 0
+    for (J, I, gamma) in principal_triples
+        N = Int(norm(J)) * abs(Int(norm(K(gamma))))
+        chi = kronecker_symbol(d + 1, N)
+        if chi == -1
+            push!(selected, (J, I, gamma, N))
+        elseif chi == 0
+            n_zero += 1
+        else
+            n_plus += 1
+        end
+    end
+    println("Principal classes with chi = -1: ", length(selected),
+            "   chi = +1: ", n_plus, "   chi = 0 (N not coprime to d+1, skipped): ", n_zero)
+    if isempty(selected)
+        println("No principal class with chi = -1 for d = ", d,
+                " - the two sign rules agree here; nothing to test.")
+        return nothing
+    end
+    n_run = min(n_twists, length(selected))
+
+    # ---- tables and caches, exactly as in test_all_twists -------------------
+    j_cache = Dict{FinGenAbGroupElem, Any}()
+    println("\nComputing ray class shin lookup table once for this run ...")
+    ray_class_lookup_table = ray_class_shin_table_fast_quiet(F; shared_data = sd)
+    println("  done: ", length(ray_class_lookup_table), " entries.")
+    println("\nComputing the full ray class monoid table once for this run ...")
+    full_monoid_table = ray_class_monoid_table_v2(F; shared_data = sd, verbose = true)
+    println("  done: ", length(full_monoid_table), " monoid classes across all Picard fibers.")
+    monoid_table = NamedTuple[]
+    candidate_cache = Dict{Tuple{Int,Int,Int}, Any}()
+    point_id_cache = Dict{Tuple{Int,Int}, Any}()
+    class_hints = Dict{Any, NamedTuple}()
+
+    println("\n=== Testing first ", n_run, " principal twists with chi = -1 ===")
+    results = NamedTuple[]
+    for (k, (J, I, gamma, N)) in enumerate(selected[1:n_run])
+        println("\nPrincipal twist (chi = -1) ", k, " of ", n_run, ":")
+        println("  J = ", J)
+        println("  gamma = ", gamma)
+        println("  norm(gamma) = ", norm(K(gamma)), "   N(J)*|N(gamma)| = ", N,
+                "   chi = ((d+1)/N) = -1")
+        new_ovs, gF, psi = twisted_chi_general(F, J, gamma, K, O,
+                                                true, P_O, mP_O,
+                                                rho_reps, gQ_reps, F_class, j_cache;
+                                                ray_class_lookup_table = ray_class_lookup_table,
+                                                monoid_table = monoid_table,
+                                                candidate_cache = candidate_cache,
+                                                class_hints = class_hints,
+                                                full_monoid_table = full_monoid_table,
+                                                point_id_cache = point_id_cache,
+                                                phase_debug_points = phase_debug_points)
+        push!(results, (k = k, N_gamma = norm(K(gamma)), N = N, gF = gF))
+    end
+
+    println("\n=== SUMMARY: principal twists with chi = -1 at d = ", d, " ===")
+    println("Read off ||M^2 - M||_F above for each twist. ~1e-14 on all of them => the sign of the",
+            " Galois action on nu~ is chi (rule (b)); O(1) on all of them => '+ always' (rule (a)).")
+    for r in results
+        println("  twist ", r.k, ": N(gamma) = ", r.N_gamma, "   N = ", r.N, "   gF = ", r.gF)
+    end
+    return results
 end
 
 function test_ray_class_group_size(F::AdmissibleTuple)
@@ -8516,7 +8702,7 @@ end
 # The failing run's twist: J = <5, 3//2*sqrt(44) + 3>, gamma = 1, non-principal.
 # Forced onto every seed below (broken seed 208475639 + two others). Redirect
 # output to a file and read the "=== SEED SUMMARY ===" block at the end.
-test_all_twists(29)
+test_all_twists(25)
 #diagnose_twist_across_seeds(21, [(5, 0), (3, 3//2)], (-20, -3), [208475639])
 #diagnose_twist_across_seeds(21, [(5, 0), (3, 3//2)], (1, 0), [208475639])
 #diagnose_seed_lift_differences(21, [305817264, 672049183, 208475639])

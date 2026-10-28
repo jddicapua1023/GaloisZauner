@@ -1,3 +1,62 @@
+# ===========================================================================
+# galois_action_ghost_sics_shin_rm.jl
+# ===========================================================================
+#
+# WHAT THIS FILE DOES (plain-English overview)
+#
+# This script numerically computes the (conjectural) Galois action on "ghost
+# SICs".  A ghost SIC in dimension d is described by d^2 numbers, its "ghost
+# overlaps", which the Zauner.jl package produces from an admissible tuple
+# (d, r, Q) via values of the Shintani-Faddeev cocycle ("shin").  The paper
+# arXiv:2501.03970 (Appleby-Flammia-Kopp) predicts that an element h of the
+# Galois group of a certain ray class field acts on these overlaps in a way
+# that can be described by ray class group arithmetic.  This file implements
+# that recipe and checks the result: for a chosen ray class (a "twist"), it
+# builds the twisted overlaps, assembles the matrix M = h(Pi~), and verifies
+# that M is again a ghost SIC (idempotent, trace 1, correct overlap identities).
+#
+# The pipeline, in the order it runs (see test_all_twists at the end of the
+# file):
+#
+#   1. SETUP.  Build the real quadratic field K, the order O of conductor q,
+#      the Picard group of O, and representatives of the ray class GROUP and
+#      of the ray class MONOID at modulus d-bar (d-bar = d for odd d, 2d for
+#      even d).  (_ray_class_shin_setup, ray_class_group_representatives,
+#      ray_class_monoid_table_v2.)
+#
+#   2. TABLES.  For every class, find a pair (rho_B, s) as in Theorem 2.19 of
+#      the paper, and record the value of shin at that pair.  These tables are
+#      used only to IDENTIFY classes later.  (ray_class_shin_table_fast_quiet.)
+#
+#   3. TWISTS.  For each chosen class J (principal or non-principal), compute
+#      the twisted overlaps point by point, assemble M, and verify it.
+#      (twisted_chi_general.)
+#
+#   4. DIAGNOSTICS.  Many functions named diagnose_* / check_* exist only to
+#      debug specific past problems; they are never called by a normal run.
+#
+# LATEST FIX (10/26): find_hj_reducing_matrix now always returns a det +1
+# matrix R with R*x the main reduced root. The old det(R) = -1 handling
+# (together with the 10/18 form negation and the 10/19 inverse-direction fix
+# that it triggered) gave values inconsistent with the det +1 points; this
+# was the cause of the d = 55 and d = 64 non-principal failures. Runs whose
+# non-principal twists fired "negating the form" (d = 55, 64, 69, 71, 75,
+# 79, 84, 89, 94, 99) must be restarted with this version.
+#
+# NOTATION USED THROUGHOUT THE COMMENTS
+#   d        : the dimension.
+#   d-bar    : the ray class modulus: d if d is odd, 2d if d is even.
+#   K        : the real quadratic field; O : the order of conductor q in K.
+#   rho_F    : the root of the tuple's quadratic form Q (a real quadratic
+#              irrational); Z + Z*rho_F is the lattice O.
+#   p = (p1,p2) : a grid point; it stands for the element x_p = p2*rho - p1.
+#   shin / theta : the Shintani-Faddeev cocycle value, computed by Zauner.jl.
+#   J, gamma : an ideal and an element whose product J*(gamma) represents the
+#              ray class being twisted by; N(J), N(gamma) are their norms.
+#   chi      : the sign +-1 by which the Galois element acts on sqrt(d+1).
+#   Sigma    : the second real place of K; "Sigma-positive" = positive there.
+#   BigFloat : Julia arbitrary-precision floats (256 bits by default here).
+# ===========================================================================
 using Random
 #Random.seed!(305817264)
 #Random.seed!(672049183)
@@ -69,6 +128,182 @@ using Zauner
 import Zauner: _ghost_invariants, _dualize, _approx_complex_intersection, roots, Vandermonde, pow_to_elem_sym_poly, shin_rm
 using GenericFFT: fft
 using LinearAlgebra
+import Pkg
+const _HAVE_SHA = try
+    @eval using SHA
+    true
+catch
+    false
+end
+
+# ---------------------------------------------------------------------------
+# RUN ENVIRONMENT BANNER (10/14). print_run_banner(d) is called at the start of
+# test_all_twists / test_all_twists_2 and records everything that has made a
+# run behave differently on another machine in this project: Julia version,
+# threads, RAM, BLAS, package versions (Nemo/Hecke/FLINT_jll/Zauner, incl. the
+# git commit of a dev'd Zauner), the Julia version the Manifest was resolved
+# with (the 9/20 Base.StaticData crash was a 1.12 Manifest on Julia 1.11),
+# the random seed, and size/mtime/sha256 of this script and of the three
+# sibling files it include()s (an old ray_class_enumeration.jl silently brings
+# back the d=15 bug). Everything is wrapped in try/catch: the banner can never
+# abort a run. To compare two machines, diff the banner blocks of their logs.
+# print_mem_line / print_run_footer record memory growth, so an OS kill (no
+# Julia error message) can be told apart from a crash.
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# HECKE-VERSION COMPATIBILITY (10/14). In newer Hecke, embedding(place)(x)
+# returns a complex ball (AcbFieldElem) even for a real place, and
+# Float64(::AcbFieldElem) has no method - that crashed the d=30 run on the
+# cluster (newer Hecke than the laptop's Manifest) at the first monoid anchor.
+# Older Hecke returned something Float64 accepts directly. _embf takes the
+# real part first and then tries the conversions in order; it returns the
+# same Float64 on both versions. Every Float64(emb_*(x)) /
+# _embf(embedding(p)(x)) call site now goes through it.
+# ---------------------------------------------------------------------------
+function _embf(v)
+    v = real(v)
+    try
+        return Float64(v)
+    catch
+    end
+    try
+        return Float64(BigFloat(v))
+    catch
+    end
+    try
+        return Float64(midpoint(v))      # Arb ball midpoint
+    catch
+    end
+    error("_embf: cannot convert an embedding value of type ", typeof(v), " to Float64")
+end
+
+# _sha12(path): returns the first 12 hex digits of the SHA-256 hash of a file,
+# or a placeholder if the SHA package is missing. Used by the run banner so two
+# machines can confirm they ran byte-identical source files.
+function _sha12(path)
+    try
+        return _HAVE_SHA ? bytes2hex(SHA.sha256(read(path)))[1:12] : "n/a"
+    catch
+        return "unreadable"
+    end
+end
+
+# _file_info(path): one-line description of a file (path, size, modification
+# time, short hash) for the run banner.
+function _file_info(path)
+    path = normpath(path)
+    isfile(path) || return string("MISSING: ", path)
+    st = stat(path)
+    return string(path, "  size=", st.size, "  mtime=", Libc.strftime("%Y-%m-%d %H:%M", st.mtime),
+                  "  sha256=", _sha12(path))
+end
+
+# print_mem_line(tag): prints the current memory usage (peak resident size,
+# live Julia heap, free system memory) with a label. Called after the tables
+# are built and after every twist, so a run that dies silently can be
+# diagnosed from its last memory line.
+function print_mem_line(tag::AbstractString)
+    try
+        live = NaN
+        try
+            live = Base.gc_live_bytes() / 2^30
+        catch
+        end
+        println("  [mem] ", tag, ": peak RSS = ", round(Sys.maxrss() / 2^30, digits = 2),
+                " GiB, GC-live = ", round(live, digits = 2),
+                " GiB, system free = ", round(Sys.free_memory() / 2^30, digits = 2), " GiB")
+    catch
+    end
+    return nothing
+end
+
+# print_run_footer(t0): prints the total elapsed time of a run and a final
+# memory line. Called at the very end of test_all_twists / test_all_twists_2.
+function print_run_footer(t0::Float64)
+    println("\n=== RUN FINISHED: elapsed ", round((time() - t0) / 60, digits = 1), " min ===")
+    print_mem_line("at end")
+    return nothing
+end
+
+# print_run_banner(d): prints everything about the computing environment that
+# has ever made a run behave differently on another machine: Julia version,
+# threads, RAM, package versions, the Manifest's Julia version, the random
+# seed, and hashes of this script and the files it includes. It never aborts a
+# run (everything is wrapped in try/catch).
+function print_run_banner(d::Int)
+    try
+        println("=================== RUN ENVIRONMENT ===================")
+        println("Julia ", VERSION, "   ", Sys.MACHINE, "   word size ", Sys.WORD_SIZE)
+        println("CPU: ", Sys.cpu_info()[1].model, "   logical cores = ", Sys.CPU_THREADS)
+        println("Threads.nthreads() = ", Threads.nthreads(),
+                "   JULIA_NUM_THREADS = ", get(ENV, "JULIA_NUM_THREADS", "(unset)"),
+                Threads.nthreads() > 1 ? "   <-- WARNING: Nemo/FLINT are not thread-safe; use -t 1" : "")
+        println("RAM: total = ", round(Sys.total_memory() / 2^30, digits = 1),
+                " GiB, free = ", round(Sys.free_memory() / 2^30, digits = 1), " GiB")
+        try
+            println("BLAS: ", LinearAlgebra.BLAS.get_config(),
+                    "   BLAS threads = ", LinearAlgebra.BLAS.get_num_threads())
+        catch
+        end
+        println("d = ", d, "   BigFloat precision = ", precision(BigFloat), " bits")
+        src = read(@__FILE__, String)
+        m = match(r"^Random\.seed!\((\d+)\)"m, src)
+        println("Random seed (active, uncommented line in the script) = ",
+                m === nothing ? "none found" : m.captures[1])
+
+        proj = Base.active_project()
+        println("Active project: ", proj)
+        if proj !== nothing
+            pdir = dirname(proj)
+            for fn in sort(readdir(pdir))
+                (startswith(fn, "Manifest") && endswith(fn, ".toml")) || continue
+                mpath = joinpath(pdir, fn)
+                println("  ", _file_info(mpath))
+                mv = match(r"julia_version\s*=\s*\"([^\"]+)\"", read(mpath, String))
+                if mv !== nothing
+                    mvv = VersionNumber(mv.captures[1])
+                    println("    Manifest resolved with Julia ", mvv)
+                    if (mvv.major, mvv.minor) != (VERSION.major, VERSION.minor)
+                        println("    <-- WARNING: Manifest was resolved with Julia ", mvv,
+                                " but this is Julia ", VERSION,
+                                ". Restore the matching Manifest or re-resolve on this version.")
+                    end
+                end
+            end
+        end
+
+        println("Packages (from the active project's dependency graph):")
+        deps = Pkg.dependencies()
+        for nm in ("Nemo", "Hecke", "AbstractAlgebra", "FLINT_jll", "Zauner", "GenericFFT")
+            infos = [v for (_, v) in deps if v.name == nm]
+            if isempty(infos)
+                println("  ", nm, ": (not in the active project's dependency graph)")
+                continue
+            end
+            v = infos[1]
+            line = string("  ", nm, " ", v.version === nothing ? "(no version)" : string(v.version))
+            if v.is_tracking_path
+                line *= string("  [dev, path = ", v.source, "]")
+                try
+                    sha = readchomp(pipeline(`git -C $(v.source) rev-parse --short HEAD`, stderr = devnull))
+                    dirty = !isempty(readchomp(pipeline(`git -C $(v.source) status --porcelain`, stderr = devnull)))
+                    line *= string("  git ", sha, dirty ? " (UNCOMMITTED CHANGES)" : "")
+                catch
+                end
+            end
+            println(line)
+        end
+
+        println("Script:  ", _file_info(@__FILE__))
+        for nm in ("unit_group_quotients.jl", "ray_class_enumeration.jl", "coprime_representatives.jl")
+            println("  include: ", _file_info(joinpath(@__DIR__, "..", "01_ray_class_representatives", nm)))
+        end
+        println("=======================================================")
+    catch err
+        println("(run-environment banner failed: ", sprint(showerror, err), " - continuing)")
+    end
+    return nothing
+end
 include("../01_ray_class_representatives/unit_group_quotients.jl")
 include("../01_ray_class_representatives/ray_class_enumeration.jl")
 include("../01_ray_class_representatives/coprime_representatives.jl")
@@ -81,6 +316,9 @@ include("../01_ray_class_representatives/coprime_representatives.jl")
 # included full_rayclassgrp.jl either, defining these locally instead.
 
 
+# ghost_overlaps(psi): given a ghost fiducial vector psi, returns the d x d
+# array of its ghost overlaps (real numbers), normalized so that each overlap
+# times its partner at -p equals 1/(d+1).
 function ghost_overlaps(ψ::AbstractVector)
     φ = circshift(reverse(ψ), 1)
     d = length(ψ)
@@ -88,6 +326,10 @@ function ghost_overlaps(ψ::AbstractVector)
     return real.(scale .* [φ' * wh(p, q, ψ) for p = 0:d-1, q = 0:d-1])
 end
 
+# ghost_overlap_test_complex(ovs, d): measures how far an array of overlaps is
+# from the ghost identity |v(p) * v(-p)| = 1/(d+1). Returns the largest
+# deviation over all nonzero p. Only MAGNITUDES are tested here (signs are
+# checked elsewhere).
 function ghost_overlap_test_complex(ovs, d)
     max_dev = 0.0
     for p1 = 0:d-1
@@ -163,6 +405,8 @@ function diagnose_sign_flips(new_ovs, d; max_flips::Int = 8, tol::Float64 = 1e-1
     return flipped
 end
 
+# express_in_basis(x, rho, D): writes an element x of K in the basis {1, rho},
+# i.e. finds rationals (c1, c2) with x = c1 + c2*rho. Returns [c1, c2].
 function express_in_basis(x, rho, D)
     p = coeff(x, 0)
     q_coeff = coeff(x, 1)
@@ -188,7 +432,7 @@ for why this is essential, not optional, for large-norm ideals). Left
 already-working code.
 """
 function lattice_reduce_2d(v1, v2, K, places)
-    embed_pair(x) = (Float64(embedding(places[1])(x)), Float64(embedding(places[2])(x)))
+    embed_pair(x) = (_embf(embedding(places[1])(x)), _embf(embedding(places[2])(x)))
     norm2(e) = e[1]^2 + e[2]^2
     dotp(ea, eb) = ea[1]*eb[1] + ea[2]*eb[2]
 
@@ -232,7 +476,7 @@ self-checking detection, so `Sigma` is never again wrong-by-assumption.
 function conjugation_place(K)
     places = real_places(K)
     a = gen(K)
-    i = findfirst(p -> Float64(real(embedding(p)(a))) < 0, places)
+    i = findfirst(p -> _embf(embedding(p)(a)) < 0, places)
     i === nothing && error("conjugation_place: neither real place of K sends gen(K) negative - ",
                            "cannot identify conjugation")
     return places[i]
@@ -369,16 +613,23 @@ the current pair of tracked root-images. If `0 < lo < 1 < hi`, done. Else if
 (`z ↦ 1/z`, `det = -1`). This always terminates (real quadratic irrationals
 have purely periodic continued-fraction-type behavior under this process).
 
+(10/26) After the loop, `R` is normalized so that `R*x` is the MAIN reduced
+root (`> 1`): if `x` landed on the small root, `R` is replaced by
+`[0 1; 1 0]*R`, which maps the reduced pair to another reduced pair with the
+roles of the two roots exchanged. In every case met so far this makes
+`det(R) = 1`; a remaining `det(R) = -1` raises an error rather than falling
+back to the old det = -1 handling, which gave values inconsistent with the
+det = +1 points (the d = 55 / d = 64 non-principal failures).
+
 Returns a named tuple `(R, detR, A_reduced, root_used, reduced_root)`:
 - `R`             : the `GL_2(Z)` matrix found, as an `Int` matrix.
-- `detR`          : `det(R)`, either `1` or `-1`.
+- `detR`          : `det(R)`; always `1` since the 10/26 normalization
+                    (kept as a field for the diagnostics that print it).
 - `A_reduced`     : `R*A*R^{-1}` (HJ-reduced), as an `Int` matrix.
-- `root_used`     : `:x` if `detR == 1` (meaning `R*x` is `A_reduced`'s own
-                    reduced root, `> 1`), or `:conj_x` if `detR == -1`
-                    (meaning `R*conj(x)` is instead) - per the theorem
-                    above, this is exactly which point to feed `shin_rm`
-                    together with `A_reduced` to compute `shin_A(x,p,d)`.
-- `reduced_root`  : the `BigFloat` value of that reduced root (`> 1`).
+- `root_used`     : always `:x` since the 10/26 normalization: `R*x` is
+                    `A_reduced`'s main reduced root (`> 1`). (Before 10/26
+                    this could be `:conj_x` when `det(R) = -1`.)
+- `reduced_root`  : the `BigFloat` value `R*x` (`> 1`).
 - `x0`            : `x` itself (unmutated), returned for convenience so
                     callers (e.g. `shin` below) don't need to recompute it.
 - `conjx0`        : `A`'s other fixed point (`x`'s Galois conjugate),
@@ -424,14 +675,67 @@ function find_hj_reducing_matrix(A::AbstractMatrix{<:Integer}, x::BigFloat;
         end
     end
 
+    # (10/26 FIX, d = 55 and d = 64 non-principal failures) Normalize R so
+    # that it has det +1 AND sends x itself (not its conjugate) to the main
+    # reduced root (> 1).
+    #
+    # The loop above stops at the first HJ-reduced pair, and the parity of
+    # the number of inversion steps decides det(R). Previously a det(R) = -1
+    # result was handled through the "det = -1 branch" of the transformation
+    # theorem (evaluate at conj(x) instead of x). In every case that occurred
+    # in the runs, det(R) = -1 came together with R*x being the SMALL root
+    # rho_- (in (0,1)) and R*conj(x) the main root rho_+; the reduced
+    # stabilizer then pointed in the inverse direction (lower-left < 0), and
+    # the 10/18 and 10/19 fixes (negate the form / invert A_reduced) made
+    # Zauner accept it - but the value obtained that way is NOT consistent
+    # with the det = +1 points: a point p with det(R) = -1 and its partner
+    # -p with det(R) = +1 gave |v(p) v(-p)| != 1/(d+1). The d = 55 and
+    # d = 64 logs show this exactly: every deviating pair (288 at d = 55,
+    # 2700 at d = 64) contains a det(R) = -1 point, and pairs where BOTH
+    # points had det(R) = -1 were consistent with each other but not with
+    # the rest (which is also why d = 69, where every point had det(R) = -1,
+    # still assembled to a ghost-like M; its non-principal outputs must be
+    # recomputed).
+    #
+    # The fix: if R*x landed on the small root, compose with the inversion
+    # W = [0 1; 1 0] (z -> 1/z). That maps the reduced pair (rho_-, rho_+) to
+    # the reduced pair (1/rho_+, 1/rho_-), so R' = W*R still produces an
+    # HJ-reduced pair, now with R'*x = 1/rho_- > 1 the MAIN root, and
+    # det(R') = -det(R). In all cases met so far this turns det -1 into
+    # det +1, so only the det = +1 branch of the theorem (the branch every
+    # passing twist has always used) is ever needed. The reduced stabilizer
+    # R' A R'^{-1} then has lower-left entry > 0 exactly when A has
+    # eigenvalue > 1 at x (checked numerically on random hyperbolic SL_2(Z)
+    # matrices), i.e. the direction Zauner expects, so the negation /
+    # inversion fixes no longer fire for these points.
+    if x_val < 1
+        W = BigInt[0 1; 1 0]
+        x_val = 1 / x_val
+        cx_val = 1 / cx_val
+        R = W * R
+    end
+
     Rint = Int.(R)
     detR = Rint[1,1]*Rint[2,2] - Rint[1,2]*Rint[2,1]
     (detR == 1 || detR == -1) || error("find_hj_reducing_matrix: det(R) = $detR, expected ±1")
+    # A det = -1 matrix sending x to the main root would need the det = -1
+    # branch of the transformation theorem, which is not validated (it never
+    # occurred in any run, and the old det = -1 handling produced wrong
+    # values). Stop loudly instead of returning a silently wrong value.
+    detR == 1 || error("find_hj_reducing_matrix: after normalization R sends x to the main ",
+                       "reduced root but det(R) = -1 (A = $A, x = $x). This case has never ",
+                       "occurred before and has no validated treatment - please report it.")
 
     Rinv = _gl2z_inv(Rint)
     A_reduced = Rint * Matrix(A) * Rinv
 
-    root_used, reduced_root = detR == 1 ? (:x, x_val) : (:conj_x, cx_val)
+    # Safety check: R must really send x to the reduced root it reports.
+    let mob = (BigFloat(Rint[1,1]) * x0 + Rint[1,2]) / (BigFloat(Rint[2,1]) * x0 + Rint[2,2])
+        abs(mob - x_val) <= 1e-20 * max(1, abs(x_val)) ||
+            error("find_hj_reducing_matrix: R*x = $mob but the tracked reduced root is $x_val")
+    end
+
+    root_used, reduced_root = (:x, x_val)
 
     reduced_root > 1 || @warn "find_hj_reducing_matrix: reduced_root = $reduced_root " *
                                "is not > 1 as expected for the HJ-reduced (main) root " *
@@ -455,6 +759,12 @@ transformation theorem
                                          = shin^r_A(conj(β))   if det(R) = -1
 
 with `s_R(β) = sgn(J_R(β)) = sgn(c_R·β + d_R)` for `R = [a_R b_R; c_R d_R]`.
+
+(10/26) Since the normalization in `find_hj_reducing_matrix`, `R` always
+has `det(R) = 1` and `R*x = reduced_root`, so only the first case of the
+theorem is used and `β = x`. The text below describes the older behavior,
+when `det(R) = -1` could occur; that branch gave values inconsistent with
+the det = +1 points and is no longer reached.
 
 Concretely: `find_hj_reducing_matrix(A, x)` gives `R`, `A_reduced =
 R*A*R^{-1}`, and tells us which β makes `R*β` equal to `reduced_root` -
@@ -488,7 +798,27 @@ function shin(A::AbstractMatrix{<:Integer}, x::BigFloat, p::Vector{<:Integer}, d
 
     p_transformed = mod.(s_R .* (red.R * Int.(p)), d)
 
-    return shin_rm(Matrix(red.A_reduced), red.reduced_root, p_transformed, d)
+    # (10/19, d = 55) Zauner's shin_rm -> gamma_kopp -> _hj_cycle_matrices
+    # requires the HJ-reduced stabilizer in the direction with lower-left
+    # entry > 0 (and trace > 0): psl2word of the other direction does not end
+    # in 0 and it errors "t.Q is not strictly HJ-reduced". find_hj_reducing_matrix
+    # can hand back the inverse direction (A_reduced[2,1] < 0) after conjugating
+    # by R - it happened at d = 55 in the per-point intra-point check (the tuple
+    # path has the matching fix: it negates a form with a < 0, i.e. uses A^{-1}).
+    # Replace A by its inverse (det = 1, so inv = [d -b; -c a]), which fixes the
+    # same root. This never triggered in any earlier run (it would have crashed).
+    # (10/26) Every firing seen in the runs came from a det(R) = -1 reduction,
+    # which find_hj_reducing_matrix now normalizes away; after that this branch
+    # should only fire if A itself is the inverse automorph direction at x
+    # (eigenvalue < 1 there), in which case using the inverse is the correct
+    # direction for Zauner.
+    A_red = Matrix(red.A_reduced)
+    if A_red[2,1] < 0
+        A_red = [A_red[2,2] -A_red[1,2]; -A_red[2,1] A_red[1,1]]
+        println("    [shin] A_reduced had lower-left entry < 0 (inverse automorph direction) - using its inverse")
+    end
+
+    return shin_rm(A_red, red.reduced_root, p_transformed, d)
 end
 
 # ---------------------------------------------------------------------------
@@ -581,13 +911,19 @@ function hj_automorph_for_root(rho_B, D::Int; max_u::Integer = 10_000_000, tol::
 
     p0 = c0^2 - c1^2 * D
     p1 = -2 * c0
-    scale = lcm(Int(denominator(QQ(p0))), Int(denominator(QQ(p1))), 1)
-    a_int = scale
-    b_int = Int(round(scale * p1))
-    c_int = Int(round(scale * p0))
-    g = gcd(gcd(abs(a_int), abs(b_int)), abs(c_int))
-    g == 0 && error("hj_automorph_for_root: degenerate form (a=b=c=0) for rho_B = $rho_B")
-    a_int ÷= g; b_int ÷= g; c_int ÷= g
+    # (10/16) ZZ arithmetic first (see find_class_representatives); the
+    # primitive form is converted to Int only after the gcd, with a clear
+    # error if it still does not fit (hj_form_automorph is Int-based).
+    p0q = QQ(p0); p1q = QQ(p1)
+    scale_z = lcm(denominator(p0q), denominator(p1q))
+    a_z = scale_z; b_z = numerator(p1q * scale_z); c_z = numerator(p0q * scale_z)
+    g_z = gcd(gcd(abs(a_z), abs(b_z)), abs(c_z))
+    iszero(g_z) && error("hj_automorph_for_root: degenerate form (a=b=c=0) for rho_B = $rho_B")
+    a_z = divexact(a_z, g_z); b_z = divexact(b_z, g_z); c_z = divexact(c_z, g_z)
+    (fits(Int, a_z) && fits(Int, b_z) && fits(Int, c_z)) ||
+        error("hj_automorph_for_root: primitive form coefficients exceed Int64 for rho_B = $rho_B ",
+              "(a,b,c) = ($a_z,$b_z,$c_z) - the root needs to be reduced first")
+    a_int = Int(a_z); b_int = Int(b_z); c_int = Int(c_z)
     if a_int < 0
         a_int, b_int, c_int = -a_int, -b_int, -c_int
     end
@@ -666,6 +1002,9 @@ function stabilizer_generator_in_Gamma_s(rho_B, D::Int, s::Vector;
     return stabilizer_power_in_Gamma_s(L, s; max_power = max_power)
 end
 
+# squarefree_part(n): the squarefree part of an integer n (the product of the
+# primes dividing n to an odd power). Used to get the field K = Q(sqrt(D))
+# from the discriminant D of the tuple.
 function squarefree_part(n::Int)
     fac = factor(n)
     sq_part = 1
@@ -677,6 +1016,9 @@ function squarefree_part(n::Int)
     return sq_part
 end
 
+# rationals_by_height(max_h): lists all rational numbers p/q in lowest terms
+# with |p|, q <= max_h, sorted by height. Used as a search space for the
+# rational coordinates s1, s2 in Theorem 2.19.
 function rationals_by_height(max_h)
     # NOTE: rewritten for efficiency at large max_h. The previous version
     # escalated an internal "h" from 1 to max_h and, at every level, rescanned
@@ -696,6 +1038,8 @@ function rationals_by_height(max_h)
     return rats
 end
 
+# to_du_mod_d(u, d): reduces a rational number u into the half-open interval
+# [0, d). Used to bring grid coordinates back into the fundamental domain.
 function to_du_mod_d(u_val, d)
     du = u_val
     k = floor(du / d)
@@ -703,20 +1047,33 @@ function to_du_mod_d(u_val, d)
     return du_mod
 end
 
+# find_class_representatives(O, F, K): for every class g of the Picard group of
+# O, picks a root rho (a real quadratic irrational) whose lattice Z + Z*rho
+# lies in that class, and the reduced quadratic form gQ attached to it. Also
+# works out which Picard class contains the tuple's own form F.Q and overrides
+# that class's root by the tuple's own root rho_F. Returns the Picard group,
+# the class map, and the two dictionaries rho_reps / gQ_reps keyed by class.
 function find_class_representatives(O, F, K)
     D = Int(F.D)
     a = gen(K)
 
+    # Step 1: the field data. Dr is the squarefree part of D, so sqrt(D) = sqrt(D/Dr)*sqrt(Dr).
     Dr = squarefree_part(D)
     sqrt_Dr = a // isqrt(D ÷ Dr)
 
+    # Step 2: the Picard group P_O of the order, and the map mP_O from group elements to ideals.
     P_O, mP_O = picard_group(O)
     d_val = Int(F.d)
 
+    # Step 3: for every Picard class, choose a root rho and a reduced quadratic form.
     rho_reps = Dict{FinGenAbGroupElem, Any}()
     gQ_reps  = Dict{FinGenAbGroupElem, Any}()
     F_class  = nothing
 
+    # Loop over the Picard classes. For each class g, take Hecke's representative ideal,
+    # read off a root rho_g from its Z-basis, build the quadratic form of the lattice
+    # Z + Z*rho_g (in exact ZZ arithmetic, since the basis can be huge), reduce the form,
+    # and store both.
     for g in P_O
         I_g = mP_O(g)
         b = basis(I_g)
@@ -733,16 +1090,20 @@ function find_class_representatives(O, F, K)
         p0 = c1^2 - c2^2 * D
         p1_form = -2 * c1
         p2_form = 1
-        scale = lcm(Int(denominator(QQ(p0))),
-                   Int(denominator(QQ(p1_form))), 1)
-        a_int = Int(round(scale * p2_form))
-        b_int = Int(round(scale * p1_form))
-        c_int = Int(round(scale * p0))
-        g_int = gcd(a_int, b_int, c_int)
-        a_int ÷= g_int
-        b_int ÷= g_int
-        c_int ÷= g_int
-        gQ_cand = binary_quadratic_form(a_int, b_int, c_int)
+        # (10/16) Build the form in ZZ, not Int64. Hecke's Picard-class
+        # representative can have a huge basis (d = 57: the root's denominator
+        # was 4.5e19 > typemax(Int64), InexactError here), and Hecke forms store
+        # ZZRingElem coefficients anyway, so nothing needs to fit in a machine
+        # word; reduced_hj_orbit / minimal_hj_stabilizer bring the reduced form
+        # down to small coefficients afterwards.
+        p0q = QQ(p0); p1q = QQ(p1_form)
+        scale = lcm(denominator(p0q), denominator(p1q))          # ZZRingElem
+        a_z = scale * ZZ(p2_form)
+        b_z = numerator(p1q * scale)
+        c_z = numerator(p0q * scale)
+        g_z = gcd(gcd(a_z, b_z), c_z)
+        a_z = divexact(a_z, g_z); b_z = divexact(b_z, g_z); c_z = divexact(c_z, g_z)
+        gQ_cand = binary_quadratic_form(a_z, b_z, c_z)
         V = reduced_hj_orbit(gQ_cand)
         gQ_reps[g] = minimal_hj_stabilizer(V, d_val)
 
@@ -754,6 +1115,8 @@ function find_class_representatives(O, F, K)
         end
     end
 
+    # Step 4: find out which Picard class the tuple's OWN form F.Q lives in, and use the
+    # tuple's own root rho_F for that class (so the lookups at rho_F are in the same frame).
     D_Q = Int(discriminant(F.Q))
     D_fund, f_Q = coredisc(D_Q)
     D_fund == D ||
@@ -772,6 +1135,8 @@ function find_class_representatives(O, F, K)
             "  disc(F.Q) = ", D_Q, "  coredisc = (", D_fund, ",", f_Q, ")",
             "  sqrt_DQ = ", sqrt_DQ, "  rho_F (fixed) = ", rho_F)
 
+    # If F.Q's class was not recognized among the stored forms, fall back to comparing
+    # lattices directly.
     if F_class === nothing
         for g in P_O
             if rho_reps[g] == rho_F
@@ -794,6 +1159,9 @@ function find_class_representatives(O, F, K)
     return P_O, mP_O, rho_reps, gQ_reps, F_class
 end
 
+# find_rho_j_and_coords(product, rho_j): given an element `product` of K and a
+# root rho_j, writes product = u2*rho_j - u1 and returns (u2, u1) as rationals.
+# This is how an element is turned back into a grid point (u1, u2).
 function find_rho_j_and_coords(product, rho_j)
     p0 = coeff(product, 0)
     p1 = coeff(product, 1)
@@ -805,6 +1173,10 @@ function find_rho_j_and_coords(product, rho_j)
     return QQ(u2), QQ(u1)
 end
 
+# find_s1_s2(...): an older helper that computes the Theorem 2.19 coordinates
+# (s1, s2) of a class by working in the maximal order of K. It is kept for the
+# diagnostics; the main pipeline uses find_alpha_rhoB_s1_s2_O instead, which
+# works directly in the (possibly non-maximal) order O.
 function find_s1_s2(J, rho_B, rho, u_B, P_O, mP_O, O, K, OK, d_val, rho_j)
     J_OK  = extend(J, OK)
     b_OK  = extend(mP_O(-u_B), OK)
@@ -862,7 +1234,7 @@ function find_s1_s2(J, rho_B, rho, u_B, P_O, mP_O, O, K, OK, d_val, rho_j)
     println("  c_rhoB = ", c_rhoB)
 
     emb_conj = embedding(places[1])
-    rhoB_conj = Float64(emb_conj(rho_B))
+    rhoB_conj = _embf(emb_conj(rho_B))
     println("  conj(rho_B) = ", rhoB_conj)
 
     function to_float(q)
@@ -971,6 +1343,9 @@ struct RhoJGridRejected <: Exception
     msg::String
 end
 
+# _nf_elem_of(K, x): converts x (which may be an order element, a field
+# element, or something Hecke returns from an ideal basis) into an element of
+# the number field K, trying the available conversions in turn.
 function _nf_elem_of(K, x)
     try
         return elem_in_nf(x)
@@ -988,6 +1363,8 @@ function _nf_elem_of(K, x)
 end
 
 # Galois conjugate a + b*gen(K) -> a - b*gen(K)  (K real quadratic)
+# quad_conj(K, x): the Galois conjugate of x in the real quadratic field K
+# (sqrt(D) -> -sqrt(D)).
 function quad_conj(K, x)
     return K(coeff(x, 0)) - K(coeff(x, 1)) * gen(K)
 end
@@ -995,6 +1372,9 @@ end
 # Canonical form (den, 2x2 upper-triangular ZZ HNF, common content removed) of
 # the Z-lattice in K spanned by `gens`, in coordinates over (1, gen(K)).
 # Two full-rank lattices are equal iff their canonical forms are equal.
+# lattice_canonical(K, gens): a canonical (Hermite normal form) description of
+# the Z-lattice spanned by the given elements of K, so two lattices can be
+# compared for equality exactly.
 function lattice_canonical(K, gens)
     n = length(gens)
     den = one(ZZ)
@@ -1036,6 +1416,9 @@ function lattice_canonical(K, gens)
     return (divexact(den, c), H2)
 end
 
+# lattices_equal / lattice_product_gens: exact equality test for two lattices,
+# and the list of pairwise products of two generating sets (which generates
+# the product lattice).
 lattices_equal(K, gensA, gensB) = lattice_canonical(K, gensA) == lattice_canonical(K, gensB)
 
 # Z-generators of the product module A*B from Z-generators of A and B.
@@ -1047,6 +1430,11 @@ lattice_product_gens(gensA, gensB) = [a * b for a in gensA for b in gensB]
 # Z-generators `gens` (K-elements): returns (true, gamma) with gamma an
 # EXPLICIT verified generator (gamma * O equals the lattice, checked by HNF),
 # or (false, nothing). Independent of picard_group / mP_O entirely.
+# is_principal_O_verified(K, O, gens): decides whether the O-ideal spanned by
+# `gens` is principal, and if so returns a generator mu. It first asks Hecke
+# in the maximal order, then adjusts by powers of the fundamental unit until
+# mu*O is EXACTLY the given lattice (checked with lattice_canonical). The
+# returned generator can carry a large unit power.
 function is_principal_O_verified(K, O, gens; unit_bound::Int = 60)
     OK = maximal_order(K)
     gens_nf = [_nf_elem_of(K, g) for g in gens]
@@ -1105,6 +1493,8 @@ end
 # flip (g or -g) gives a totally positive generator; if g has MIXED signs,
 # no totally positive generator exists for this ideal at all - it's a
 # genuine rejection, not a search-depth issue.
+# is_principal_totally_positive_verified(...): like is_principal_O_verified but
+# additionally requires the generator to be totally positive.
 function is_principal_totally_positive_verified(K, O, gens; unit_bound::Int = 60)
     ok, g = is_principal_O_verified(K, O, gens; unit_bound = unit_bound)
     ok || return (false, nothing)
@@ -1128,6 +1518,9 @@ end
 # unit_bound) for one that ALSO satisfies the membership condition, rather
 # than accepting the first totally positive one and erroring if membership
 # happens to fail for that particular one.
+# is_principal_totally_positive_verified_with_membership(...): variant of the
+# above that also verifies membership of the generator in a companion
+# lattice; used by the Theorem 2.19 consistency gate.
 function is_principal_totally_positive_verified_with_membership(K, O, gens, companion,
                                                                   target_lattice;
                                                                   unit_bound::Int = 200)
@@ -1194,6 +1587,10 @@ end
 # than by trusting a Picard discrete log. Same height-shell search pattern as
 # find_coprime_picard_representative. Returns (b_O, mu) with mu a verified
 # generator of J*b_O.
+# find_b_with_verified_principal_product(O, K, J, moduli): searches for an
+# ideal b_O, coprime to every ideal in `moduli` (e.g. d-bar*O and (d+1)*O),
+# such that J*b_O is principal with a certified generator. This b_O is the
+# auxiliary ideal "b" of Theorem 2.19 for the class of J.
 function find_b_with_verified_principal_product(O, K, J, moduli;
                                                  max_height::Int = 100,
                                                  unit_bound::Int = 60)
@@ -1261,6 +1658,8 @@ function find_b_with_verified_principal_product(O, K, J, moduli;
           "max_height/unit_bound before suspecting anything deeper.")
 end
 
+# find_coprime_picard_representative(O, mP_O, target_class, moduli): finds one
+# ideal in a given Picard class that is coprime to all the given moduli.
 function find_coprime_picard_representative(O, mP_O, target_class, moduli; max_height::Int = 100)
     # Mirrors make_coprime_representatives (make_coprime_reps.jl): searches
     # O's own basis coordinates for TWO generators alpha1, alpha2 (height =
@@ -1346,6 +1745,10 @@ end
 # instead of b*L^{-1}: the two differ by a positive rational factor, hence are
 # principal together with generators of identical sign at both real places.
 # This avoids inv() on a non-maximal-order ideal (unverified in this codebase).
+# theorem219_gate(K, O, mP_O, inv_class, rho_j, d): a consistency check that a
+# candidate root rho_j really can serve in Theorem 2.19 for the given Picard
+# class (the lattice Z + Z*rho_j must be a proper O-ideal in the right class,
+# with a totally positive scaling). Returns a status symbol plus witnesses.
 function theorem219_gate(K, O, mP_O, inv_class, rho_j, d; gamma_height::Int = 8,
                           unit_bound::Int = 60)
     b0 = mP_O(inv_class)
@@ -1406,6 +1809,10 @@ end
 # project owner, the goal for Stage 1 (finding new_rho_j from P_int) is
 # P_int*d*O = alpha*(Z+Z*new_rho_j) directly, so I*d*O is used as-is with no
 # inverse-class detour.
+# find_alpha_rho_direct(I, K, O, d_val): given an ideal I (in practice
+# I = b_O * d-bar*O), writes it as alpha*(Z + Z*rho_B) with alpha totally
+# positive and rho_B a root with the main embedding larger than the conjugate
+# one. This produces the pair (alpha, rho_B) of Theorem 2.19.
 function find_alpha_rho_direct(I, K, O, d_val; mn_height::Int = 3000,
                                 exclude::Vector = [], verbose::Bool = false)
     IdO = I * ideal(O, d_val)
@@ -1422,7 +1829,7 @@ function find_alpha_rho_direct(I, K, O, d_val; mn_height::Int = 3000,
     bd2_raw = _nf_elem_of(K, bd_basis_raw[2])
 
     function embed_pair(x, plcs)
-        return (Float64(embedding(plcs[1])(x)), Float64(embedding(plcs[2])(x)))
+        return (_embf(embedding(plcs[1])(x)), _embf(embedding(plcs[2])(x)))
     end
 
     function lattice_reduce_2d(v1, v2, plcs)
@@ -1484,8 +1891,8 @@ function find_alpha_rho_direct(I, K, O, d_val; mn_height::Int = 3000,
             beta = K(p_) * bd1 + K(q_) * bd2
 
             rho_B = beta / alpha_cand
-            main_val = Float64(emb_main(rho_B))
-            conj_val = Float64(emb_conj(rho_B))
+            main_val = _embf(emb_main(rho_B))
+            conj_val = _embf(emb_conj(rho_B))
             main_val > conj_val || continue
 
             (rho_B in exclude) && continue
@@ -1519,6 +1926,15 @@ function find_alpha_rho_direct(I, K, O, d_val; mn_height::Int = 3000,
           " satisfying I*d*O = alpha*(Z+Z*rho_B)")
 end
 
+# find_alpha_rhoB_s1_s2_O(J, ...): THE Theorem 2.19 engine. For a ray class
+# represented by the ideal J it finds
+#     b_O   : an auxiliary ideal with J*b_O principal (see above),
+#     alpha, rho_B : with b_O * d-bar*O = alpha*(Z + Z*rho_B),
+#     s = (s1, s2) : rationals with J*b_O = ( alpha*(s2*rho_B - s1) ) and the
+#                    element s2*rho_B - s1 positive at Sigma.
+# The pair (rho_B, s) is what the shin cocycle is evaluated at for this class.
+# It has a fast path (reusing alpha, rho_B, b_O found earlier for the same
+# Picard class, passed in as *_hint) and a slow two-stage search.
 function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
                                   d_val, rho_j, d_check;
                                   mn_height::Int = 3000,           # bound for the joint (alpha,rho_B) primitive-vector search
@@ -1544,6 +1960,9 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
     # would have produced for this J. This lets callers building a
     # per-ray-class table (e.g. ray_class_shin_table) do the expensive
     # search ONCE per Picard class instead of once per ray class.
+    # FAST PATH: if alpha, rho_B and b_O are already known for this Picard class (hints
+    # from an earlier call), only the coordinates (s1, s2) of J*b_O / alpha have to be
+    # found, by a small search for a generator of that ideal.
     if alpha_hint !== nothing && rho_B_hint !== nothing && b_O_hint !== nothing
         alpha = alpha_hint
         rho_B = rho_B_hint
@@ -1574,7 +1993,7 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
         alpha_ideal * rhoB_lattice_O == bdO_O ||
             error("alpha_hint, rho_B_hint do not satisfy b_O_hint*d_val*O = ",
                   "alpha*(Z+Z*rho_B) - hints are inconsistent with b_O_hint/d_val")
-        Float64(emb_main(rho_B)) > Float64(emb_conj(rho_B)) ||
+        _embf(emb_main(rho_B)) > _embf(emb_conj(rho_B)) ||
             error("rho_B_hint does not satisfy the larger-root convention (main > conj)")
 
         function to_nf_elem_fp(x)
@@ -1661,7 +2080,7 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
             end
             cand_ideal == Q || continue
 
-            elem2 = Float64(emb_conj(cand)) > 0 ? cand : -cand
+            elem2 = _embf(emb_conj(cand)) > 0 ? cand : -cand
 
             qc  = coeff(elem2, 1)
             p0  = coeff(elem2, 0)
@@ -1685,7 +2104,7 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
             end
             in_bO || continue
 
-            rhoB_conj_check = Float64(emb_conj(rho_B))
+            rhoB_conj_check = _embf(emb_conj(rho_B))
             s1_f_check = to_float_fp(s1_try)
             s2_f_check = to_float_fp(s2_try)
             (s2_f_check * rhoB_conj_check - s1_f_check) > 0 || continue
@@ -1700,7 +2119,7 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
         found_s || error("Could not find s1, s2 within q_gen_height=", q_gen_height,
                           " using the hinted alpha, rho_B, b_O for this J = ", J)
 
-        rhoB_conj = Float64(emb_conj(rho_B))
+        rhoB_conj = _embf(emb_conj(rho_B))
         s1_f = to_float_fp(s1)
         s2_f = to_float_fp(s2)
         is_valid_final = (s2_f * rhoB_conj - s1_f) > 0
@@ -1750,6 +2169,8 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
     #     alpha we picked (they all generate the same ideal target_O), so
     #     there is no need to search over alpha's unit-power "height" either
     #     - the first totally positive alpha found is as good as any other.
+    # SLOW PATH, stage 1: find the auxiliary ideal b_O with J*b_O principal, coprime to
+    # d-bar*O and to (d+1)*O.
     dO_O = ideal(O, d_val)
     is_inv_d, _ = Hecke.is_invertible(dO_O)
     is_inv_d || error("dO_O = ideal(O, d_val) is NOT invertible - this would be ",
@@ -1822,6 +2243,10 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
                                "points to a bug in that function rather than a genuine ",
                                "mathematical obstruction.")
 
+    # Stage 2: write b_O * d-bar*O = alpha*(Z + Z*rho_B). The lattice basis of that
+    # ideal is first size-reduced, then candidate pairs (m, n) of small integers are
+    # searched for a totally positive alpha whose quotient lattice has a root rho_B
+    # with the right ordering of its two real embeddings.
     bdO_O = b_O * dO_O
     Jb_O  = J * b_O
     NJb   = QQ(norm(Jb_O))
@@ -1850,7 +2275,7 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
     # combinations is far more likely to reach a genuinely small element
     # quickly.
     function embed_pair(x, plcs)
-        return (Float64(embedding(plcs[1])(x)), Float64(embedding(plcs[2])(x)))
+        return (_embf(embedding(plcs[1])(x)), _embf(embedding(plcs[2])(x)))
     end
 
     function lattice_reduce_2d(v1, v2, plcs)
@@ -1905,6 +2330,8 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
     # search, and no unit-power sign-twisting needed at all. We only need
     # alpha itself (some m*bd1+n*bd2 with gcd(m,n)=1, so it extends to a
     # genuine basis) to be totally positive, checked directly.
+    # The joint search over (m, n) pairs by increasing height; `rej` counts the reasons
+    # candidates were rejected (mixed sign, wrong root order, ...).
     verbose && println("  [two-stage] searching primitive (m,n) pairs for alpha, rho_B jointly")
 
     n_mn_tried = 0
@@ -1955,8 +2382,8 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
             # Bezout construction, so the ratio beta/alpha is unchanged
             # either way; using alpha_cand directly here is just simpler.
             rho_B = beta / alpha_cand
-            main_val  = Float64(emb_main(rho_B))
-            conj_val  = Float64(emb_conj(rho_B))
+            main_val  = _embf(emb_main(rho_B))
+            conj_val  = _embf(emb_conj(rho_B))
             # BUGFIX (9/15, d=15 hang): the previous version rejected the
             # (m,n) pair outright when rho_B failed the "larger root"
             # convention (conj(rho_B) > rho_B). That is wrong, and for d=15
@@ -2075,7 +2502,7 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
 
             # a single global sign flip always suffices, since is_valid only
             # depends on the sign of elem2 at ONE embedding (emb_conj)
-            elem2 = Float64(emb_conj(cand)) > 0 ? cand : -cand
+            elem2 = _embf(emb_conj(cand)) > 0 ? cand : -cand
 
             # closed-form solve for s1, s2: elem2 = s2*rho_B - s1, and
             # {1,rho_B} is a full Q-basis of K - exact, no search needed
@@ -2110,7 +2537,7 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
             # candidate outright and let the search continue to the next
             # lattice point, rather than trusting the sign-flip construction
             # or erroring out.
-            rhoB_conj_check = Float64(emb_conj(rho_B))
+            rhoB_conj_check = _embf(emb_conj(rho_B))
             s1_f_check = to_float(s1_try)
             s2_f_check = to_float(s2_try)
             (s2_f_check * rhoB_conj_check - s1_f_check) > 0 || continue
@@ -2121,7 +2548,7 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
         end
         found_s || continue
 
-        rhoB_conj = Float64(emb_conj(rho_B))
+        rhoB_conj = _embf(emb_conj(rho_B))
         s1_f = to_float(s1)
         s2_f = to_float(s2)
         is_valid_final = (s2_f * rhoB_conj - s1_f) > 0
@@ -2176,12 +2603,18 @@ function find_alpha_rhoB_s1_s2_O(J, rho_B_init, rho, u_B, P_O, mP_O, O, K,
           "(mn_height=", mn_height, ", q_gen_height=", q_gen_height, ")")
 end
 
+# artin_action_on_sqrtm(...): an older, unused helper computing a Kronecker
+# symbol; the sign chi used by the pipeline is computed inside
+# twisted_chi_general instead.
 function artin_action_on_sqrtm(d::Int, f::Int, m::Int, J, Sigma::Vector{Int}, K)
     nJ = Int(norm(J))
     kron = kronecker_symbol(m, nJ)
     return kron
 end
 
+# find_signs(new_ovs, d): an older diagnostic that tries to repair a sign
+# pattern on an overlap array by pairing p with -p. Not used by the pipeline
+# (the sign-flip search diagnose_sign_flips superseded it).
 function find_signs(new_ovs, d)
     a = ones(Int, d, d)
     a[1, 1] = 1
@@ -2231,6 +2664,19 @@ function find_signs(new_ovs, d)
     return a
 end
 
+# twisted_chi_general(F, J, gamma, ...): THE MAIN FUNCTION. Given the tuple F
+# and a ray class represented by J*(gamma), it computes the twisted ghost
+# overlaps h(mu~_p) for every grid point p, assembles the matrix M = h(Pi~),
+# and verifies that M is a ghost SIC. There are two branches:
+#   * PRINCIPAL (is_principal_J = true): the class is principal, so the twist
+#     acts on grid points by a 2x2 integer matrix M_g (multiplication by
+#     gamma); no table lookups are needed.
+#   * NON-PRINCIPAL: for every grid point the class of the point is identified
+#     in the monoid table, multiplied by the class of J, and the product class
+#     is turned back into a point via Theorem 2.19; the overlap is then the
+#     SF phase times the shin value at that point.
+# Returns (new_ovs, gF, psi): the twisted overlaps, the tuple whose root was
+# used last, and the fiducial vector psi extracted from M.
 function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                               is_principal_J::Bool,
                               P_O, mP_O, rho_reps, gQ_reps, F_class,
@@ -2245,6 +2691,10 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                               full_monoid_table::Union{Nothing,Vector} = nothing,
                               point_id_cache::Dict = Dict{Tuple{Int,Int}, Any}(),
                               phase_debug_points::Vector{Tuple{Int,Int}} = Tuple{Int,Int}[])
+    # ---- Section A: basic data for this twist -------------------------------------
+    # d is the dimension, dm (= d-bar) the ray class modulus, rho the tuple's root,
+    # emb_main_K / emb_conj_K the two real embeddings of K, Ng and NJ the norms of
+    # gamma and J (their product N determines the Galois action on roots of unity).
     d = Int(F.d)
     # EVEN d (9/18): ray-class modulus d-bar (2d for even d). All Theorem 2.19
     # point representations, lookups, class products and twisted points below
@@ -2272,21 +2722,32 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
     println("  Ng = ", Ng)
     println("  NJ = ", NJ)
 
-    # elem1 (used per grid point below) is now recovered via a REVERSE
-    # LOOKUP into the ray class shin table, per project owner: for a given
-    # (p1,p2), compute shin^{[p1,p2]}_A(rho) for the matrix A that's a power
-    # of rho's own fundamental automorph lying in Gamma_{[p1,p2]/d} (built
-    # exactly the way ray_class_shin_table_fast builds its own matrices),
-    # find the ray class whose table entry has this SAME shin value, and
-    # set elem1 = d*(s2*rho_B - s1) from THAT entry's own s1, s2, rho_B -
-    # not from rho/p1/p2 directly (the old, incorrect method). Both pieces
-    # this needs only depend on rho/F (not on gamma, J, or p1/p2), so they
-    # are computed once here rather than per grid point.
+    # elem1 (used per grid point below) comes from the class of the grid
+    # point, which is IDENTIFIED BY MEMBERSHIP in the monoid table (see the
+    # per-point block "(1) IDENTIFY THE CLASS OF THE POINT" in the loop): the
+    # point is mapped into the table's frame and the entry whose `members`
+    # list contains it (or its negative) is the class. For every point the
+    # code also computes the identification value shin^{[p1,p2]}_A(rho), with
+    # A a power of rho's fundamental automorph lying in Gamma_{[p1,p2]/d-bar};
+    # that value is NOT what decides the class - it only breaks the +-p'
+    # sign tie of the frame map, serves as the fallback when membership finds
+    # nothing, and is printed as a consistency check against the group table.
+    # (Before 9/22 the class was found by matching this value against the
+    # table, which fails when two classes share a value or the value is
+    # degenerate.) elem1 = d-bar*(s2*rho_B - s1) is then taken from the
+    # identified entry's own (rho_B, s1, s2). The two objects built here
+    # (the automorph of rho and rho as a BigFloat) depend only on rho/F, not
+    # on gamma, J or the point, so they are computed once.
+    # The automorph L_rho_base of the root rho (the matrix of the fundamental unit acting
+    # on Z + Z*rho) and the BigFloat value of rho: both are needed to evaluate shin at rho.
     L_rho_base = hj_automorph_for_root(rho, D; max_u = elem1_max_u)
     rho_bf_base = BigFloat(coeff(rho, 0)) + BigFloat(coeff(rho, 1)) * sqrt(BigFloat(D))
     ray_class_lookup_table_local = ray_class_lookup_table === nothing ?
         ray_class_shin_table_fast_quiet(F) : ray_class_lookup_table
 
+    # ---- Section B: the sign chi = ((d+1) / N) ------------------------------------
+    # chi is how the Galois element acts on sqrt(d+1). It appears twice below (as a
+    # factor and inside c_g), so it cancels on the overlaps mu~; see the comment there.
     if is_principal_J
         # (10/1) The Artin element of a principal twist is Art(J*(gamma)), so
         # its action on sqrt(d+1) is ((d+1) / N(J)*|N(gamma)|) - NOT ((d+1)/N(J)),
@@ -2309,6 +2770,9 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
 
     ζ = -cispi(BigFloat(1) / d)
 
+    # ---- Section C: the multiplication matrix M_g ---------------------------------
+    # rho_g is the root of F.Q; M_g is the 2x2 integer matrix (mod d) by which
+    # multiplication by gamma acts on grid points. Used directly in the principal branch.
     Dr = squarefree_part(D)
     sqrt_Dr = a // isqrt(D ÷ Dr)
 
@@ -2317,9 +2781,14 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
     M_g = multiplication_matrix_mod_d(K(gamma), rho_g, d, D)
     println("  M_g = ", M_g)
 
+    # new_ovs will hold the twisted overlaps on the d x d grid; entry (1,1) is the
+    # normalization sqrt(d+1) of the identity component.
     new_ovs = zeros(Complex{BigFloat}, d, d)
     new_ovs[1, 1] = sqrt(BigFloat(d + 1))
 
+    # Two small helpers: du_to_int_mod_d turns a rational grid coordinate into an
+    # integer mod d (requiring the denominator to be invertible), and
+    # compute_integralnewdu is a diagnostic re-derivation of the twisted point.
     function du_to_int_mod_d(du_int_val, d)
         num = Int(numerator(du_int_val))
         den = Int(denominator(du_int_val))
@@ -2360,7 +2829,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         # use the negated pair if it isn't (see the main loop for the full
         # reasoning - kept in sync here even though this helper is currently
         # unused, so it isn't silently wrong if it's called later).
-        rho_j_conj_val_local = Float64(real(emb_conj_K(rho_j)))
+        rho_j_conj_val_local = _embf(emb_conj_K(rho_j))
         check_val = Float64(u2) * rho_j_conj_val_local - Float64(u1)
         if check_val <= 0
             u1, u2 = -u1, -u2
@@ -2378,11 +2847,17 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         return integralnewdu
     end
 
+    # ==== PRINCIPAL BRANCH ===========================================================
+    # The twist is by a principal class, so the twisted overlap at index
+    # (p1, Ng*p2) is simply the SF phase times shin at the point M_g * p.
     if is_principal_J
         gF = AdmissibleTuple(d, F.r, F.Q)
         println("  gQ = ", F.Q)
         println("  gF = ", gF)
 
+        # QQ_form is the quadratic form attached to the tuple's stabilizer matrix gF.A; it
+        # enters the SF phase as xi_d^{-Q(p)}. c_g collects the constant factors
+        # (the Rademacher term and 1/(chi*sqrt(d+1))).
         QQ_form = binary_quadratic_form(gF.A[2,1], gF.A[2,2] - gF.A[1,1], -gF.A[1,2])
 
         c_g = e(-BigFloat(rademacher(gF.A)) / 24) / (chi * sqrt(BigFloat(d + 1)))
@@ -2406,6 +2881,8 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         isodd(d) || println("  M_g mod d-bar = 2d: ", M_g_bar)
         isodd(d) || isodd(Ng) || error("even d: N(gamma) = ", Ng, " must be coprime to d-bar = 2d")
 
+        # V is the twisted overlap function on the full d-bar x d-bar grid (for even d the
+        # overlaps are only 2d-periodic). Each entry: chi * phase * c_g * shin(M_g * p).
         V = zeros(Complex{BigFloat}, dbar, dbar)
         for p1 = 0:dbar-1
             for p2 = 0:dbar-1
@@ -2419,6 +2896,8 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 V[gp[1]+1, gp[2]+1] = chi * ζ^QA * (-1)^s * c_g * shin_of_tuple_cached(gF, newp)
             end
         end
+        # The coefficients of the displacement operators D_p, p in [0,d)^2, are read
+        # straight off V.
         for p1 = 0:d-1, p2 = 0:d-1
             (p1 == 0 && p2 == 0) && continue
             new_ovs[p1+1, p2+1] = V[p1+1, p2+1]
@@ -2426,6 +2905,8 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
 
         println("  v(p)*v(-p) for all p != 0 mod d",
                 isodd(d) ? ":" : " (even d: on the 2d x 2d grid, -p mod 2d, expected 1/(d+1) everywhere):")
+        # Check the Theorem 5.8 identity v(p) * v(-p) = 1/(d+1) on the whole d-bar grid
+        # (with -p taken mod d-bar) and count deviations.
         n_dev = 0
         for p1 = 0:dbar-1
             for p2 = 0:dbar-1
@@ -2455,6 +2936,8 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         # sitting in the cache - silently pulling in the WRONG twist's
         # rho_B/s1/s2/rho_j. This was confirmed to be happening (multiple
         # consecutive corrupted twists observed).
+        # ==== NON-PRINCIPAL BRANCH =======================================================
+        # u_B is J's Picard class. First J itself must be represented as in Theorem 2.19.
         u_B = mP_O \ J
         j_key = u_B
 
@@ -2469,6 +2952,8 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         # bad candidate. Strip q's prime factors out of d before checking;
         # the joint find_alpha_rhoB_s1_s2_O search remains the real
         # correctness gate and is unaffected by this relaxation.
+        # d_check is the coprimality target for the Theorem 2.19 searches: d-bar with the
+        # primes of the conductor q removed.
         q_val = Int(F.q)
         d_check = dm
         for (p, _) in factor(q_val)
@@ -2496,6 +2981,8 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         # because the per-point outer retry below may need to search for a
         # DIFFERENT rho_B/s1/s2 if the cached one can't satisfy some point's
         # full stage sequence.
+        # Represent J by (rho_B, s1, s2) via Theorem 2.19, reusing the result from an
+        # earlier twist in the same class if it is in j_cache.
         rho_B_init = rho_reps[u_B]
 
         if haskey(j_cache, j_key)
@@ -2546,6 +3033,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         # find_rho_j_and_coords itself for that decomposition (not
         # actually needed for P itself since gamma enters as a whole
         # element, but printed as a useful diagnostic).
+        # Express gamma itself in the basis (rho, 1) (diagnostic printout).
         P2_gamma, P1_gamma = find_rho_j_and_coords(K(gamma), rho)
         println("  gamma = P2*rho - P1 with P2 = ", P2_gamma, " P1 = ", P1_gamma)
 
@@ -2557,6 +3045,10 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         # built on top of them is avoided in favor of the conjugate
         # trick, which only needs norm() (basic ideal bookkeeping, not
         # principality testing or discrete logs).
+        # Build the fractional ideals needed for the diagnostics below:
+        # Lrho_inv = (Z + Z*rho)^{-1}, P_frac = J*(gamma)*Lrho_inv, and the inverses of
+        # P_int and J (computed with the conjugate/norm trick, since Hecke's inv() is
+        # unreliable for non-maximal orders).
         Lrho_gens = [one(K), rho]
         Lrho_ideal = fractional_ideal(O, Lrho_gens)
         N_Lrho = norm(Lrho_ideal)
@@ -2595,6 +3087,9 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         J_inv_gens = [quad_conj(K, g) // N_J for g in J_gens_nf]
         J_inv = fractional_ideal(O, J_inv_gens)
 
+        # Per-point bookkeeping: test1 records whether the intra-point check passed
+        # everywhere, gQ_j remembers the form of the first processed point (used for the
+        # returned tuple), V_np is the twisted overlap function on the d-bar grid.
         test1 = true
         max_retries_p = 50
         gQ_j = nothing   # set from the FIRST successfully-processed grid point;
@@ -2609,6 +3104,14 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         V_np = zeros(Complex{BigFloat}, dm, dm)
         isodd(d) || isodd(NJ * Ng) || error("even d: NJ*Ng = ", NJ * Ng, " must be coprime to d-bar = 2d")
 
+        # ---- The main loop over grid points p -----------------------------------------
+        # For each p (skipping p = 0 mod d), the steps are:
+        #   (1) identify the class of x_p = p2*rho - p1 in the monoid table;
+        #   (2) multiply that class by J, represent the product by Theorem 2.19,
+        #       and apply the matrix of multiplication by gamma -> the twisted point du;
+        #   (3) move du into the frame of the tuple built from the product's root
+        #       (HJ reduction), evaluate the SF phase and shin there, and store the
+        #       overlap at index gp = (p1, NJ*Ng*p2).
         for p1 = 0:dm-1
             for p2 = 0:dm-1
                 (mod(p1, d) == 0 && mod(p2, d) == 0) && continue
@@ -2624,33 +3127,73 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 # is computed once and reused by every later twist. Nothing
                 # after `elem1` below reads shin_val_lookup / A_lookup /
                 # full_match, and lookup_entry is never reassigned.
+                # (1) IDENTIFY THE CLASS OF THE POINT. The identification depends only on p, not on
+                # the twist, so it is cached across twists in point_id_cache.
                 local lookup_entry
                 if haskey(point_id_cache, (p1, p2))
                     lookup_entry = point_id_cache[(p1, p2)]
                     println("    p=($p1,$p2): class identification reused from cache")
                 else
+                # The identification value: shin at rho for the point p/d-bar, using a stabilizer
+                # matrix A_lookup in Gamma(d-bar). Used as a cross-check (and as fallback).
                 A_lookup, _ = stabilizer_power_in_Gamma_s(
                     L_rho_base, [QQ(p1, dm), QQ(p2, dm)]; max_power = elem1_max_power)
                 shin_val_lookup = shin(A_lookup, rho_bf_base, [p1, p2], dm)
 
-                match_idx = findfirst(
+                # (10/16) A lone value match is not trusted: at d = 46 and d = 48
+                # three class pairs (36 grid points) were MISIDENTIFIED because two
+                # distinct group-table entries agreed to within the tolerance (a
+                # value collision - identification values are not injective), and
+                # the same wrong classes then broke every twist at those points
+                # (||M^2-M|| ~ 0.5, products off by |theta(q)theta(q')| = 1.37,
+                # 9.63, 1.61). So: collect ALL entries within tolerance; accept
+                # only a UNIQUE match; a collision (>= 2) or a miss (0) is resolved
+                # by exact membership in the monoid table below, exactly as the
+                # non-unit points already are.
+                # Scan the group table for entries whose value matches. A UNIQUE match is kept as
+                # a cross-check; collisions (several matches) are expected and harmless.
+                match_idxs = findall(
                     e -> e !== nothing && abs(e.shin_value - shin_val_lookup) < ray_class_lookup_tol,
                     ray_class_lookup_table_local)
-                if match_idx === nothing
-                    # REVISED PER PROJECT OWNER: the ray class monoid
-                    # Jbar_m^flat(O) is FINITE and small (592 classes for
-                    # d=21) - build it in FULL, once, up front
-                    # (full_monoid_table, via ray_class_monoid_table_v2,
-                    # threaded through exactly like monoid_table/
-                    # candidate_cache/class_hints), and do a direct value
-                    # lookup against it - no incremental norm-bound search at
-                    # all. Confirmed empirically (diagnose_full_monoid_
-                    # membership) that a genuine shin_val_lookup value DOES
-                    # appear in this table; the earlier incremental search
-                    # (ray_class_monoid_lookup) was solving a problem that
-                    # did not need solving that way.
+                match_idx = length(match_idxs) == 1 ? match_idxs[1] : nothing
+                if length(match_idxs) >= 2
+                    println("  [group lookup] p=($p1,$p2): VALUE COLLISION - ", length(match_idxs),
+                            " group-table entries within tol ", ray_class_lookup_tol,
+                            " (indices ", match_idxs, "); resolving by membership in the monoid table")
+                end
+                # (10/18) MEMBERSHIP IS NOW THE PRIMARY IDENTIFICATION FOR EVERY
+                # POINT whenever the full monoid table is available. At d = 56
+                # twelve (p,-p) pairs were still wrong after the collision fix:
+                # in each pair one point was identified by a UNIQUE group-table
+                # value match and the partner by membership, and the two
+                # disagreed. Membership is exact (residue buckets), so the
+                # unique group match was the wrong class - the group table's
+                # value for that class is not its invariant (non-anchor entries
+                # are derived, not independently computed), and the correct
+                # lookup value happened to match a different entry uniquely.
+                # No value-based test can see that. So: the group table is kept
+                # only as a consistency check (printed below) and as the
+                # fallback when no monoid table was supplied.
+                group_entry = match_idx === nothing ? nothing : ray_class_lookup_table_local[match_idx]
+                # Primary identification by MEMBERSHIP in the monoid table: the lookup point is
+                # mapped into the monoid table's frame (the table may use a different root of
+                # the same class), tested in both signs, and the right entry is the one that
+                # contains it; the value only breaks ties. Falls back to the group entry when
+                # no monoid table was supplied.
+                if full_monoid_table !== nothing || match_idx === nothing
+                    # The ray class monoid Jbar_m^flat(O) is FINITE and small
+                    # (592 classes for d=21), so it is built in FULL, once, up
+                    # front (full_monoid_table, via ray_class_monoid_table_v2,
+                    # threaded through like monoid_table/candidate_cache/
+                    # class_hints). The point is then located in it by
+                    # MEMBERSHIP (next comment), not by searching for its
+                    # value; the earlier incremental norm-bound search
+                    # (ray_class_monoid_lookup) and the direct value search
+                    # that replaced it are both superseded, the latter kept
+                    # only as the fallback at the end of this block.
                     println("  [monoid lookup] shin^{[$p1,$p2]}_A(rho) = ", shin_val_lookup,
-                            " not in the group table - looking up in the full monoid table...")
+                            match_idx === nothing ? " not in the group table - " : " (group table: unique match, kept as cross-check) - ",
+                            "identifying by membership in the full monoid table...")
                     full_monoid_table === nothing &&
                         error("twisted_chi_general: a lookup miss against the group table ",
                               "occurred but full_monoid_table was not provided - build it once ",
@@ -2700,16 +3243,39 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                                           vdiff = abs(Complex{BigFloat}(e.shin_value) - shin_val_lookup)))
                         end
                     end
+                    # The +p'/-p' sign of the frame map is a GLOBAL property of the
+                    # pair of roots, not of the point, so it is decided by value only
+                    # at points where the value is decisive (one candidate within
+                    # tol, the other not), and those decisions are tallied. At an
+                    # ambiguous point (both or neither within tol - a value
+                    # collision or a degenerate value) the tally decides, which is
+                    # what makes membership identification immune to collisions.
+                    sign_votes = get!(point_id_cache, (-1, -1), Dict{Symbol,Int}(:plus => 0, :minus => 0))
                     if length(cands) == 1
                         full_match = cands[1].e
                         println("  [monoid lookup] p=($p1,$p2): +p' and -p' lie in ONE class",
                                 cands[1].plus && cands[1].minus ? " (both)" : cands[1].plus ? " (+p')" : " (-p')")
                     elseif length(cands) >= 2
                         sort!(cands, by = c -> c.vdiff)
-                        full_match = cands[1].e
-                        println("  [monoid lookup] p=($p1,$p2): +p' and -p' lie in DIFFERENT classes; ",
-                                "taking the one whose value matches the lookup (|diff| = ", Float64(cands[1].vdiff),
-                                " vs ", Float64(cands[2].vdiff), "; chose ", cands[1].plus ? "+p'" : "-p'", ")")
+                        decisive = cands[1].vdiff < ray_class_lookup_tol && cands[2].vdiff >= ray_class_lookup_tol
+                        if decisive
+                            full_match = cands[1].e
+                            sign_votes[cands[1].plus ? :plus : :minus] += 1
+                            println("  [monoid lookup] p=($p1,$p2): +p' and -p' lie in DIFFERENT classes; ",
+                                    "value is decisive (|diff| = ", Float64(cands[1].vdiff), " vs ",
+                                    Float64(cands[2].vdiff), "; chose ", cands[1].plus ? "+p'" : "-p'",
+                                    "; tally +:", sign_votes[:plus], " -:", sign_votes[:minus], ")")
+                        else
+                            want_plus = sign_votes[:plus] >= sign_votes[:minus]
+                            pick = findfirst(c -> (want_plus ? c.plus : c.minus), cands)
+                            pick === nothing && (pick = 1)
+                            full_match = cands[pick].e
+                            println("  [monoid lookup] p=($p1,$p2): +p' and -p' lie in DIFFERENT classes and the ",
+                                    "value is NOT decisive (|diff| = ", Float64(cands[1].vdiff), " vs ",
+                                    Float64(cands[2].vdiff), "); using the calibrated sign ",
+                                    want_plus ? "+p'" : "-p'", " (tally +:", sign_votes[:plus],
+                                    " -:", sign_votes[:minus], ")")
+                        end
                     end
                     if full_match !== nothing
                         vdiff = abs(Complex{BigFloat}(full_match.shin_value) - shin_val_lookup)
@@ -2762,11 +3328,23 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     end
                     lookup_entry = (J = full_match.J, rho_B = rho_match, s1 = s1_match,
                                     s2 = s2_match, shin_value = full_match.shin_value)
+                    if group_entry !== nothing
+                        # consistency check: does the unique group-table match agree with
+                        # membership? (same ideal class <=> J_group * J_monoid^{-1} principal
+                        # with a generator == 1 mod m and Sigma-positive; cheaper proxy used
+                        # here: compare the two entries' identification values)
+                        gdiff = abs(Complex{BigFloat}(group_entry.shin_value) - Complex{BigFloat}(full_match.shin_value))
+                        println("  [group lookup] p=($p1,$p2): unique group-table match (J = ", group_entry.J,
+                                ") ", gdiff < ray_class_lookup_tol ? "AGREES" : "DISAGREES",
+                                " with membership in value (|diff| = ", Float64(gdiff), "); membership used")
+                    end
                 else
-                    lookup_entry = ray_class_lookup_table_local[match_idx]
+                    lookup_entry = group_entry
                 end
                 point_id_cache[(p1, p2)] = lookup_entry
                 end   # point_id_cache
+                # elem1 is the element d-bar*(s2*rho_B - s1) attached to the identified class;
+                # it is used for diagnostics (the product elem1*elem2 below).
                 elem1 = K(dm) * (K(lookup_entry.s2) * lookup_entry.rho_B - K(lookup_entry.s1))
                 println("    p=($p1,$p2): lookup_entry.J (U_elem1, the actual ideal) = ", lookup_entry.J,
                         "   N = ", norm(lookup_entry.J))
@@ -2782,6 +3360,8 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 # it, and retry the whole rho_j search fresh. This does NOT
                 # touch j_cache - only this point's local search is affected;
                 # other points/gammas keep using the originally cached rho_B.
+                # (2) CLASS PRODUCT AND TWISTED POINT. A few representations of J may be tried
+                # (excluded_rho_B_p) if the intra-point check fails for one of them.
                 excluded_rho_B_p = []
                 found_overall = false
                 max_retries_rho_B_p = 20
@@ -2811,11 +3391,11 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     # and their conjugate-embedding values DIRECTLY (not via
                     # the u1/u2 decomposition), once per rho_B_attempt.
                     println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: elem1 = ", elem1,
-                            "  conj(elem1) = ", Float64(real(emb_conj_K(elem1))))
+                            "  conj(elem1) = ", _embf(emb_conj_K(elem1)))
                     println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: elem2 = ", elem2,
-                            "  conj(elem2) = ", Float64(real(emb_conj_K(elem2))))
+                            "  conj(elem2) = ", _embf(emb_conj_K(elem2)))
                     println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: product = ", product,
-                            "  conj(product) [direct] = ", Float64(real(emb_conj_K(product))))
+                            "  conj(product) [direct] = ", _embf(emb_conj_K(product)))
 
                     # NEW rho_j construction (per project owner), replacing
                     # the old Stage 1/2/2.5/4.7/4.8/4.9 search+verify chain
@@ -2826,7 +3406,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     # so that b_j^{-1}*d*O = alpha_bj*(Z*rho_j+Z) (passing
                     # J*U_elem1 itself as the "J" argument gives exactly
                     # this, since find_alpha_rhoB_s1_s2_O's own internal
-                    # b_O is always [input]^{-1}). rho_j is now UNIQUELY
+                    # b_O is always [input]^{-1}). rho_j is now
                     # determined here (no candidate search/exclusion at
                     # this level) - the only remaining retry axis is the
                     # outer rho_B_attempt loop above.
@@ -2842,9 +3422,11 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     # b_j^{-1}*d*O = alpha_bj*(Z*rho_j+Z) (passing J*U_elem1
                     # itself as the "J" argument gives exactly this, since
                     # find_alpha_rhoB_s1_s2_O's own internal b_O is always
-                    # [input]^{-1}). rho_j is UNIQUELY determined here (no
+                    # [input]^{-1}). rho_j is determined here (no
                     # candidate search/exclusion at this level) - the only
                     # remaining retry axis is the outer rho_B_attempt loop.
+                    # Multiply the class of the point by J (ideal product J_bj), find its Picard
+                    # class u_Bj, and represent J_bj by (rho_j, s_bj) via Theorem 2.19.
                     local alpha_bj, rho_j_raw, s1_bj, s2_bj
                     U_elem1 = lookup_entry.J
                     J_bj = J * U_elem1
@@ -2904,6 +3486,8 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     # literal Z-span (a confirmed hazard in this codebase and
                     # precisely the thing that would silently paper over a
                     # non-proper L here).
+                    # Consistency gate: the lattice Z + Z*rho_j must be a proper O-ideal in the right
+                    # class, and Theorem 2.19's scaling must exist (theorem219_gate).
                     b_cls = mP_O(-u_Bj)
                     bO1 = _nf_elem_of(K, basis(O)[1])
                     bO2 = _nf_elem_of(K, basis(O)[2])
@@ -2952,6 +3536,10 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                             "   alpha = ", t219_alpha,
                             "   (b = gamma*b0 with gamma = ", t219_gamma, ")")
 
+                    # The automorph L_bj of rho_j, a stabilizer power A_bj for the point s_bj, and the
+                    # HJ-reduced form of the stabilizer, which becomes the tuple form gQ_j_cand.
+                    # A form with negative leading coefficient is the inverse automorph direction and
+                    # is negated (Zauner.jl needs the strictly HJ-reduced orientation).
                     rho_j_bf_raw = BigFloat(coeff(rho_j_raw, 0)) + BigFloat(coeff(rho_j_raw, 1)) * sqrt(BigFloat(D))
                     L_bj = hj_automorph_for_root(rho_j_raw, D; max_u = elem1_max_u)
                     A_bj_cand, _ = stabilizer_power_in_Gamma_s(L_bj, [s1_bj, s2_bj]; max_power = elem1_max_power)
@@ -2987,6 +3575,28 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     gQ_j_cand = binary_quadratic_form(divexact(gQ_j_cand_raw.a, content_j),
                                                        divexact(gQ_j_cand_raw.b, content_j),
                                                        divexact(gQ_j_cand_raw.c, content_j))
+                    # (10/18, d = 55 crash) The form of a stabilizer matrix A is
+                    # (c, d-a, -b); if find_hj_reducing_matrix hands back the
+                    # INVERSE direction of the automorph (A_reduced[2,1] < 0) the
+                    # form comes out with a < 0, and Zauner's AdmissibleTuple then
+                    # builds t.A as that inverse, whose psl2word does not end in
+                    # 0 ("t.Q is not strictly HJ-reduced" in shin_of_tuple).
+                    # A^{-1} has form -(c, d-a, -b), so negating the form is
+                    # exactly "use the automorph direction every other point
+                    # uses"; diagnose_hj_orbit_d55 confirmed (41,-124,76) is in
+                    # reduced_hj_orbit((-41,124,-76)), is strictly reduced, and
+                    # its t.A is the inverse of the failing one.
+                    # (10/26) Every a < 0 case in the runs came from a det(R) = -1
+                    # reduction; find_hj_reducing_matrix now normalizes R to det +1
+                    # with R*rho_j the main root, after which the reduced stabilizer
+                    # has a > 0 whenever A_bj has eigenvalue > 1 at rho_j. The old
+                    # negation path gave values inconsistent with the other points
+                    # (d = 55, d = 64). This branch should now be essentially dead.
+                    if gQ_j_cand.a < 0
+                        println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: gQ_j_cand has a < 0 ",
+                                "(A_reduced is the inverse automorph direction) - negating the form")
+                        gQ_j_cand = binary_quadratic_form(-gQ_j_cand.a, -gQ_j_cand.b, -gQ_j_cand.c)
+                    end
                     let a_c, b_c, c_c, disc_c, fund_c, cond_c
                         a_c, b_c, c_c = gQ_j_cand.a, gQ_j_cand.b, gQ_j_cand.c
                         disc_c = Int(discriminant(gQ_j_cand))
@@ -2996,6 +3606,8 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                                 "  disc = ", disc_c, "  coredisc = (", fund_c, ",", cond_c, ")",
                                 "  O's own q = ", q_val, "  F.r = ", F.r)
                     end
+                    # Build the admissible tuple for the product's root and its quadratic form, and the
+                    # matrix M_g_j of multiplication by gamma in the basis (rho_j, 1) mod d-bar.
                     gF_j_cand = AdmissibleTuple(d, F.r, gQ_j_cand)
                     QQ_form_cand = binary_quadratic_form(gF_j_cand.A[2,1],
                                                           gF_j_cand.A[2,2] - gF_j_cand.A[1,1],
@@ -3042,6 +3654,9 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     # is immaterial. So: use the class-multiplication s-vector.
                     # The product-route coordinates are still computed and printed
                     # below purely as a diagnostic (they no longer feed du).
+                    # The twisted point: du = (s1_bj, s2_bj)*d-bar, normalized so that the element is
+                    # positive at Sigma, then multiplied by M_g_j; the result must have coordinates
+                    # with denominators invertible mod d-bar (else try another representation).
                     u2_prod, u1_prod = find_rho_j_and_coords(product, rho_j_raw)
                     u2_cand, u1_cand = s2_bj, s1_bj
                     _red_du(u) = begin
@@ -3053,7 +3668,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                             ")   du from product elem1*elem2 (diagnostic only) = (",
                             _red_du(u1_prod), ", ", _red_du(u2_prod), ")")
 
-                    diag_val = Float64(u2_cand) * Float64(real(emb_conj_K(rho_j_raw))) - Float64(u1_cand)
+                    diag_val = Float64(u2_cand) * _embf(emb_conj_K(rho_j_raw)) - Float64(u1_cand)
                     println("    p=($p1,$p2) [rho_B_attempt $rho_B_attempt]: u2*conj(rho_j)-u1 = ", diag_val,
                             "  positive? ", diag_val > 0)
 
@@ -3113,6 +3728,7 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                         continue
                     end
 
+                    # All candidates accepted: freeze them as the values used for this point.
                     rho_j_p = rho_j_raw
                     A_bj_p = A_bj_cand
                     gF_j_p = gF_j_cand
@@ -3166,6 +3782,10 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                 # and evaluate QA, c and shin ALL with the tuple's A on du_red -
                 # the principal-path recipe applied verbatim to (gF_j, du_red).
                 # The wrapper's A_bj-based value is kept for the diagnostic only.
+                # (3) EVALUATE THE OVERLAP. find_hj_reducing_matrix moves the point du into the
+                # frame of the HJ-reduced root used by the tuple (du_red); the SF phase is
+                # evaluated at du_red mod d-bar (it is 2d-periodic) and shin at du_red mod d
+                # (it is d-periodic). The overlap is chi * zeta^QA * (-1)^s * c_g * shin.
                 red_p = find_hj_reducing_matrix(A_bj_p, rho_j_bf_p)
                 beta_p = red_p.root_used == :x ? red_p.x0 : red_p.conjx0
                 s_R_p = Int(sign(red_p.R[2,1] * beta_p + red_p.R[2,2]))
@@ -3218,6 +3838,9 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
                     println("  [phase-debug]   V_np[gp] = ", V_np[gp[1]+1, gp[2]+1])
                 end
 
+                # Intra-point check: |shin(du)| * |shin(-du)| must equal 1 for the pair of points
+                # du and -du at this root; a failure means the representation of J was unsuitable
+                # and another rho_B is tried.
                 let sh_plus = shin(A_bj_p, rho_j_bf_p, integralnewdu, d),
                     sh_minus = shin(A_bj_p, rho_j_bf_p, -integralnewdu, d)
                     if abs(abs(sh_plus * sh_minus) - 1.0) > 1e-10
@@ -3235,6 +3858,8 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
 
         println("  all |vv(p)vv(-p)| correct: ", test1)
 
+        # Read the coefficients of D_p (p in [0,d)^2) off the d-bar grid, then run the
+        # Theorem 5.8 product check on the whole grid.
         for p1 = 0:d-1, p2 = 0:d-1
             (p1 == 0 && p2 == 0) && continue
             new_ovs[p1+1, p2+1] = V_np[p1+1, p2+1]
@@ -3260,6 +3885,8 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
         println("  deviations of v(p)*v(-p) from 1/(d+1): ", n_dev, " of ", dm^2 - (dm ÷ d)^2)
     end
 
+    # ---- Section D: assemble and verify M -----------------------------------------
+    # The overlaps must be real; M = I/d + (1/d) * sum_p v(p) * D_p.
     max_imag = maximum(abs.(imag.(new_ovs)))
     println("  max imaginary part of new_ovs = ", max_imag)
 
@@ -3285,6 +3912,10 @@ function twisted_chi_general(F::AdmissibleTuple, J, gamma, K, O,
     # M is a rank-1 idempotent, M = |psi><phi| / <phi|psi>, so every nonzero
     # column is proportional to psi: take the largest column (full precision,
     # no eigensolve). The Float64 eigen() printout is kept as a diagnostic.
+    # Verification in BigFloat: ||M^2 - M||, tr(M), and psi = the largest column of M
+    # (for a rank-1 idempotent every nonzero column is proportional to the fiducial).
+    # The Float64 residual and eigenvalues are printed as diagnostics only; they are
+    # meaningless when ||M|| is large.
     M2M = M * M - M
     res_big = norm(M2M)
     normM = norm(M)
@@ -3327,6 +3958,10 @@ end
 # ../01_ray_class_representatives/ray_class_group.jl. That formula-based
 # version was found to be wrong by the unit index in some cases (missing the
 # -eps^k sign case); this direct-search version fixes both issues.
+# num_principal_ray_classes(OK, O, m, Sigma): computes, by a counting formula,
+# how many ray classes of modulus m*Sigma are principal (represented by a
+# principal ideal of O). The enumeration of principal classes stops once this
+# many distinct classes have been found.
 function num_principal_ray_classes(OK, O, m, Sigma)
     K = number_field(O)
     println("    num_principal: starting")
@@ -3434,11 +4069,19 @@ function num_principal_ray_classes(OK, O, m, Sigma)
     return N
 end
 
+# ray_class_group_representatives(K, O, m, Sigma): builds one representative
+# ideal for EVERY ray class of modulus m*Sigma. The ray class group is a
+# union of "fibers" over the Picard group: for each Picard class a coprime
+# representative J is chosen, and it is multiplied by every principal ray
+# class (gamma). Returns the list of ideals and the list of triples
+# (J, (gamma), gamma, is_principal).
 function ray_class_group_representatives(K, O, m, Sigma)
     OK = maximal_order(K)
     println("  ray_class: OK ready")
     GC.gc()
 
+    # Picard group of O: one coprime representative ideal per class (coprime to the
+    # modulus and to d+1).
     P_O, mP_O = picard_group(O)
     println("  ray_class: picard_group done, order = ", order(P_O))
     GC.gc()
@@ -3466,6 +4109,8 @@ function ray_class_group_representatives(K, O, m, Sigma)
         println("    rep $i: ", J, " group_elem = ", group_elems[i])
     end
 
+    # Principal ray classes: count them, then enumerate generators gamma until that
+    # many distinct classes have been found (ray_class_enumeration.jl).
     N = num_principal_ray_classes(OK, O, m, Sigma)
     println("  ray_class: num_principal_ray_classes = ", N)
     GC.gc()
@@ -3545,6 +4190,9 @@ end
 # where a_k = #{elements of order dividing p^k}, derived from the
 # already-computed element orders.
 # ---------------------------------------------------------------------------
+# ray_class_group_elementary_divisors(K, O, m, Sigma): works out the abstract
+# group structure (elementary divisors) of the ray class group from the
+# representatives. A diagnostic used to compare with the expected group.
 function ray_class_group_elementary_divisors(K, O, m, Sigma)
     OK = maximal_order(K)
     P_O, mP_O = picard_group(O)
@@ -3730,6 +4378,8 @@ function ray_class_group_elementary_divisors(K, O, m, Sigma)
     return ray_class_divs
 end
 
+# ray_class_group_elementary_divisors(F): convenience wrapper building K, O and
+# the modulus from an admissible tuple and calling the function above.
 function ray_class_group_elementary_divisors(F::AdmissibleTuple)
     D = Int(F.D)
     q = Int(F.q)
@@ -3753,6 +4403,8 @@ end
 
 ray_class_group_elementary_divisors(d::Int) = ray_class_group_elementary_divisors(AdmissibleTuple(d))
 
+# ray_class_group_data(F): builds K, O and the modulus from an admissible
+# tuple and prints the sizes/structure of the Picard and ray class groups.
 function ray_class_group_data(F::AdmissibleTuple)
     D = Int(F.D)
     q = Int(F.q)
@@ -3783,7 +4435,10 @@ ray_class_group_data(d::Int) = ray_class_group_data(AdmissibleTuple(d))
 
 # ---------------------------------------------------------------------------
 # ray_class_shin_table: for each explicit representative ideal J of a class
-# in the ray class group H_{d*infty2}^{O_f}, computes a "shin value" via:
+# in the ray class group H_{d*infty2}^{O_f}, computes a "shin value" (used
+# in the pipeline only as a consistency check and sign tie-breaker; the
+# class of a grid point is identified by membership in the monoid table,
+# see twisted_chi_general) via:
 #   - b = a representative of [J]^{-1} in Pic(O); alpha, rho_B from
 #     find_alpha_rhoB_s1_s2_O such that b*d*O = alpha*(Z*rho_B+Z), alpha
 #     totally positive, rho_B > conj(rho_B).
@@ -3824,6 +4479,10 @@ printed as a failure rather than aborting the whole table).
 # the same literal representative ideals or the same class ORDER on every
 # call, which otherwise silently misaligns the two tables at the same index.
 # ---------------------------------------------------------------------------
+# _ray_class_shin_setup(F): builds, ONCE per run, everything the tables and the
+# twists share: the field K, the order O, the modulus d-bar, the Picard data,
+# the class representatives (rho_reps, gQ_reps), the full list of ray class
+# representatives (all_triples), and the coprimality target d_check.
 function _ray_class_shin_setup(F::AdmissibleTuple)
     D = Int(F.D)
     q = Int(F.q)
@@ -4018,6 +4677,11 @@ function shin_value_in_frame(A, rho_B, D, p_vec, d, conj_frame::Bool)
 end
 
 
+# ray_class_shin_table(F): the ORIGINAL (slow, verbose) group-table builder:
+# for every ray class it runs the full Theorem 2.19 search and records the
+# shin value. Superseded by ray_class_shin_table_fast_quiet, which derives the
+# non-anchor entries of each Picard fiber from the fiber's anchor; kept for
+# cross-checking (compare_ray_class_shin_tables).
 function ray_class_shin_table(F::AdmissibleTuple;
                                mn_height::Int = 3000,
                                q_gen_height::Int = 3000,
@@ -4257,8 +4921,8 @@ function ray_class_shin_table_fast(F::AdmissibleTuple;
                     b_O, _ = find_b_with_verified_principal_product(
                         O, K, Jfull, [ideal(O, dm), ideal(O, d + 1)])
                     elem2_anchor = K(s2) * rho_B - K(s1)
-                    abs(Float64(emb_conj(elem2_anchor))) > 0 || error("elem2_anchor is zero under emb_conj")
-                    Float64(emb_conj(elem2_anchor)) > 0 ||
+                    abs(_embf(emb_conj(elem2_anchor))) > 0 || error("elem2_anchor is zero under emb_conj")
+                    _embf(emb_conj(elem2_anchor)) > 0 ||
                         error("elem2_anchor is not sign-adjusted as expected (emb_conj <= 0)")
                     L = hj_automorph_for_root(rho_B, D; max_u = max_u)
                     osign, _ = fiber_orientation_sign(K, O, rho_B, rho_reps[-u_B])   # see docstring
@@ -4282,7 +4946,7 @@ function ray_class_shin_table_fast(F::AdmissibleTuple;
                     alpha, rho_B, b_O = fc.alpha, fc.rho_B, fc.b_O
 
                     w = K(gamma) * fc.elem2_anchor
-                    elem2 = Float64(emb_conj(w)) > 0 ? w : -w
+                    elem2 = _embf(emb_conj(w)) > 0 ? w : -w
 
                     qc  = coeff(elem2, 1)
                     p0  = coeff(elem2, 0)
@@ -4295,7 +4959,7 @@ function ray_class_shin_table_fast(F::AdmissibleTuple;
                     # find_alpha_rhoB_s1_s2_O itself checks for every
                     # candidate, plus the sign condition. Never trust the
                     # algebraic derivation above blindly.
-                    rhoB_conj_val = Float64(emb_conj(rho_B))
+                    rhoB_conj_val = _embf(emb_conj(rho_B))
                     s1_f = Float64(BigInt(numerator(s1))) / Float64(BigInt(denominator(s1)))
                     s2_f = Float64(BigInt(numerator(s2))) / Float64(BigInt(denominator(s2)))
                     (s2_f * rhoB_conj_val - s1_f) > 0 ||
@@ -4371,10 +5035,12 @@ ray_class_shin_table_fast(d::Int) = ray_class_shin_table_fast(AdmissibleTuple(d)
 # ---------------------------------------------------------------------------
 # ray_class_shin_table_fast_quiet: identical computation to
 # ray_class_shin_table_fast, but (a) prints nothing at all, and (b) returns
-# each entry's s1, s2, rho_B alongside its shin value (not just d*s), since
-# a REVERSE lookup by shin value (find which ray class produced a given
-# shin value, then read off ITS s1/s2/rho_B) is exactly what's needed to
-# fix elem1 in twisted_chi_general - see the comment there. A separate
+# each entry's s1, s2, rho_B alongside its shin value (not just d*s), so
+# that twisted_chi_general can read off an entry's own s1/s2/rho_B once the
+# entry is known. (Originally the entry was found by a reverse lookup by
+# shin value; since 10/18 the group table's unique value match is only a
+# consistency check and the fallback when no monoid table is supplied -
+# the class is identified by membership in the monoid table.) A separate
 # function rather than modifying ray_class_shin_table_fast itself, so its
 # existing return type/behavior (and compare_ray_class_shin_tables, which
 # depends on it) are untouched.
@@ -4387,7 +5053,10 @@ ray_class_shin_table_fast(d::Int) = ray_class_shin_table_fast(AdmissibleTuple(d)
                                      shared_data::Union{Nothing,NamedTuple} = nothing)
 
 Same computation as `ray_class_shin_table_fast`, silenced (no `println` at
-all) and returning richer per-entry data for reverse lookup by shin value.
+all) and returning richer per-entry data (s1, s2, rho_B per entry). Note
+that in the current pipeline this table is only a consistency check and a
+fallback: the class of a grid point is decided by membership in the monoid
+table (`ray_class_monoid_table_v2`), not by matching its shin value here.
 
 Returns `Vector{Union{Nothing,NamedTuple}}`, one entry per ray class, each
 either `nothing` (that class's computation failed) or a named tuple
@@ -4445,8 +5114,8 @@ function _ray_class_shin_table_fast_quiet_impl(F::AdmissibleTuple;
                 b_O, _ = find_b_with_verified_principal_product(
                     O, K, Jfull, [ideal(O, dm), ideal(O, d + 1)])
                 elem2_anchor = K(s2) * rho_B - K(s1)
-                abs(Float64(emb_conj(elem2_anchor))) > 0 || error("elem2_anchor is zero under emb_conj")
-                Float64(emb_conj(elem2_anchor)) > 0 ||
+                abs(_embf(emb_conj(elem2_anchor))) > 0 || error("elem2_anchor is zero under emb_conj")
+                _embf(emb_conj(elem2_anchor)) > 0 ||
                     error("elem2_anchor is not sign-adjusted as expected (emb_conj <= 0)")
                 L = hj_automorph_for_root(rho_B, D; max_u = max_u)
                 # Orientation of this anchor root relative to the class's
@@ -4481,7 +5150,7 @@ function _ray_class_shin_table_fast_quiet_impl(F::AdmissibleTuple;
                 alpha, rho_B, b_O = fc.alpha, fc.rho_B, fc.b_O
 
                 w = K(gamma) * fc.elem2_anchor
-                elem2 = Float64(emb_conj(w)) > 0 ? w : -w
+                elem2 = _embf(emb_conj(w)) > 0 ? w : -w
 
                 qc  = coeff(elem2, 1)
                 p0  = coeff(elem2, 0)
@@ -4490,7 +5159,7 @@ function _ray_class_shin_table_fast_quiet_impl(F::AdmissibleTuple;
                 s2 = QQ(qc / c2b)
                 s1 = QQ(qc * c1b / c2b - p0)
 
-                rhoB_conj_val = Float64(emb_conj(rho_B))
+                rhoB_conj_val = _embf(emb_conj(rho_B))
                 s1_f = Float64(BigInt(numerator(s1))) / Float64(BigInt(denominator(s1)))
                 s2_f = Float64(BigInt(numerator(s2))) / Float64(BigInt(denominator(s2)))
                 (s2_f * rhoB_conj_val - s1_f) > 0 ||
@@ -4825,7 +5494,7 @@ function diagnose_real_places(d::Int)
     println("K = ", K, "   gen(K) = sqrt(", D, ")")
     i_conj = 0
     for (i, p) in enumerate(places)
-        v = Float64(real(embedding(p)(a)))
+        v = _embf(embedding(p)(a))
         isconj = v < 0
         isconj && (i_conj = i)
         println("  real_places(K)[", i, "]:  sqrt(", D, ") -> ", v, "   => ",
@@ -4843,8 +5512,8 @@ function diagnose_real_places(d::Int)
 
     println("\nChecking rho > rho' (i.e. sigma_1(rho) > sigma_2(rho)) for the class roots:")
     for (g, rho) in sd.rho_reps
-        v_main = Float64(real(emb_main(rho)))
-        v_conj = Float64(real(emb_conj(rho)))
+        v_main = _embf(emb_main(rho))
+        v_conj = _embf(emb_conj(rho))
         println("  class ", g, ": rho = ", rho, "   sigma_1 = ", v_main,
                 "  sigma_2 = ", v_conj, "   rho > rho'? ", v_main > v_conj)
     end
@@ -4952,12 +5621,12 @@ function ray_class_monoid_table_v2(F::AdmissibleTuple; shared_data = nothing,
     dm = hasproperty(sd, :dbar) ? sd.dbar : (isodd(d) ? d : 2 * d)
 
     places = real_places(K)
-    i_conj = findfirst(p -> Float64(real(embedding(p)(gen(K)))) < 0, places)
+    i_conj = findfirst(p -> _embf(embedding(p)(gen(K))) < 0, places)
     i_conj === nothing && error("ray_class_monoid_table_v2: could not identify conjugation")
     emb_conj = embedding(places[i_conj])          # sigma_2 = Sigma
     emb_main = embedding(places[3 - i_conj])      # sigma_1
-    fm(x) = Float64(real(emb_main(x)))
-    fc(x) = Float64(real(emb_conj(x)))
+    fm(x) = _embf(emb_main(x))
+    fc(x) = _embf(emb_conj(x))
 
     m = ideal(O, dm)
 
@@ -5313,7 +5982,7 @@ function check_lookup_coverage(d::Int; tol::Float64 = 1e-10)
     rho = sd.rho_reps[sd.F_class]
     rho_bf = BigFloat(coeff(rho, 0)) + BigFloat(coeff(rho, 1)) * sqrt(BigFloat(D))
     L_rho = hj_automorph_for_root(rho, D)
-    rho_B0 = rhoBs[argmin([abs(Float64(real(embedding(real_places(K)[2])(rho - rb)))) for rb in rhoBs])]
+    rho_B0 = rhoBs[argmin([abs(_embf(embedding(real_places(K)[2])(rho - rb))) for rb in rhoBs])]
     t_shift = rho - rho_B0
     t_int = iszero(coeff(t_shift, 1)) && isone(denominator(QQ(coeff(t_shift, 0)))) ?
             Int(numerator(QQ(coeff(t_shift, 0)))) : nothing
@@ -5429,7 +6098,7 @@ function diagnose_group_lookup_ambiguity(d::Int; tol::Float64 = 1e-10)
     L_rho = hj_automorph_for_root(rho, D)
     rhoBs = unique([tbl[i].rho_B for i in idxs])
     emb_main = embedding(real_places(K)[2])
-    rho_B0 = rhoBs[argmin([abs(Float64(real(emb_main(rho - rb)))) for rb in rhoBs])]
+    rho_B0 = rhoBs[argmin([abs(_embf(emb_main(rho - rb))) for rb in rhoBs])]
     t_shift = rho - rho_B0
     (iszero(coeff(t_shift, 1)) && isone(denominator(QQ(coeff(t_shift, 0))))) ||
         error("rho - rho_B0 = $t_shift is not an integer translation; orbit identification needs it")
@@ -5569,7 +6238,7 @@ function diagnose_seed_lift_differences(d::Int, seeds::Vector{Int}; tol::Float64
         rhoBs = unique([tbl[i].rho_B for i in idxs])
         emb_main = embedding(real_places(K)[2])
         emb_conj = embedding(real_places(K)[1])
-        rho_B0 = rhoBs[argmin([abs(Float64(real(emb_main(rho - rb)))) for rb in rhoBs])]
+        rho_B0 = rhoBs[argmin([abs(_embf(emb_main(rho - rb))) for rb in rhoBs])]
         t_int = Int(numerator(QQ(coeff(rho - rho_B0, 0))))
         L0 = hj_automorph_for_root(rho_B0, D)
         Lpos = (L0[1,1] + L0[2,2]) > 0 ? L0 : -L0
@@ -5588,8 +6257,8 @@ function diagnose_seed_lift_differences(d::Int, seeds::Vector{Int}; tol::Float64
             pt = (Int(mod(numerator(e.s1 * d), d)), Int(mod(numerator(e.s2 * d), d)))
             elem1 = K(d) * (K(e.s2) * e.rho_B - K(e.s1))
             classes[orbit_of(pt)] = (idx = i, s1 = e.s1, s2 = e.s2, elem1 = elem1,
-                                     main = Float64(real(emb_main(elem1))),
-                                     conj = Float64(real(emb_conj(elem1))),
+                                     main = _embf(emb_main(elem1)),
+                                     conj = _embf(emb_conj(elem1)),
                                      nrm = norm(elem1))
         end
         println("seed ", sdn, ": base fiber rho_B0 = ", rho_B0, ", t = ", t_int,
@@ -5813,6 +6482,9 @@ function check_nonunit_shift_invariance(d::Int; p1::Union{Int,Nothing} = nothing
         gQ_j_cand = binary_quadratic_form(divexact(gQ_j_cand_raw.a, content_j),
                                            divexact(gQ_j_cand_raw.b, content_j),
                                            divexact(gQ_j_cand_raw.c, content_j))
+        if gQ_j_cand.a < 0      # same normalization as twisted_chi_general (10/18, d = 55)
+            gQ_j_cand = binary_quadratic_form(-gQ_j_cand.a, -gQ_j_cand.b, -gQ_j_cand.c)
+        end
         gF_j_cand = AdmissibleTuple(d, F.r, gQ_j_cand)
         QQ_form_cand = binary_quadratic_form(gF_j_cand.A[2,1],
                                               gF_j_cand.A[2,2] - gF_j_cand.A[1,1],
@@ -5825,7 +6497,7 @@ function check_nonunit_shift_invariance(d::Int; p1::Union{Int,Nothing} = nothing
                   "compare shift invariance for this candidate")
 
         u2_cand, u1_cand = find_rho_j_and_coords(product, rho_j_raw)
-        diag_val = Float64(u2_cand) * Float64(real(emb_conj_K(rho_j_raw))) - Float64(u1_cand)
+        diag_val = Float64(u2_cand) * _embf(emb_conj_K(rho_j_raw)) - Float64(u1_cand)
         diag_val > 0 ||
             error("run_direct_route: u2*conj(rho_j)-u1 <= 0 for this elem1 - cannot ",
                   "compare shift invariance for this candidate")
@@ -5844,8 +6516,8 @@ function check_nonunit_shift_invariance(d::Int; p1::Union{Int,Nothing} = nothing
     end
 
     # --- the code's own minimal totally-positive shift, then n_shifts_to_test-1 more ---
-    conj_v = Float64(real(emb_conj_K(x_p)))
-    main_v = Float64(real(emb_main_K(x_p)))
+    conj_v = _embf(emb_conj_K(x_p))
+    main_v = _embf(emb_main_K(x_p))
     n_shift0 = max(0, Int(ceil((-min(conj_v, main_v) + 1) / d)))
 
     values = ComplexF64[]
@@ -5855,8 +6527,8 @@ function check_nonunit_shift_invariance(d::Int; p1::Union{Int,Nothing} = nothing
     for k in 0:(n_shifts_to_test - 1)
         n = n_shift0 + k
         elem1 = x_p + K(d * n)
-        conj1 = Float64(real(emb_conj_K(elem1)))
-        main1 = Float64(real(emb_main_K(elem1)))
+        conj1 = _embf(emb_conj_K(elem1))
+        main1 = _embf(emb_main_K(elem1))
         println("  n_shift = ", n, ":  elem1 = ", elem1,
                 "  conj(elem1) = ", conj1, "  main(elem1) = ", main1,
                 "  totally positive? ", conj1 > 0 && main1 > 0)
@@ -5939,12 +6611,11 @@ end
 SUPERSEDED, per the project owner: the ray class monoid Jbar_m^flat(O) is
 FINITE (592 classes for d=21) and small enough to build in FULL, once, up
 front, via `ray_class_monoid_table_v2` - no incremental norm-bound search
-needed at all. `twisted_chi_general` no longer calls this function; it does
-a direct value lookup against a pre-built `full_monoid_table` instead (see
-that function's own comments at the lookup-miss branch). Confirmed
-empirically (`diagnose_full_monoid_membership`) that a genuine
-shin_val_lookup value DOES appear in the full table - this incremental
-search was solving a problem that did not need solving that way. Left
+needed at all. `twisted_chi_general` no longer calls this function; it
+identifies each grid point's class by MEMBERSHIP in the pre-built
+`full_monoid_table` (each entry lists the grid points of its class), using
+the shin value only as a sign tie-breaker, a fallback and a consistency
+check (see the per-point block in that function). Left
 defined (fully working, extensively debugged) since it may still be useful
 for comparison/verification, but it is DEAD CODE on the current production
 path.
@@ -7088,11 +7759,11 @@ function diagnose_theorem219_cross_check(d::Int, p1::Int, p2::Int; tol::Float64 
     println("target (shin_val_lookup, twisted_chi_general's own construction) = ", target_val)
 
     places = real_places(K)
-    i_conj = findfirst(pl -> Float64(real(embedding(pl)(gen(K)))) < 0, places)
+    i_conj = findfirst(pl -> _embf(embedding(pl)(gen(K))) < 0, places)
     emb_conj = embedding(places[i_conj])
     emb_main = embedding(places[3 - i_conj])
-    fm(x) = Float64(real(emb_main(x)))
-    fc(x) = Float64(real(emb_conj(x)))
+    fm(x) = _embf(emb_main(x))
+    fc(x) = _embf(emb_conj(x))
 
     picard_classes = collect(P_O)
     println("\n--- ray_class_monoid_table_v2's own construction, per Picard class ---")
@@ -7480,7 +8151,7 @@ function diagnose_monoid_lookup_v2_timing(d::Int; n_candidates_per_class::Int = 
     Qinv_gens = [[g // NQ[i] for g in Pgens[i]] for i in 1:n_classes]
     places = real_places(K)
 
-    embnorm2(x) = Float64(embedding(places[1])(x))^2 + Float64(embedding(places[2])(x))^2
+    embnorm2(x) = _embf(embedding(places[1])(x))^2 + _embf(embedding(places[2])(x))^2
 
     # ---- class_hints cache, mirroring ray_class_monoid_lookup's fix exactly ----
     class_hints = Dict{Any, NamedTuple}()
@@ -7956,6 +8627,11 @@ function diagnose_twist_across_seeds(d::Int, J_gens::Vector, gamma_coords::Tuple
     return results
 end
 
+# test_all_twists(d): THE TOP-LEVEL DRIVER. Builds everything for dimension d
+# (setup, group table, monoid table), then runs the first 5 principal twists
+# and the first 20 non-principal twists through twisted_chi_general, printing
+# the verification results of each. Every twist should end with a ghost SIC
+# (||M^2 - M|| ~ 1e-50 in BigFloat, 0 deviations in the product check).
 function test_all_twists(d::Int; phase_debug_points::Vector{Tuple{Int,Int}} = Tuple{Int,Int}[],
                          precision_bits::Int = 256)
     # PRECISION (10/13): working precision for every BigFloat in this run
@@ -7967,6 +8643,9 @@ function test_all_twists(d::Int; phase_debug_points::Vector{Tuple{Int,Int}} = Tu
     # runs in one session is safe.
     setprecision(BigFloat, precision_bits)
     println("BigFloat precision: ", precision(BigFloat), " bits")
+    t_run0 = time()
+    print_run_banner(d)
+    # Shared setup (one K/O for everything), printed summary of the group structure.
     F = AdmissibleTuple(d)
     @show F
 
@@ -8027,16 +8706,17 @@ function test_all_twists(d::Int; phase_debug_points::Vector{Tuple{Int,Int}} = Tu
     end
 
     # Built once for the whole run: the ENTIRE ray class monoid
-    # Jbar_m^flat(O), per the project owner's revised approach - the monoid
-    # is finite and small (592 classes for d=21), so build it in full and do
-    # a direct value lookup on a group-table miss, rather than an
-    # incremental norm-bound search (ray_class_monoid_lookup, now
-    # superseded - see its docstring). Threaded through every
-    # twisted_chi_general call below exactly like ray_class_lookup_table.
+    # Jbar_m^flat(O). The monoid is finite and small (592 classes for d=21),
+    # so it is built in full, and twisted_chi_general identifies every grid
+    # point's class by membership in it (each entry lists its grid points);
+    # the group table built just above is only used as a consistency check.
+    # Threaded through every twisted_chi_general call below exactly like
+    # ray_class_lookup_table.
     println("\nComputing the full ray class monoid table once for this run ",
             "(used by every twisted_chi_general call below on a group-table miss) ...")
     full_monoid_table = ray_class_monoid_table_v2(F; shared_data = sd, verbose = true)
     println("  done: ", length(full_monoid_table), " monoid classes across all Picard fibers.")
+    print_mem_line("after building the group and monoid tables")
 
     # Persistent, growing extension of the ray class table into the monoid
     # Jbar_m^flat(O) (see ray_class_monoid_lookup's docstring for the exact
@@ -8079,6 +8759,7 @@ function test_all_twists(d::Int; phase_debug_points::Vector{Tuple{Int,Int}} = Tu
                                                 full_monoid_table = full_monoid_table,
                                                 point_id_cache = point_id_cache,
                                                 phase_debug_points = phase_debug_points)
+        print_mem_line(string("after principal twist ", k))
     end
 
     n_nonprincipal = min(20, length(nonprincipal_triples))
@@ -8098,7 +8779,9 @@ function test_all_twists(d::Int; phase_debug_points::Vector{Tuple{Int,Int}} = Tu
                                                 full_monoid_table = full_monoid_table,
                                                 point_id_cache = point_id_cache,
                                                 phase_debug_points = phase_debug_points)
+        print_mem_line(string("after non-principal twist ", k))
     end
+    print_run_footer(t_run0)
 end
 
 """
@@ -8136,6 +8819,8 @@ function test_all_twists_2(d::Int; n_twists::Int = 5,
                            precision_bits::Int = 256)
     setprecision(BigFloat, precision_bits)      # see test_all_twists
     println("BigFloat precision: ", precision(BigFloat), " bits")
+    t_run0 = time()
+    print_run_banner(d)
     F = AdmissibleTuple(d)
     @show F
 
@@ -8188,6 +8873,7 @@ function test_all_twists_2(d::Int; n_twists::Int = 5,
     println("\nComputing the full ray class monoid table once for this run ...")
     full_monoid_table = ray_class_monoid_table_v2(F; shared_data = sd, verbose = true)
     println("  done: ", length(full_monoid_table), " monoid classes across all Picard fibers.")
+    print_mem_line("after building the group and monoid tables")
     monoid_table = NamedTuple[]
     candidate_cache = Dict{Tuple{Int,Int,Int}, Any}()
     point_id_cache = Dict{Tuple{Int,Int}, Any}()
@@ -8211,6 +8897,7 @@ function test_all_twists_2(d::Int; n_twists::Int = 5,
                                                 full_monoid_table = full_monoid_table,
                                                 point_id_cache = point_id_cache,
                                                 phase_debug_points = phase_debug_points)
+        print_mem_line(string("after twist ", k))
         push!(results, (k = k, N_gamma = norm(K(gamma)), N = N, gF = gF))
     end
 
@@ -8220,9 +8907,114 @@ function test_all_twists_2(d::Int; n_twists::Int = 5,
     for r in results
         println("  twist ", r.k, ": N(gamma) = ", r.N_gamma, "   N = ", r.N, "   gF = ", r.gF)
     end
+    print_run_footer(t_run0)
     return results
 end
 
+"""
+    diagnose_hj_orbit(a, b, c, d; points = [[1, 0], [42, 14]], precision_bits = 256)
+    diagnose_hj_orbit_d55()
+
+(10/18) Diagnostic for the d = 55 crash. In non-principal twist 1 at
+p = (3,37), twisted_chi_general built the tuple form
+    gQ_j_cand = (-41, 124, -76)   (disc 2912 = 2^2 * 728)
+from the HJ-reduced stabilizer of rho_j = (103 + sqrt(728))/241 and passed it
+to AdmissibleTuple(d, F.r, gQ_j_cand). shin_of_tuple then failed inside
+Zauner (_hj_cycle_matrices: "not implemented when t.Q is not strictly
+HJ-reduced"). Note the NEGATIVE leading coefficient - every working point
+has a > 0.
+
+For the form Q = (a,b,c) this prints, for Q itself, for every form in
+reduced_hj_orbit(Q), for minimal_hj_stabilizer(reduced_hj_orbit(Q), d) (the
+recipe find_class_representatives uses), and for -Q (comparison only; -Q is
+the opposite orientation, NOT an equivalent form):
+    * the tuple's canonical matrix t.A,
+    * psl2word(t.A) and whether its last entry is 0 (Zauner's "strictly
+      HJ-reduced" condition),
+    * whether shin_of_tuple(t, p) succeeds at the test points
+      (the failure does not depend on p; [42,14] is the point's du).
+Read-only: changes nothing. Use the output to pick the replacement form
+(an orbit member that passes and is SL2(Z)-equivalent to Q).
+
+Run with:   diagnose_hj_orbit_d55()
+or, for another failing form:   diagnose_hj_orbit(a, b, c, d)
+"""
+function diagnose_hj_orbit(a::Integer, b::Integer, c::Integer, d::Int;
+                           points::Vector{Vector{Int}} = [[1, 0], [42, 14]],
+                           precision_bits::Int = 256)
+    setprecision(BigFloat, precision_bits)
+    F = AdmissibleTuple(d)
+    println("F = ", F, "   using r = F.r = ", F.r)
+    Q = binary_quadratic_form(ZZ(a), ZZ(b), ZZ(c))
+    println("Q = ", Q, "   disc = ", discriminant(Q))
+
+    function _probe(label, Qx)
+        try
+            println("\n--- ", label, ": ", Qx, "   (a,b,c) = (", Qx.a, ",", Qx.b, ",", Qx.c,
+                    ")   disc = ", discriminant(Qx))
+            t = nothing
+            try
+                t = AdmissibleTuple(d, F.r, Qx)
+            catch err
+                println("    AdmissibleTuple(d, r, Q) FAILED: ", sprint(showerror, err))
+                return nothing
+            end
+            println("    t.A = ", t.A)
+            try
+                w = Zauner.psl2word(t.A)
+                println("    psl2word(t.A) = ", w, "   strictly HJ-reduced (last entry 0)? ", iszero(w[end]))
+            catch err
+                println("    psl2word(t.A) unavailable/failed: ", sprint(showerror, err))
+            end
+            for p in points
+                pp = mod.(p, d)
+                try
+                    v = shin_of_tuple(t, pp)
+                    println("    shin_of_tuple(t, ", pp, ") = ", ComplexF64(v), "   OK")
+                catch err
+                    println("    shin_of_tuple(t, ", pp, ") FAILED: ", sprint(showerror, err))
+                end
+            end
+            return t
+        catch err
+            println("\n--- ", label, ": could not probe (", sprint(showerror, err), ")")
+            return nothing
+        end
+    end
+
+    _probe("Q as built in twisted_chi_general (gQ_j_cand)", Q)
+
+    V = nothing
+    try
+        V = reduced_hj_orbit(Q)
+    catch err
+        println("\nreduced_hj_orbit(Q) FAILED: ", sprint(showerror, err))
+    end
+    if V !== nothing
+        println("\nreduced_hj_orbit(Q): ", length(V), " form(s), element type ", eltype(V))
+        for (i, Qi) in enumerate(V)
+            _probe(string("reduced_hj_orbit(Q)[", i, "]"), Qi)
+        end
+        try
+            Qmin = minimal_hj_stabilizer(V, d)
+            _probe("minimal_hj_stabilizer(reduced_hj_orbit(Q), d)  [the find_class_representatives recipe]", Qmin)
+        catch err
+            println("\nminimal_hj_stabilizer(V, d) FAILED: ", sprint(showerror, err))
+        end
+    end
+
+    _probe("-Q (comparison only: opposite orientation, not an equivalent form)",
+           binary_quadratic_form(-Q.a, -Q.b, -Q.c))
+    return V
+end
+
+# diagnose_hj_orbit_d55(): runs diagnose_hj_orbit on the specific form that
+# crashed the d = 55 run (see that function's docstring).
+diagnose_hj_orbit_d55() = diagnose_hj_orbit(-41, 124, -76, 55)
+
+# test_ray_class_group_size(F): diagnostic that builds K, O and the modulus
+# for a tuple and reports the number of ray class representatives found,
+# without building any shin tables.
 function test_ray_class_group_size(F::AdmissibleTuple)
     @show F
 
@@ -8269,6 +9061,8 @@ end
 
 test_ray_class_group_size(d::Int) = test_ray_class_group_size(AdmissibleTuple(d))
 
+# test_ray_class_group_size_first_n_tuples(n) / ray_class_group_data_first_n_tuples(n):
+# loop the two diagnostics above over the first n admissible tuples (dq(k)).
 function test_ray_class_group_size_first_n_tuples(n::Int)
     for k in 1:n
         println("\n=== Tuple ", k, " of ", n, " (dq(", k, ")) ===")
